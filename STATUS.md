@@ -7,7 +7,7 @@ Working state of the project — implementation progress, current focus, sequenc
 | Idea | Designed | Implemented | Smoke ✓ | Real-data ✓ |
 |------|:--------:|:-----------:|:-------:|:-----------:|
 | [z-loss](ideas/zloss/README.md) | ✓ | ✓ (naive default; fused autograd opt-in via `ZLOSS_FUSED=1`) | ✓ (a/b/c/d) | partial — d6/M4 only |
-| [MTP](ideas/mtp/README.md) | ✓ | — | — | — |
+| [MTP](ideas/mtp/README.md) | ✓ | ✓ (naive only; shared unembedding; k=3 default) | ✓ (a/b/c) | d6/M4 measured — val/bpb +4.17%, tok/sec −32% vs baseline (expected toy-scale signature of a scale-dependent technique). GPU validation pending. |
 | [Deep supervision](ideas/deep-supervision/README.md) | ✓ | — | — | — |
 | [Differential attention](ideas/diff-attention/README.md) | ✓ | — | — | — |
 | [Online data selection + batch-size tuning](ideas/online-data-selection/README.md) | ✓ | — | — | — |
@@ -16,16 +16,17 @@ Working state of the project — implementation progress, current focus, sequenc
 
 ## Currently in flight
 
-z-loss has been validated at d6 scale on the M4 mini; runs archived under `results/` and synced to wandb:
+Three overlays measured at d6/M4 scale; runs synced to wandb and archived under `results/`. Every result here is mechanism-verification, not capability claim — the d6/5000-iter regime is below the noise/signal threshold for any of these techniques per `ideas/README.md` "Lessons learned (ideation)".
 
-- **`d6_baseline`** (wandb `qdoniwrj`) — `val/bpb` 1.16534, CORE 0.0361. The CORE number is toy-scale, not capability-meaningful.
-- **`d6_zloss`** (wandb `szesl4yg`) — `val/bpb` 1.17007 (+0.41% vs baseline; within noise at this scale). Used the naive `F.cross_entropy` + `torch.logsumexp` path. tok/sec ~7% under baseline.
-- **`d6_zloss_fused`** (wandb `de562k89`, killed at ~300 steps) — confirmed the Python fused-autograd path is **numerically correct** (matched naive bit-exactly: Δ val/bpb at step 300 = 6.6e-05) but **~32% slower than baseline** because pure-Python autograd replaces optimized C++ CE with Python ops. Default flipped to naive; the fused path remains opt-in via `ZLOSS_FUSED=1` for memory-bound scenarios. See `ideas/zloss/README.md` "Expected cost".
+- **`d6_baseline`** (wandb `qdoniwrj`) — `val/bpb` 1.16534. Pure baseline reference. (Original CORE CSV was overwritten before auto-archive landed; recovering it would require a retrain.)
+- **`d6_zloss`** (wandb `szesl4yg`) — `val/bpb` 1.17007 (+0.41% vs baseline; within noise). Naive `F.cross_entropy` + `torch.logsumexp`. tok/sec ~7% under baseline. CORE 0.0361.
+- **`d6_zloss_fused`** (wandb `de562k89`, killed at ~300 steps) — confirmed the Python fused-autograd path is **numerically correct** (bit-exact loss + ~2e-8 grad agreement vs naive) but **~32% slower than baseline** in pure PyTorch (Python ops replace C++ CE). Default flipped to naive; opt in via `ZLOSS_FUSED=1`. See `ideas/zloss/README.md` "Expected cost".
+- **`d6_mtp`** (wandb `bcv9920m`) — `val/bpb` 1.21398 (+4.17% vs baseline; stable +0.045–0.049 gap from step ~500 onward). tok/sec ~32% under baseline (4 separate `F.cross_entropy` calls). CORE −0.0179. The val/bpb regression is the expected toy-scale MTP signature: aux supervision diverts gradient capacity from the main objective, and at 37M params / 5000 iters the model can't afford the dual objective. See `ideas/mtp/README.md` "Current state" for details.
 
-Compare any two/three:
+Compare any combination:
 
 ```bash
-uv run python -m tools.compare_runs d6_baseline d6_zloss [d6_zloss_fused]
+uv run python -m tools.compare_runs d6_baseline d6_zloss [d6_zloss_fused] [d6_mtp]
 ```
 
 ## Suggested sequencing
@@ -40,14 +41,15 @@ The [non-backprop LLM](ideas/non-backprop/README.md) is a **separate research tr
 
 ## Next concrete steps
 
-1. **Real-data validation of z-loss on GPU.** d6/M4 results aren't capability-meaningful (the +0.41% gap is within seed noise at this scale, and z-loss's effects show up most at scale + under aggressive LR schedules). The actual question — does z-loss help at GPT-2 scale — needs a Lambda speedrun. Use [`runs/lambda.sh`](runs/lambda.sh) to provision, then on the instance:
+1. **Real-data validation of z-loss and MTP on GPU.** d6/M4 results aren't capability-meaningful for either; both are scale-dependent techniques whose wins (if any) appear at GPT-2+ scale per the literature. Lambda speedrun via [`runs/lambda.sh`](runs/lambda.sh) → on the instance:
 
    ```bash
    WANDB_RUN=d24_baseline bash runs/speedrun.sh
    WANDB_RUN=d24_zloss MODEL_TAG=d24_zloss OVERLAY=zloss bash runs/speedrun.sh
-   uv run python -m tools.compare_runs d24_baseline d24_zloss
+   WANDB_RUN=d24_mtp   MODEL_TAG=d24_mtp   OVERLAY=mtp   bash runs/speedrun.sh
+   uv run python -m tools.compare_runs d24_baseline d24_zloss d24_mtp
    ```
 
-2. **Build the MTP overlay** — the next big lever per sequencing. Follow `SETUP.md` "Adding a new overlay" recipe (three files + smoke). Plan to compose with z-loss into one `MTPGPT` subclass so the depth-axis (deep supervision) work later folds in cleanly.
+2. **Build the next overlay** — per sequencing, **deep supervision** (folds into the same `MTPGPT` subclass) or **differential attention** (independent architecture A/B). Deep supervision is the more natural next step since the MTPGPT scaffolding is already in place.
 
-3. After MTP lands: deep supervision (folds into MTPGPT), then differential attention as a separate architecture A/B.
+3. After that: differential attention, then online data selection if the earlier results justify the harness-touching investment.

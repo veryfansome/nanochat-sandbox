@@ -1,7 +1,50 @@
-# Multi-Token Prediction (MTP) — proposed setup
+# Multi-Token Prediction (MTP)
 
-Status: **proposal / not yet implemented**
+Status: **implemented** — overlay + wrapper + smoke + d6/M4 A/B measured. GPU validation pending.
 Target repo: `nanochat` (Karpathy) — kept **pristine**, never edited.
+
+## Current state
+
+The mechanism is live and smoke-verified:
+
+- [`../../overlay/mtp.py`](../../overlay/mtp.py) — `MTPGPT(GPT)`. Forward returns `baseline_CE + (α/k) · Σ_{d=1..k} CE(logits[:, :-d, :], targets[:, d:])` on the training path; pure baseline CE on the eval path (`loss_reduction='none'`) so `val/bpb` stays directly comparable.
+- [`../../wrappers/train_mtp.py`](../../wrappers/train_mtp.py) — six lines: patch `nanochat.gpt.GPT` → `MTPGPT`, `runpy` `scripts.base_train`. Does **not** patch `GPTConfig`.
+- [`../../wrappers/smoke_mtp.py`](../../wrappers/smoke_mtp.py) — verifies (a) forward math, (b) config-portability, (c) monkeypatch. <5 sec, no data.
+
+### Measured at d6 / 5000 iters on M4 (wandb `bcv9920m`, archived `results/d6_mtp/`)
+
+| metric | d6_baseline | d6_mtp | Δ |
+|---|---:|---:|---:|
+| val/bpb (final, step 5000) | 1.16534 | 1.21398 | **+0.04864 (+4.17%)** |
+| train/tok_per_sec | 27,628 | 18,657 | **−32.5%** |
+| total time | 50.6 min | 71.3 min | +41% |
+| CORE (post-train eval) | not recoverable | −0.0179 | (within noise; below-random on centered tasks) |
+
+The val/bpb gap is **stable, not transient** — diverges from 0 at step 0, locks in at +0.045–0.049 by step ~500, holds for the remaining ~4500 steps. This is the expected toy-scale signature of MTP: the model has 37M params and 5000 warmup-heavy iters; asking the residual stream to also encode lookahead for tokens 2–4 ahead diverts gradient budget the main objective can't spare. The literature (Gloeckle 2024, DeepSeek-V3) shows the win at scale, where the model can afford the dual objective and the denser supervision becomes a sample-efficiency lever rather than a capacity tax. tok/sec hit (−32%) tracks the cost of 4 separate `F.cross_entropy` calls per step — similar magnitude to the Python-fused-zloss number, same root cause. Expect this to shrink to a few percent at GPT-2 / GPU scale where the trunk dominates wall-clock.
+
+train/loss in wandb is **not** directly comparable to baseline — it includes the aux contribution. Use val/bpb for cross-run comparison.
+
+### Implementation choices (per the agreed plan)
+
+- **Naive only.** k separate `F.cross_entropy` calls on shifted target slices. Each saves its own softmax for backward, so peak saved-for-backward memory at the loss = (k+1) × `(B, T, V)` slice. Worked example of the loss-shape gotcha from `../../overlay/README.md`. A Python fused autograd would halve this but cost throughput per the z-loss experience; revisit only if scale-up memory forces it.
+- **Shared unembedding** with the main `lm_head`. No extra parameters; all heads use the same logits with different shifted targets. The trunk is regularized to encode multi-step-ahead information in the residual stream.
+- **k = 3 default** (predicts t+2, t+3, t+4). Env var `MTP_HEADS`.
+- **Loss weighting**: total aux contribution = α (default 0.3); per-head = α/k. Env var `MTP_ALPHA`.
+- **Eval path** (`loss_reduction='none'`, used by `evaluate_bpb` to compute per-token bpb) returns main CE only — aux supervision is a training regularizer; mixing it into bpb would inflate the metric in a non-comparable way.
+
+Run the smoke any time: `uv run python -m wrappers.smoke_mtp`.
+
+### Next milestone — GPU validation at d24/Lambda
+
+The d6/M4 result tells us MTP doesn't help at toy scale (expected), not whether it helps at GPT-2 scale (the actual question). On Lambda:
+
+```bash
+WANDB_RUN=d24_baseline bash runs/speedrun.sh
+WANDB_RUN=d24_mtp MODEL_TAG=d24_mtp OVERLAY=mtp bash runs/speedrun.sh
+uv run python -m tools.compare_runs d24_baseline d24_mtp
+```
+
+At d24 scale the saved-for-backward stack from k=3 aux heads is roughly `4 × (16 × 2048 × 32768 × 4 bytes) ≈ 16 GB` — comfortable on a single H100 (80 GB HBM) and trivial across 8. The throughput hit should drop to a few percent (trunk dominates).
 
 ## Goal
 
