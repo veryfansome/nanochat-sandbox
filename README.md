@@ -12,16 +12,18 @@ Every experiment is a small overlay: a `GPT` subclass plus a wrapper that monkey
 
 | You want to… | Read… |
 |--------------|-------|
+| Know what's done, in flight, and next | [`STATUS.md`](STATUS.md) |
 | Set up on a fresh machine, run smoke, launch a full speedrun | [`SETUP.md`](SETUP.md) |
-| Pick what to work on next; see the curated sequencing | [`ideas/README.md`](ideas/README.md) |
+| Pick what to work on; browse the idea catalog | [`ideas/README.md`](ideas/README.md) |
 | Read the design for a specific idea | `ideas/<idea>/README.md` |
-| See the pattern implemented end-to-end | [`overlay/zloss.py`](overlay/zloss.py), [`wrappers/train_zloss.py`](wrappers/train_zloss.py), [`wrappers/smoke_zloss.py`](wrappers/smoke_zloss.py) |
+| See an implemented overlay's pattern | [`overlay/zloss.py`](overlay/zloss.py), [`wrappers/train_zloss.py`](wrappers/train_zloss.py), [`wrappers/smoke_zloss.py`](wrappers/smoke_zloss.py) |
 
 ## Layout
 
 ```
+README.md        # this file (auto-loaded as AGENTS.md / CLAUDE.md via symlink)
 SETUP.md         # provisioning, running, adding overlays — mechanics
-README.md        # this file
+STATUS.md        # implementation progress + currently in flight + next steps
 ideas/           # design docs, one folder per experiment (+ index)
 overlay/         # model subclasses (one .py per implemented idea)
 wrappers/        # Python entrypoints: patch nanochat.gpt + runpy base_train
@@ -33,24 +35,6 @@ pyproject.toml   # nanochat-sandbox project (nanochat NOT installed as a pkg)
 
 Sibling layout assumed: `../nanochat/` next to `sandbox/`. Never edited; loaded via the `.pth` bootstrap dropped by `runs/setup.sh`.
 
-## Current state
-
-| Idea | Designed | Implemented | Smoke ✓ | Real-data ✓ |
-|------|:--------:|:-----------:|:-------:|:-----------:|
-| [z-loss](ideas/zloss/README.md) | ✓ | ✓ | ✓ | — |
-| [MTP](ideas/mtp/README.md) | ✓ | — | — | — |
-| [Deep supervision](ideas/deep-supervision/README.md) | ✓ | — | — | — |
-| [Differential attention](ideas/diff-attention/README.md) | ✓ | — | — | — |
-| [Online data selection + batch-size tuning](ideas/online-data-selection/README.md) | ✓ | — | — | — |
-| [Layer-wise LR](ideas/layerwise-lr/README.md) | ✓ | — | — | — |
-| [Non-backprop (DFA → block-local)](ideas/non-backprop/README.md) | ✓ (research track) | — | — | — |
-
-## Next concrete steps
-
-1. **Validate z-loss on real data.** The mechanism is smoke-verified locally; the next milestone is a real training run. Cheap: `OVERLAY=zloss bash runs/runcpu.sh` (~30 min on M3 Max, single CPU). Real: `OVERLAY=zloss bash runs/speedrun.sh` on a multi-GPU node. Compare `val_bpb` and CORE to a baseline run on the same pinned nanochat commit + seed.
-2. **Build the next overlay.** Per [`ideas/README.md`](ideas/README.md) sequencing, **MTP** is the highest-leverage next item (capability + sample efficiency, pure model-side). Follow SETUP.md's "Adding a new overlay" recipe — three files plus a smoke. Compose with z-loss into a single `MTPGPT` subclass.
-3. Then per the sequencing: deep supervision (folds into MTP subclass), differential attention, online data selection. Non-backprop is a separate research track.
-
 ## Constraints (settled — don't relitigate)
 
 - **Scale & data are fixed.** No bumping `--depth`, no adding tokens, no new datasets.
@@ -61,8 +45,9 @@ Sibling layout assumed: `../nanochat/` next to `sandbox/`. Never edited; loaded 
 
 - **Docs**: Markdown prose unwrapped (one line per paragraph/bullet).
 - **A/B discipline**: same pinned nanochat commit + same seed for baseline vs overlay. `--model-tag` is auto-derived in `runs/*.sh` to `d${DEPTH}_${OVERLAY:-baseline}` so runs don't clobber each other.
-- **Idea-specific hyperparameters**: passed as env vars (e.g. `Z_LOSS_COEFF=1e-4`), defaulted in the config subclass via `__post_init__` to avoid argparse conflicts with the upstream parser. Documented in each idea's README.
-- **Smoke before training**: every new overlay gets a `wrappers/smoke_<idea>.py` that verifies (a) the loss math (b) the monkeypatch substitution. Runs in <5 seconds with no data.
+- **Idea-specific hyperparameters**: passed as env vars (e.g. `Z_LOSS_COEFF=1e-4`), read at `__init__` and stored as an instance attribute on the overlay subclass — **not** added to `GPTConfig`, since that breaks downstream load via `scripts.base_eval` / `scripts.chat_sft` / `scripts.chat_cli`. See SETUP.md "Hyperparameter placement: attribute, not config field".
+- **Smoke before training**: every new overlay gets a `wrappers/smoke_<idea>.py` that verifies (a) the loss math, (b) config-portability (no overlay-only fields leak into the saved checkpoint), (c) the monkeypatch substitution. Runs in <5 seconds with no data. Always run before any real training.
+- **Prefer existing tools over inline scripts**: e.g. use `tools/compare_runs.py` for wandb comparisons. Extend the tool when it's missing a feature, don't bypass it.
 
 ## Glossary
 
