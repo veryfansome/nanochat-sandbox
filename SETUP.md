@@ -28,6 +28,9 @@ runs/
   setup.sh               # one-shot provisioning (uv + nanochat clone + .venv + .pth + smoke)
   speedrun.sh            # full GPU pipeline; swaps base_train → wrappers.train_$OVERLAY
   runcpu.sh              # CPU/macOS smoke run (depth=6, 5000 iters)
+  lambda.sh              # Lambda Cloud REST wrapper: launch / bootstrap / ssh / terminate
+tools/
+  compare_runs.py        # pull wandb metrics for N runs; side-by-side table + trajectory
 results/                 # per-run logs / checkpoints / metadata (gitignored)
 ```
 
@@ -69,7 +72,7 @@ WANDB_RUN=baseline bash runs/speedrun.sh                    # baseline (upstream
 
 Env vars: `OVERLAY` (empty = upstream baseline), `MODEL_TAG` (default `d${DEPTH}_${OVERLAY:-baseline}` — keeps baseline and overlay A/B runs from overwriting each other's checkpoints), `NPROC` (default 8), `DEPTH` (default 24), `WANDB_RUN` (default `dummy`), `NANOCHAT_BASE_DIR` (default `~/.cache/nanochat`), `FORCE_RETRAIN_TOKENIZER` (default 0 = skip if cached; upstream's `scripts/tok_train.py` retrains unconditionally, so we add a guard to avoid wasting tokenizer-training time across A/B runs).
 
-`runs/runcpu.sh` is the same shape, tuned for CPU/macOS (depth=6, 5000 iters, ~30 min on an M3 Max). Not a real comparison — the cheap end-to-end check that the overlay survives real training iterations on real data.
+`runs/runcpu.sh` is the same shape, tuned for CPU/macOS (depth=6, 5000 iters, ~30 min on an M3 Max). Not a real comparison — the cheap end-to-end check that the overlay survives real training iterations on real data. **Deletes the trained checkpoint by default** after `base_eval` completes (~500 MB savings per run; wandb has the curves, the report has the metrics — pass `KEEP_CHECKPOINT=1` if you want to keep it for resume / chat / further eval).
 
 ```bash
 OVERLAY=zloss bash runs/runcpu.sh
@@ -77,19 +80,36 @@ OVERLAY=zloss bash runs/runcpu.sh
 
 ### Lambda / fresh-instance flow
 
-After SSH'ing to a fresh GPU instance with this directory cloned to `~/sandbox`:
+For Lambda Cloud, `runs/lambda.sh` wraps the REST API to provision, bootstrap, SSH, and tear down. No CLI install needed — just `curl` + `jq` + `ssh` + `rsync`. From your local machine:
 
 ```bash
-# 1. provision (one-shot, idempotent)
-bash ~/sandbox/runs/setup.sh
+export LAMBDA_API_KEY=...           # https://cloud.lambda.ai/api-keys
+export LAMBDA_SSH_KEY=mykey         # name of an SSH key already uploaded to Lambda
+                                    # (not a local file path)
 
-# 2. launch in tmux so it survives SSH disconnects
+# 1. launch an 8xH100 (default; --type / --region to override). Auto-picks a
+#    region with capacity. Polls until active; final stdout line is "<id> <ip>".
+read ID IP < <(bash runs/lambda.sh launch | tail -1)
+
+# 2. rsync this sandbox/ to the instance and run setup.sh on it
+bash runs/lambda.sh bootstrap "$ID"
+
+# 3. SSH in
+bash runs/lambda.sh ssh "$ID"
+
+# 4. on the instance, launch the run in tmux so it survives SSH disconnects
 OVERLAY=zloss WANDB_RUN=zloss tmux new -s sr "cd ~/sandbox && bash runs/speedrun.sh 2>&1 | tee runs/sr.log"
+# Ctrl-B D to detach; `tmux attach -t sr` to reconnect.
+
+# 5. when done — IMPORTANT, billing is per hour:
+bash runs/lambda.sh terminate "$ID"
 ```
 
-In tmux: Ctrl-B then D to detach (training continues). Reconnect later with `tmux attach -t sr`.
+Other subcommands: `types [--available]`, `list`, `status <id>`. Run `bash runs/lambda.sh` (no args) to see the full usage.
 
-For an A/B, run the baseline in a second tmux session under a different `WANDB_RUN` and `--model-tag`.
+For an A/B, do step 4 in a second tmux session under a different `WANDB_RUN`. `MODEL_TAG` is auto-derived from `OVERLAY` so the on-disk checkpoint dirs don't collide.
+
+If you'd rather provision manually (web dashboard) then SSH in and run `bash ~/sandbox/runs/setup.sh` yourself, that works too — `lambda.sh` is just the curl wrapper, not a requirement.
 
 ## How the sys.path bootstrap works
 
@@ -118,19 +138,14 @@ For an idea that's a **pure model-side change** (forward/loss only — MTP, z-lo
 ### 1. The model subclass — `overlay/<idea>.py`
 
 ```python
-from dataclasses import dataclass
 import os
-from nanochat.gpt import GPT, GPTConfig
-
-@dataclass
-class MyIdeaConfig(GPTConfig):
-    my_hyperparam: float = 0.0  # populated from env in __post_init__
-
-    def __post_init__(self):
-        if self.my_hyperparam == 0.0:
-            self.my_hyperparam = float(os.environ.get("MY_HYPERPARAM", "0.1"))
+from nanochat.gpt import GPT
 
 class MyIdeaGPT(GPT):
+    def __init__(self, config):
+        super().__init__(config)
+        self.my_hyperparam = float(os.environ.get("MY_HYPERPARAM", "0.1"))
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         # Inference: defer to base
         if targets is None:
@@ -141,28 +156,50 @@ class MyIdeaGPT(GPT):
         return loss
 ```
 
-Important convention: idea-specific hyperparameters get **defaults** on the config subclass (read from env vars in `__post_init__`), so upstream's `GPTConfig(sequence_len=..., ...)` constructor call in `base_train.py` keeps working without passing your new fields.
+### Hyperparameter placement: attribute, not config field
+
+The template above stores `my_hyperparam` as a plain Python attribute, **NOT** as a field on a `GPTConfig` subclass. This is deliberate and important.
+
+`scripts/base_train.py` saves the model config to `meta_*.json` via `asdict(model.config)`. Any field on a `GPTConfig` subclass ends up in that JSON. A fresh Python process that loads the checkpoint with vanilla `GPTConfig(**kwargs)` — `scripts.base_eval`, `scripts.chat_sft`, `scripts.chat_cli`, anything downstream — then crashes with `TypeError: GPTConfig.__init__() got an unexpected keyword argument 'your_field'`. Keeping overlay hyperparameters off the config makes the saved checkpoint byte-identical to a baseline run and fully portable to the entire upstream toolchain. (z-loss hit this bug in a real run; the smoke test now has a check `(b)` that flags any overlay leaking fields into the config.)
+
+**Use a config field only if the hyperparameter affects model *shape*** — i.e. the model literally cannot be reconstructed without it (number of extra heads, layer-band count, etc.). In that case you must *also* provide either:
+
+- a sibling eval wrapper (`wrappers/eval_<idea>.py` that patches `GPTConfig` and `runpy`s `scripts.base_eval`), repeated for every upstream tool you want to use, or
+- a pre-load shim that strips your fields from `meta_*.json` before vanilla tools touch it.
+
+When in doubt, use the attribute pattern. Loss-only and training-dynamics knobs always fit this pattern. The trade-off is the coefficient isn't recorded in the checkpoint — capture it via `MODEL_TAG` (e.g. `d24_zloss_1e4`) and wandb config.
+
+### Loss-shape gotcha: don't materialize `(B, T, V)` twice
+
+If your overlay computes anything off `logits` *in addition to* the standard CE — auxiliary heads, z-loss-style regularizers, anything that touches the unembedding output — be aware that PyTorch's autograd holds saved-for-backward tensors per op. Two ops on `logits` means two `(B, T, V)` tensors live across the backward pass: the softmax `F.cross_entropy` saves internally + whatever your second op needs. This is **invisible at GPU scale** (you've got 80–141 GB HBM and the trunk dominates the time cost), but it caused observable swap memory pressure and ~7–10% throughput loss when z-loss was first written naively and run on an M4 mini.
+
+The fix is a small custom `torch.autograd.Function` that takes `logits` as input, computes both loss terms from one `log_softmax`, and saves *only* `log_probs` for backward (an analytic backward derives both gradient components from that one saved tensor). See `overlay/zloss.py`'s `_FusedCEZLoss` for a worked example; it's ~60 lines and reduces backward-time `(B, T, V)` memory by ~50% relative to the naive two-op path. A smoke `(d)` check compares fused vs naive numerics on every smoke run to catch regressions.
+
+This matters more for overlays that touch logits multiple ways (MTP's `k` heads, deep supervision's intermediate heads). The same fused-autograd pattern carries over: compute everything in one pass, save just `log_probs`, write the analytic backward.
 
 ### 2. The wrapper — `wrappers/train_<idea>.py`
 
 ```python
 import runpy
 import nanochat.gpt as g
-from overlay.<idea> import MyIdeaGPT, MyIdeaConfig
+from overlay.<idea> import MyIdeaGPT
 
 g.GPT = MyIdeaGPT
-g.GPTConfig = MyIdeaConfig
+# Do NOT patch g.GPTConfig — see "Hyperparameter placement" above. Patching
+# GPTConfig pollutes the saved checkpoint with overlay-only fields, which
+# breaks base_eval / chat_sft / chat_cli when they load it.
 
 runpy.run_module("scripts.base_train", run_name="__main__")
 ```
 
-This is the entire integration — `base_train.py`'s `from nanochat.gpt import GPT, GPTConfig` resolves to the patched classes at its import time.
+This is the entire integration — `base_train.py`'s `from nanochat.gpt import GPT` resolves to the patched class at its import time.
 
 ### 3. The smoke test — `wrappers/smoke_<idea>.py`
 
-Two checks (no data, no training):
-- **Forward-correctness**: build a tiny baseline and a subclass with identical weights, run forward on random tokens, assert the difference equals what your math says it should.
-- **Monkeypatch**: after `g.GPT = MyIdeaGPT`, assert `from nanochat.gpt import GPT` resolves to `MyIdeaGPT`.
+Three checks (no data, no training):
+- **(a) Forward-correctness**: build a tiny baseline and a subclass with identical weights, run forward on random tokens, assert the difference equals what your math says it should.
+- **(b) Config-portability**: `asdict(my_idea_model.config).keys()` equals `asdict(baseline.config).keys()` — confirms no overlay-only fields leak into the saved checkpoint. **This would have caught a real bug in z-loss.** Skip only if your overlay genuinely needs to change the config (see hyperparameter-placement section above).
+- **(c) Monkeypatch**: after `g.GPT = MyIdeaGPT`, assert `from nanochat.gpt import GPT` resolves to `MyIdeaGPT`.
 
 `wrappers/smoke_zloss.py` is the working template — copy it and adapt the math check. Always run the smoke before any real training.
 
@@ -212,15 +249,37 @@ The config subclass reads the env var in `__post_init__`. Document the env-var n
 
 Per-run results live there under `base_checkpoints/<model_tag>/`. Recommend setting `--model-tag` so baseline and overlay runs don't collide: `--model-tag=d4_zloss_smoke` vs. `--model-tag=d4_baseline`.
 
-wandb logging: `--run=<wandb_run_name>` enables it; `--run=dummy` (the default) skips it.
+**Per-run archive** — `runs/runcpu.sh` and `runs/speedrun.sh` both auto-archive the durable run artifacts to `sandbox/results/$MODEL_TAG/` after `base_eval` finishes: the eval CSV, the base-model report markdowns, the checkpoint `meta.json`, the nanochat commit hash, and an `ENV` file with the relevant env vars + timestamp. This is necessary because upstream's eval CSV path is *step-keyed*, not *model_tag-keyed* (`base_model_<step>.csv`), and `nanochat.report reset` wipes `report/` at the start of every run — without the archive, the only durable record of a run's metrics besides wandb gets clobbered by the next run.
+
+wandb logging: `--run=<wandb_run_name>` enables it; `--run=dummy` (the default) skips it. `runs/runcpu.sh` and `runs/speedrun.sh` both set `WANDB_DIR="$NANOCHAT_BASE_DIR"` so wandb's local cache lands under `~/.cache/nanochat/wandb/` alongside the other generated artifacts, rather than dropping a `wandb/` dir into the sandbox.
 
 ## A-B discipline
 
-Same pinned nanochat commit + same seed for the baseline (no overlay) and the overlay run — otherwise upstream changes confound the comparison. Record the commit hash in `results/<run>/META`:
+Same pinned nanochat commit + same seed for the baseline (no overlay) and the overlay run — otherwise upstream changes confound the comparison. `runs/runcpu.sh` and `runs/speedrun.sh` both auto-record the nanochat commit + env into `results/$MODEL_TAG/NANOCHAT_COMMIT` / `ENV` (see the "Per-run archive" note above).
+
+## Comparing runs — `tools/compare_runs.py`
+
+After two or more runs finish, pull their metrics from wandb and compare them side by side:
 
 ```bash
-git -C ../nanochat rev-parse HEAD > results/<run>/META
+# A/B (first run is the reference for deltas)
+uv run python -m tools.compare_runs d6_baseline d6_zloss
+
+# N-way (e.g. a coefficient sweep)
+uv run python -m tools.compare_runs d24_baseline d24_zloss_1e4 d24_zloss_1e3 d24_zloss_1e5
+
+# JSON for piping into other tools / spreadsheets
+uv run python -m tools.compare_runs --json d6_baseline d6_zloss > results/ab.json
 ```
+
+Default project is `nanochat` (matching `base_train.py:100`); entity is auto-discovered from `~/.netrc`. Override with `--project` / `--entity` if needed. Uses the wandb credentials you already set with `wandb login`.
+
+What it pulls (extend `SUMMARY_FIELDS` / `TRAJECTORY_FIELDS` at the top of the file):
+- Summary scalars: `val/bpb` (final), `train/loss` (final), `core_metric` (if logged — disabled in runcpu by default), `train/tok_per_sec`, `train/mfu`, `total_training_time`, `total_training_flops`.
+- Trajectory: `val/bpb` per eval step, with deltas vs the reference run.
+- `train/loss` summary: count, max, min, last-5 mean — for quick spike-frequency checks.
+
+If a metric isn't logged by `base_train.py` it shows as `—` rather than failing. To add a new metric, append a `(wandb_key, display_name, format_spec)` tuple to `SUMMARY_FIELDS`.
 
 ## Syncing upstream
 
@@ -237,9 +296,9 @@ If upstream's `nanochat.gpt` API changed (rare for the public-facing `GPT.forwar
 
 What's currently checked in and verified:
 
-- **`overlay/zloss.py`** — `ZLossGPT(GPT)` overriding `forward()` to add `z_loss_coeff · mean(logsumexp(logits)²)` over non-ignored target positions; `ZLossConfig(GPTConfig)` with `z_loss_coeff` defaulted from `Z_LOSS_COEFF`.
-- **`wrappers/train_zloss.py`** — six lines: patch `nanochat.gpt.GPT`/`GPTConfig`, `runpy.run_module("scripts.base_train")`.
-- **`wrappers/smoke_zloss.py`** — verifies forward-correctness (loss diff matches the z-term to ~1e-7) and the monkeypatch substitution. Passes in <5 seconds with no data.
+- **`overlay/zloss.py`** — `ZLossGPT(GPT)` overriding `forward()` to add `z_loss_coeff · mean(logsumexp(logits)²)` over non-ignored target positions; `z_loss_coeff` is read from the `Z_LOSS_COEFF` env var at `__init__` and held as an instance attribute (no `GPTConfig` subclass — saved checkpoints load with vanilla `GPT`).
+- **`wrappers/train_zloss.py`** — six lines: patch `nanochat.gpt.GPT`, `runpy.run_module("scripts.base_train")`. Does **not** patch `GPTConfig`.
+- **`wrappers/smoke_zloss.py`** — verifies (a) forward math matches `baseline + z_coeff · E[lse²]` to ~1e-7, (b) the model's config has no overlay-only fields (checkpoint stays portable to upstream tools), (c) the monkeypatch substitution works. Passes in <5 seconds with no data.
 
 Design rationale: `ideas/zloss/README.md`.
 
@@ -259,7 +318,10 @@ Pull harness improvements by hand-merging the diff after each upstream sync.
 
 | Action | Command |
 |--------|---------|
-| Provision (fresh machine) | `bash runs/setup.sh` (or `EXTRA=cpu bash runs/setup.sh`) |
+| Provision (fresh machine, manual) | `bash runs/setup.sh` (or `EXTRA=cpu bash runs/setup.sh`) |
+| Provision Lambda instance + bootstrap | `read ID IP < <(bash runs/lambda.sh launch \| tail -1); bash runs/lambda.sh bootstrap "$ID"` |
+| Terminate Lambda instance | `bash runs/lambda.sh terminate <id>` |
+| Compare runs (A/B from wandb) | `uv run python -m tools.compare_runs RUN_A RUN_B [RUN_C ...]` |
 | Verify wiring | `uv run python -m wrappers.smoke_zloss` |
 | Full GPU run | `OVERLAY=zloss bash runs/speedrun.sh` |
 | CPU smoke run | `OVERLAY=zloss bash runs/runcpu.sh` |

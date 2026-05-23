@@ -35,6 +35,9 @@ export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 mkdir -p "$NANOCHAT_BASE_DIR"
 
+# Keep wandb's local cache under NANOCHAT_BASE_DIR (see runcpu.sh for rationale).
+export WANDB_DIR="$NANOCHAT_BASE_DIR"
+
 # Overlay selection: empty => baseline (upstream scripts.base_train)
 OVERLAY="${OVERLAY:-}"
 if [ -n "$OVERLAY" ]; then
@@ -70,7 +73,7 @@ python -m nanochat.dataset -n 8
 python -m nanochat.dataset -n 170 &
 DATASET_PID=$!
 
-TOKENIZER_FILE="$NANOCHAT_BASE_DIR/tokenizer/tokenizer.json"
+TOKENIZER_FILE="$NANOCHAT_BASE_DIR/tokenizer/tokenizer.pkl"  # RustBPETokenizer save format (default)
 if [ -f "$TOKENIZER_FILE" ] && [ "${FORCE_RETRAIN_TOKENIZER:-0}" != "1" ]; then
     echo "==> tokenizer cached at $TOKENIZER_FILE; skipping tok_train + tok_eval"
     echo "    (set FORCE_RETRAIN_TOKENIZER=1 to redo)"
@@ -92,6 +95,29 @@ torchrun --standalone --nproc_per_node="$NPROC" -m "$TRAIN_MODULE" -- \
 
 torchrun --standalone --nproc_per_node="$NPROC" -m scripts.base_eval -- \
     --model-tag="$MODEL_TAG" --device-batch-size=16
+
+# Archive base-stage artifacts to sandbox/results/$MODEL_TAG/ BEFORE SFT (or
+# the next run) overwrites them. Eval CSV path doesn't include $MODEL_TAG
+# (upstream writes base_model_<step>.csv), and `nanochat.report reset` clears
+# report/ at the start of every run — without this, the only durable record
+# of the base-stage numbers is wandb.
+ARCHIVE_DIR="$SANDBOX_DIR/results/$MODEL_TAG"
+mkdir -p "$ARCHIVE_DIR"
+EVAL_CSV=$(ls -t "$NANOCHAT_BASE_DIR/base_eval/base_model_"*.csv 2>/dev/null | head -1)
+[ -n "$EVAL_CSV" ] && cp "$EVAL_CSV" "$ARCHIVE_DIR/eval.csv"
+cp "$NANOCHAT_BASE_DIR/report/base-model-"*.md "$ARCHIVE_DIR/" 2>/dev/null || true
+cp "$NANOCHAT_BASE_DIR/base_checkpoints/$MODEL_TAG/meta_"*.json "$ARCHIVE_DIR/meta.json" 2>/dev/null || true
+git -C ../nanochat rev-parse HEAD > "$ARCHIVE_DIR/NANOCHAT_COMMIT" 2>/dev/null || true
+{
+    echo "MODEL_TAG=$MODEL_TAG"
+    echo "OVERLAY=${OVERLAY:-}"
+    echo "WANDB_RUN=$WANDB_RUN"
+    echo "DEPTH=$DEPTH"
+    echo "NPROC=$NPROC"
+    [ -n "${Z_LOSS_COEFF:-}" ] && echo "Z_LOSS_COEFF=$Z_LOSS_COEFF"
+    echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$ARCHIVE_DIR/ENV"
+echo "==> archived base-stage artifacts to $ARCHIVE_DIR/"
 
 # -----------------------------------------------------------------------------
 # SFT

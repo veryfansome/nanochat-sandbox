@@ -25,7 +25,8 @@ README.md        # this file
 ideas/           # design docs, one folder per experiment (+ index)
 overlay/         # model subclasses (one .py per implemented idea)
 wrappers/        # Python entrypoints: patch nanochat.gpt + runpy base_train
-runs/            # shell pipelines: setup.sh, speedrun.sh, runcpu.sh
+runs/            # shell pipelines: setup.sh, speedrun.sh, runcpu.sh, lambda.sh
+tools/           # analysis utilities: compare_runs.py (wandb A/B), ...
 results/         # per-run logs / metadata (gitignored)
 pyproject.toml   # nanochat-sandbox project (nanochat NOT installed as a pkg)
 ```
