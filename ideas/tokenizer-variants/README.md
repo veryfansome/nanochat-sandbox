@@ -1,107 +1,172 @@
 # Tokenizer variants (offline-evaluable) — proposed setup
 
-Status: **proposal / not yet implemented**
-Target repo: `nanochat` (Karpathy) — kept **pristine**, never edited.
+Status: **proposal / not yet implemented in this project**, but **substantial prior art exists** in two branches of [`veryfansome/nanochat`](https://github.com/veryfansome/nanochat) — see "Prior art" below before starting any new variant.
+
+Target repo: `nanochat` (Karpathy) — kept **pristine**, never edited. The Rust tokenizer source (`rustbpe/`) **is in-tree** and modifiable; PyPI wheels are a build artifact, not a black box.
 
 ## Goal
 
-Treat the tokenizer as an experiment surface, not a fixed input. Vary pre-tokenization rules, vocab size, and tokenizer-training corpus mix; evaluate variants **offline** so that GPU time is only spent on candidates that pass cheap filters. The hypothesis: which tokens exist in the vocab shapes what a model of fixed scale can learn — particularly compositional capabilities (arithmetic, code structure, multilingual transfer) where token granularity sets a hard capability ceiling.
+Treat the tokenizer as an experiment surface, not a fixed input. Vary the merge-producer (pre-tokenization regex, merge algorithm, seed/forced merges, training corpus) and evaluate variants **offline** so that GPU time is only spent on candidates that pass cheap filters. The hypothesis: which tokens exist in the vocab shapes what a model of fixed scale can learn — particularly compositional capabilities (arithmetic, code structure, multilingual transfer) and signal density per token (forced common-phrase tokens reduce gradient-step count to learn the same content).
 
 ## Brain-inspired motivation
 
-Loose mapping to the **representational alphabet**. Brains don't choose their sensory primitives — photoreceptor wavelengths, cochlear frequency bands, somatosensory receptor types are evolutionarily fixed. For language models we *do* pick the atoms: the discrete tokens the network can represent and compose. Different atomic decompositions enable or preclude different compositional reasoning. Digit-by-digit tokenization is the canonical concrete example — lets a model learn positional arithmetic compositionally rather than memorizing each number's identity atomically.
+Loose mapping to the **representational alphabet**. Brains don't choose their sensory primitives — photoreceptor wavelengths, cochlear frequency bands, somatosensory receptor types are evolutionarily fixed. For language models we *do* pick the atoms: the discrete tokens the network can represent and compose. Different atomic decompositions enable or preclude different compositional reasoning. Digit-by-digit tokenization is the canonical concrete example — lets a model learn positional arithmetic compositionally rather than memorizing each number atomically. Morpheme-aware tokenization is the analog one level up: lets the model compose meaning from sub-word linguistic primitives (Greek/Latin roots, prefixes, suffixes) rather than learning each derivation independently.
 
-## Why this works as a project track
+## What's actually a knob
 
-Two project-specific properties make this tractable here despite tokenization usually being a heavyweight intervention:
+The interface between tokenizer training and everything else is a single Python dict: `mergeable_ranks: dict[bytes, int]` (token bytes → merge-priority rank). `RustBPETokenizer.train_from_iterator` produces this dict and stuffs it into a `tiktoken.Encoding`, which is what gets pickled to `tokenizer.pkl` and consumed at inference. **Anything that produces a valid `mergeable_ranks` dict is drop-in.** The merge-producer is a free design choice.
 
-1. **The corpus is not pre-tokenized.** Pretraining shards are raw-text parquets (`nanochat/dataset.py:14, 60-65`); tokenization runs inline in the dataloader (`nanochat/dataloader.py:107`). So **changing the tokenizer requires no corpus retokenization** — none of the multi-hour cost typically associated with tokenizer experiments applies.
-2. **The speedrun already skips `tok_train` if a tokenizer is cached** (`runs/speedrun.sh:126-131`). So the workflow decouples cleanly: train variants offline, push the `tokenizer.pkl` + `token_bytes.pt` of the winner to `$NANOCHAT_BASE_DIR/tokenizer/` on the Lambda host, and the speedrun jumps straight to pretraining.
+Knobs by tier of access cost:
 
-GPU minutes are spent only on the A/B that matters. Variant generation and filtering happen on a laptop in parallel with any other track.
+| Knob | Where | Access cost |
+|---|---|---|
+| Pre-tokenization regex (`SPLIT_PATTERN`) | `nanochat/tokenizer.py:30` | Trivial — Python string |
+| Tokenizer-training corpus | `parquets_iter_batched` filter; `--max_chars`, `--doc_cap` | Easy — wrap or filter |
+| Vocab size | `--vocab_size` on `tok_train.py` | Trivial — CLI |
+| **Forced / blocked merges**, **seed tokens**, **custom merge scoring** | `rustbpe/src/lib.rs` + thin Python wrapper kwarg | Medium — Rust edit + `maturin develop` |
+| Alternative algorithm (Unigram, WordPiece) | Switch tokenizer class at inference; use `HuggingFaceTokenizer` (already a class in `tokenizer.py:39`) | Higher — inference path changes |
+| Byte-level vs character-level base alphabet | rustbpe internals | High — fundamental rewrite |
 
-## Why it's its own category (not an overlay)
+The first four are all reachable in tens to a few hundred lines of code. The Rust source is **single-file** (`rustbpe/src/lib.rs`, ~1000 lines), uses standard crates (`pyo3`, `fancy-regex`, `rayon`, `dary_heap`, `ahash`), and rebuilds incrementally with `maturin develop` in ~10s.
 
-Tokenizer experiments don't touch model code, don't touch the training loop, and don't change CLI args. The artifact is a **preprocessing output** (a trained tokenizer on disk) that the existing pipeline consumes. This is a new overlay-fit category — `preprocessing artifact` — separate from the four model/harness categories in [`../README.md`](../README.md).
+## Prior art (read before reinventing)
 
-## Candidate variants
+Two experimental branches of [`veryfansome/nanochat`](https://github.com/veryfansome/nanochat) implemented merge-producer variants. Both reached working implementations; both were paused for the same reason (inconclusive results given expensive Lambda A/Bs + no domain-expertise-driven priors to guide tuning). The infrastructure is reusable.
 
-Roughly ordered cheap-to-rich. None requires nanochat edits — all are `SPLIT_PATTERN` (`nanochat/tokenizer.py:30`) and/or `scripts/tok_train.py` invocation changes.
+### `origin/seed_tokens` — morpheme-seeded BPE
 
-1. **Digit-rule re-validation against CORE.** Karpathy already swept the `\p{N}{1,2}` clause and reported `{1,2}` best at vocab=32K, *measured on `val/bpb`* (`nanochat/tokenizer.py:27-29`). Re-test `{1}` (Llama-3-style strict digit-per-token) on CORE-arithmetic subscores — `{1}` may lose small bpb but win the downstream metric the project actually cares about. Lowest-overhead variant; just a regex change.
-2. **Vocab size × digit-rule grid.** Karpathy's sweet spot is scoped to 32K. Run `{1}` / `{1,2}` / `{1,3}` × `{32K, 64K}` and see whether the optimal rule shifts with vocab budget. Embedding-param cost at 64K is real at d24 (`2 × 64K × 768 ≈ 100M` extra params) — counts against the project's fixed-scale constraint at the upper end of the sweep.
-3. **Code-aware splits.** Standard `SPLIT_PATTERN` has no special handling for indentation, operator clustering, or common code structures. Add pre-tokenization rules (e.g., group `    ` → single indentation token, cluster operators) and measure code-domain compression + downstream code-task signal. Bigger regex surgery; the rest of the pipeline is unchanged.
-4. **Tokenizer-training corpus mix.** `tok_train.py` consumes the same FineWeb stream as pretraining. Try training the tokenizer on a code-biased or math-biased subset (without changing the *pretraining* corpus) and measure whether the resulting merges shift in useful ways. Lightest possible variant — no regex change, just a `parquets_iter_batched` filter.
+Idea: warm-start BPE training with a linguistically-curated seed list (Greek/Latin roots, English prefixes, suffixes) so the early merges build morpheme-aware tokens rather than purely frequency-driven byte concatenations.
 
-## Offline evaluation — the filter (`tools/eval_tokenizer.py`)
+What's there:
+- `sandbox/seed_tokens.yaml` — ~200 morphemes with etymology comments, organized as `versatile_morphemes` (can appear anywhere), `prefixes` (word-initial only), `inner_morphemes` (mid/end only). Position-aware variant generation (leading-space, leading-space-capitalized, no-space) is in `sandbox/seed_tokens.py`.
+- `rustbpe/src/lib.rs` — substantial new helpers:
+  - `compute_common_suffixes` — heuristic to identify suffixes worth pre-creating (suffix is itself a seed AND is a proper suffix of ≥2 other seeds).
+  - `best_rtl_tail_len` / `best_suffix_split_len` — pick the longest existing-or-common suffix to split a target token at.
+  - `ensure_merge_pair` / `ensure_token` — constructive merge-chain builder. Given a target seed token, generates the chain of intermediate merges (preferring suffix-reuse, falling back to LTR prefix-folding) so the seed token is achievable in the merge DAG.
+- New `seed_tokens=` kwarg on `train_from_iterator`; `--seed_tokens` CLI on `tok_train.py`; vocab=65536 default.
+- Older snapshots of the Rust file preserved as `sandbox/lib_v1.rs` and `lib_v2.rs`.
+- `sandbox/tok_eval.json` — 118K-line cached eval output.
+- `sandbox/test_rustbpe.py` + `sandbox/test_tok_train.py` — test infrastructure.
 
-The deliverable that makes the whole track work: a single CLI that takes a tokenizer directory and emits a metrics report. Tiers reflect runtime cost.
+Why it paused: morphemes vs frequency-pairs is a real design choice but hard to ground without domain priors on *which* morphemes matter for the downstream tasks the model will be evaluated on. Compression metrics didn't move decisively. The next step would have been measuring on a downstream-task corpus rather than general bpb.
 
-### Tier 1 — Free (seconds)
+### `origin/force_merges_wip` — forced cross-boundary common-phrase merges
 
-- **Per-domain compression** (bytes/token) on a held-out probe battery: English prose (FineWeb val), code (a small Python/JS corpus), math (a curated arithmetic + LaTeX corpus), multilingual (UDHR-style). Uneven compression flags structural problems.
-- **Vocab inspection**: longest tokens, token-length distribution, single-byte fraction, frequency-rank vs count (dead/near-dead tokens).
-- **Structural reversibility battery**: encode/decode round-trips on hand-picked cases (digit arithmetic, code snippets, contractions, unicode). Catches pre-tokenization bugs.
-- **Per-task token-count probes**: `"3 * 17 = 51"`, `"def foo(x):\n    return x"`, `"你好世界"`. These directly cap *what's expressible* in a fixed context.
+Idea: allow specific high-frequency grammatical phrases ("in the", "of the", "to be", "However,") to become single tokens, despite normally crossing pre-tokenization boundaries.
 
-### Tier 2 — Cheap (minutes)
+The crux that makes this work: **a regex carve-out, not a cross-chunk merge**. The naive approach (let BPE count pairs across pre-tok chunks and force-merge the frequent ones) breaks inference because tiktoken processes each pre-tok chunk independently — even if a merge rule for `(in_token, the_token)` exists, it doesn't fire if the two tokens are in different chunks. The branch solves this by **prepending an alternation to the regex that matches the forced phrases as single chunks**:
 
-- **Coverage curves**: fraction of validation corpus covered by top-N tokens. Steep curve = vocab budget concentrated; flat tail = wasted vocab.
-- **Information per token**: estimate `H(token | prev token)` from a held-out corpus via simple n-gram counts. Unit-free per-token entropy, comparable across vocabs without training a model. Well-merged tokens reduce locally-predictable redundancy.
-- **Bigram-Zipf fit**: how cleanly does the token distribution follow Zipf? Heavy bimodality is a sign the merge process got stuck.
+```python
+SPLIT_PATTERN = FORCED_PAIRS_EXPR + r"""|'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+| ?\p{N}{1,2}|..."""
+```
 
-### Tier 3 — Probe model (~50 min on M4 via `runs/runcpu.sh`)
+Now ` of the` is a single pre-tok chunk at both training and inference. BPE/tiktoken process it as one unit; the forced merge produces a single token consistently. Trailing lookahead `(?=([^a-z]|$))` prevents matching ` of theory` as ` of the` + `ory`.
 
-- **d6 probe pretraining** with the candidate tokenizer. Measure overall `val/bpb` and per-domain bpb (math, code). Per the project's `ideas/README.md` "Lessons learned": d6 can't reliably distinguish effects below ~0.05 bpb, so this filter catches **catastrophic regressions** but does not finely rank candidates. Use as a final filter, not a ranker.
+What's there:
+- `FORCED_PAIRS` (~70 hand-picked grammatical phrases, with comments noting conflicts and resolution order — the order matters because BPE/regex alternation is leftmost-first), `BLOCKED_PAIRS` (prevents accidental learning of weird cross-boundary merges that the regex carve-outs allow), `DERIVED_PAIRS` (multi-step compositions like `", in the"`, must match-first in the alternation).
+- `rustbpe/src/lib.rs` — `BlockedPairSpec` / `ForcedMergeSpec` structs; `apply_forced_merges_at_end` runs *after* normal BPE training, requires both operands to exist as tokens, allocates new IDs from remaining vocab capacity (or reuses an existing token if the concat bytes already exist).
+- A side micro-optimization: adding ` ?` before `\p{N}{1,2}` so leading digits merge with their preceding space like words — measured as **+1.09–1.23% compression for ~220 token cost**.
+- `get_tokenizer(tokenizer_dir_name=...)` parameterized so multiple cached tokenizers can coexist — useful for the offline workflow.
+- `sandbox/test_tok_train.py` (624 lines) — extensive tests; `sandbox/tok_analyzer.py` — custom analysis tool.
 
-### What offline metrics will NOT do
+Why it paused: the user achieved **large compression gains** but ran into the methodological problem below. The compression-driven win was clearly there; whether it translates to a real CORE/loss win was inconclusive at the available A/B budget.
 
-None of the above reliably **predicts** CORE / downstream gain from a full speedrun. They are filters that reject obviously-bad candidates so that GPU A/B sees serious contenders only. Be honest about this in any write-up; do not pick a winner from offline metrics alone.
+### Methodological problem encountered (both branches)
 
-## Implementation
+**Compression is not a fair comparison across tokenizers with different vocabs.** A tokenizer that adds " of the" as a token wins compression on any text containing "of the" and is roughly neutral elsewhere. So the headline compression number depends on what's in the test corpus — biased toward the variant whose forced/seed tokens match the test distribution.
 
-- `tools/eval_tokenizer.py` — Tier 1 + Tier 2 metrics. Input: a `$NANOCHAT_BASE_DIR/tokenizer/`-style directory. Output: a JSON / Markdown report. Pure Python; standalone (no nanochat training imports beyond `nanochat.tokenizer` and `nanochat.dataset`).
-- `wrappers/tok_train_variant.py` — wraps `scripts.tok_train` with overrides for `SPLIT_PATTERN`, vocab size, and tokenizer-training corpus filter. Saves to a *named* tokenizer dir (e.g. `~/.cache/nanochat/tokenizers/digit_1`) so multiple variants coexist.
-- A small shell helper or doc page in [`../../runs/`](../../runs/) explaining the offline → GPU workflow:
-  1. Train N variants locally with `wrappers.tok_train_variant`.
-  2. `tools.eval_tokenizer` on each; drop ~80%.
-  3. d6 probe (`OVERLAY= NANOCHAT_BASE_DIR=... bash runs/runcpu.sh`) on 2-3 finalists.
-  4. `scp` the winner's `tokenizer.pkl` + `token_bytes.pt` to `$NANOCHAT_BASE_DIR/tokenizer/` on the Lambda host.
-  5. `bash runs/speedrun.sh` — skips `tok_train`, picks up the cached tokenizer, proceeds to pretraining A/B.
+This is a real bias, not just noise. Going forward (see "Evaluation"), the eval harness needs to:
+- Report compression per-domain (`tools/eval_tokenizer.py` already does this — 21 probes across 6 domains).
+- Add probes that *don't* contain the forced/seed phrases — measure compression on neutral text to separate "variant has the right tokens for this corpus" from "variant's general BPE is better."
+- For the eventual A/B: use **CORE / val/bpb** on a held-out corpus the tokenizer's training data didn't see, not raw compression.
 
-No edits to `nanochat/`. No edits to `scripts/base_train.py`. The wrapper for `tok_train` is the only piece that mirrors the project's overlay pattern (monkeypatch + `runpy`).
+## Variants — refined catalog
 
-## Expected cost
+Organized by which knob each touches. Items marked **(prior art)** have implementation on one of the two branches above and should be re-engaged from there, not re-implemented.
 
-- **Per variant, offline**: rustbpe training on 2B chars takes a few minutes on M4 (already true; this is what `tok_train.py` defaults to). Offline eval is seconds (Tier 1) to minutes (Tier 2). d6 probe is ~50 min if a variant reaches Tier 3.
-- **Per variant, GPU**: only for finalists that go through the full speedrun A/B — same cost as any other A/B in the project.
-- **Engineering**: `tools/eval_tokenizer.py` is the biggest piece — maybe 200–400 LOC for a useful first version (compression + vocab inspection + reversibility battery; defer Tier 2 entropy/coverage curves to a follow-up). The variant wrapper is ~30 LOC.
+### Regex-only
+
+1. **Digit-rule re-validation against CORE.** Karpathy tuned `\p{N}{1,2}` on `val/bpb` at 32K vocab (`nanochat/tokenizer.py:27-29`). Re-test `{1}` (Llama-3-style strict digit-per-token) on CORE-arithmetic subscores — may lose small bpb but win the downstream metric. Lowest-overhead variant; just a regex change.
+2. **Space-prefix digits (`?\p{N}{1,2}`)** — **(prior art, force_merges_wip)**. Measured +1.09–1.23% compression for ~220 token cost. Lift this micro-optimization out of `force_merges_wip` and merge into baseline regardless of the cross-phrase work — it's a clean small win.
+3. **Code-aware splits** — pre-tokenization rules for indentation grouping, operator clustering, common code structures. Bigger regex surgery; defer until simpler variants land.
+
+### Vocab size
+
+4. **Vocab × digit-rule grid.** Karpathy's `{1,2}` sweet spot is scoped to 32K. Run `{1}` / `{1,2}` / `{1,3}` × `{32K, 64K}`. The seed_tokens branch defaulted to 65K — that vocab size is already validated as trainable.
+
+### Training corpus
+
+5. **Tokenizer-training corpus mix.** `tok_train.py` consumes the same FineWeb stream as pretraining. Try training the tokenizer on a code-biased or math-biased subset (without changing the *pretraining* corpus) and measure whether merges shift in useful ways. Lightest possible variant — no Rust change, just a `parquets_iter_batched` filter.
+
+### Merge-producer (Rust)
+
+6. **Morpheme-seeded BPE** — **(prior art, seed_tokens)**. Re-engage by either (a) rebasing `seed_tokens` onto current master and re-running with `tools/eval_tokenizer.py` for proper comparison, or (b) lifting the YAML + Rust constructive-merge machinery into the sandbox project as a wrapper around current master's rustbpe. The seed list itself (`sandbox/seed_tokens.yaml`) is a reusable artifact independent of the Rust implementation.
+7. **Forced common-phrase merges** — **(prior art, force_merges_wip)**. Same re-engagement options. The `FORCED_PAIRS` / `BLOCKED_PAIRS` lists and the regex carve-out pattern are reusable; the Rust `apply_forced_merges_at_end` and the inference-consistency machinery are tested.
+8. **`min_frequency` filter for normal BPE merges.** Skip merges below a count threshold, reallocate the saved vocab slots to other merges (or just produce a smaller vocab). Not currently exposed by rustbpe. ~30 LOC change.
+9. **Train-big-ship-small (vocab pruning).** Train at vocab=64K, drop the bottom-K by validation-set usage, ship a 32K tokenizer. Dead-token fraction → near zero by construction; the question is whether the pruned tokens were genuinely useless. Combine with `tools/eval_tokenizer.py --full` to pick the pruning threshold.
+10. **Branch-entropy merge scoring.** Penalize merges whose merged token has many high-frequency continuations (token captures less context-conditioning information). Hypothesis: better-tuned per-token information content → better next-token prediction headroom. Speculative; lowest priority.
+
+### Alternative algorithm (path 2: HF tokenizers)
+
+11. **Unigram LM tokenizer** (SentencePiece-style). Different inference algorithm; would route through `HuggingFaceTokenizer`. Bigger change but tests the "is BPE itself optimal" question.
+12. **WordPiece** — same shape as 11.
+
+## Evaluation — what changes given prior art
+
+The eval harness is already built: [`../../tools/eval_tokenizer.py`](../../tools/eval_tokenizer.py). It computes:
+
+- **Per-domain compression** on 21 probes across 6 domains (English prose, code, math, science, 9 languages, structured/JSON, whitespace, emoji).
+- **Vocab inspection** — bytes/tok stats, single-byte fraction, **digit-token analysis by length** (directly answers Karpathy's `\p{N}{1,2}` question), longest tokens, vocab gaps.
+- **Structural round-trip battery** (19 PASS/FAIL tests, catches inference inconsistencies — exactly the class of bug the cross-boundary work needed to verify).
+- **Task probes** (19 capability-relevant strings — arithmetic at multiple digit lengths, code idioms, URLs, dates, named entities).
+- **Coverage curve** (Tier 2 `--full`) — top-N cumulative share + dead-token count.
+
+Adjustments needed given the prior-art lessons:
+
+- **Add "no-forced-phrase" task probes** to separate "this tokenizer wins because it has the right merge for this probe" from "this tokenizer's general BPE is better." E.g., a probe corpus deliberately written without any of `FORCED_PAIRS`.
+- **The structural battery is the right safety net** for the cross-boundary regex trick — if any round-trip test fails, the regex carve-out has an unintended interaction with the rest of the pattern. Currently the battery passes for the cached `\p{N}{1,2}` tokenizer; new regex prefixes need to keep it passing.
+- **Compression alone is insufficient as a winner-selection signal.** The d6 probe (Tier 3, via `runs/runcpu.sh`) is the cheapest way to ground compression deltas in actual loss. If a variant wins compression but ties or loses d6 bpb, it's not a winner.
+
+## Implementation paths
+
+Updated given prior art:
+
+1. **Lift existing branch infrastructure into sandbox** — recommended for variants 6 + 7. Don't re-implement from scratch. The Rust code, the YAML/Python lists, and the regex carve-out are all working and tested. Wrap them as a sandbox-side overlay that points at current-master rustbpe with the modifications applied.
+2. **Pure-Python custom BPE trainer** — for new merge algorithms (variant 10) where the prior art doesn't help. Slower (pure-Python BPE is ~days on 2B chars), but you don't need 2B for a filter-tier experiment — 200M chars gives a comparable vocab in ~5h.
+3. **Fork rustbpe in-tree** — for variants where the Python wrapper isn't sufficient (variant 8, 10). The source is single-file; `maturin develop` rebuilds in ~10s.
+4. **HuggingFace `tokenizers` library** — for non-BPE algorithms (variants 11, 12).
+
+The sandbox project's overlay discipline applies: don't edit `nanochat/` master; either work in a parallel rustbpe build (path 3) or wrap the existing prior-art branches (path 1) without merging them into master.
 
 ## Combines well with
 
-- **Token-level loss weighting** ([`../token-loss-weighting/README.md`](../token-loss-weighting/README.md)) — both reshape per-token signal but at different layers. Vocab choice determines *which atoms exist*; weighting determines *how much gradient each atom gets*. Genuinely orthogonal — a good A/B is to vary both axes independently.
+- **[Token-level loss weighting](../token-loss-weighting/README.md)** — both reshape per-token signal but at different layers. Vocab choice determines *which atoms exist*; weighting determines *how much gradient each atom gets*. Genuinely orthogonal — a good A/B is to vary both axes independently.
 - **All model-side overlays** — tokenizer-agnostic, so any winning variant carries over to MTP, z-loss, deep supervision, etc. without code changes.
 - The track runs **in parallel with the model-overlay sequence** for GPU time. Offline iteration doesn't compete with pretraining experiments; only the final variant's speedrun A/B does.
 
 ## Sequencing within this track
 
-1. Build `tools/eval_tokenizer.py` (Tier 1 only).
-2. Variant 4 (corpus mix) — cheapest possible: no regex change, just data filter. Establishes the workflow end-to-end.
-3. Variant 1 (digit rule re-validation against CORE) — narrowly targeted at a single capability with a clear measurement.
-4. Variant 2 (vocab size × digit rule grid) — costs more (multiple speedruns) but maps a real surface.
-5. Variant 3 (code-aware splits) — biggest regex surgery; do last.
+1. **Use `tools/eval_tokenizer.py` immediately** on the cached tokenizer to establish baseline measurements. Done.
+2. **Variant 2 (space-prefix digits)** — pick this cherry first. Smallest possible Rust-free change, prior art validated compression win, fits into baseline regex.
+3. **Variant 1 (digit rule re-validation against CORE)** — narrowly targeted at a single capability; needs Lambda time for the A/B but is cheap to set up.
+4. **Variant 5 (corpus mix)** — establishes the offline workflow end-to-end without touching Rust.
+5. **Re-engage variant 7 (forced merges)** from `force_merges_wip` — biggest expected compression gain; needs the methodological discipline below to avoid the "compression-isn't-comparable" trap.
+6. **Re-engage variant 6 (seed tokens)** from `seed_tokens` — interesting, less validated; do after 7 establishes the workflow.
+7. **Variants 4 (vocab grid), 8 (min_frequency), 9 (vocab pruning)** — narrower questions, do as targeted follow-ups.
+8. **Variants 10 (branch entropy), 11/12 (non-BPE algorithms)** — speculative, defer.
 
 ## Open questions
 
-- Whether `val/bpb` and CORE rank tokenizer variants the same way at d24 scale. If they disagree, the project's primary metric needs revisiting *for this track only* (model-overlay tracks should stay bpb-driven).
-- How much per-domain compression imbalance is acceptable. A tokenizer optimized for code may compress prose worse; need a domain-weighted aggregate that matches the pretraining mix.
-- Whether Tier 2 entropy / coverage metrics ever decide a tie that Tier 1 doesn't. If not, deprioritize Tier 2.
-- Whether the d6 probe is worth running at all given the noise floor — possibly cheaper to skip Tier 3 and run the full speedrun on 2 finalists.
-- Interaction with `\p{N}{1,2}` at non-32K vocab sizes — Karpathy's tuning is scoped; variant 2 is the right way to map this.
+- Whether `val/bpb` and CORE rank tokenizer variants the same way at d24 scale. If they disagree, the project's primary metric needs adjustment for this track.
+- How to disentangle "tokenizer has the right merges for the test corpus" from "tokenizer's general BPE is better." See "Methodological problem" — needs neutral-corpus probes.
+- For forced merges: which phrases to force. The `FORCED_PAIRS` list on `force_merges_wip` is ~70 hand-picked; data-driven selection (top-K cross-boundary bigrams by frequency in a held-out corpus, subject to a grammatical-role filter) might be more principled and reproducible.
+- For seed tokens: which morphemes to seed. The `seed_tokens.yaml` list is intuition-driven; an ablation across morpheme subsets could surface which categories matter.
+- Whether to combine forced merges + seed tokens — they target different parts of the merge DAG (early/morphemic vs late/phrasal); plausibly complementary.
 
 ## References
 
 - Touvron et al. 2024 — Llama 3 paper, digit-by-digit tokenization motivation.
-- Karpathy nanochat tokenizer comment block (`nanochat/tokenizer.py:27-29`) — already-explored portion of the digit-rule sweep at vocab=32K.
+- Karpathy nanochat tokenizer comment (`nanochat/tokenizer.py:27-29`) — already-explored portion of the digit-rule sweep at vocab=32K.
 - Petrov et al. 2023 — "Language Model Tokenizers Introduce Unfairness Between Languages" (per-language compression bias).
 - Xue et al. 2022 — ByT5, byte-level alternative (out of scope here but the conceptual contrast worth knowing).
+- Prior art branches: [`origin/seed_tokens`](https://github.com/veryfansome/nanochat/tree/seed_tokens) and [`origin/force_merges_wip`](https://github.com/veryfansome/nanochat/tree/force_merges_wip) in `veryfansome/nanochat`.

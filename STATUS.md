@@ -14,7 +14,7 @@ Working state of the project — implementation progress, current focus, sequenc
 | [Online data selection + batch-size tuning](ideas/online-data-selection/README.md) | ✓ | — | — | — |
 | [Adaptive sequence length / batch size](ideas/adaptive-schedule/README.md) | ✓ | — | — | — |
 | [Layer-wise LR / staged maturation](ideas/layerwise-lr/README.md) | ✓ | — | — | — |
-| [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | — | — | — |
+| [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | partial — `tools/eval_tokenizer.py` harness done; prior art in `seed_tokens` + `force_merges_wip` nanochat branches (paused, re-engageable) | — | — |
 | [Non-backprop (DFA → block-local)](ideas/non-backprop/README.md) | ✓ (research track) | — | — | — |
 
 ## Currently in flight
@@ -41,7 +41,7 @@ uv run python -m tools.compare_runs d6_baseline d6_zloss [d6_zloss_fused] [d6_mt
 5. **Adaptive sequence length (Part A of adaptive-schedule)** — harness change, but the model needs no edits and Part A is the rare idea that should make the speedrun **faster on wall-clock** at the same final loss. Cheap-ish entry into the harness-change tier.
 6. **Online data selection + adaptive batch size (Part B of adaptive-schedule)** — bigger, harness-touching; pursue if earlier results justify it. Both share the copied-`base_train.py` pattern, so fold into a single forked harness. Online data selection is complementary to token weighting (sample-level vs. token-level signal shaping), so worth A/B-ing alone, weighting alone, and combined.
 
-**[Tokenizer variants](ideas/tokenizer-variants/README.md)** is a **parallel track**, not part of this serialized sequence. Offline variant generation + offline filtering (compression / vocab / structural metrics) runs on a laptop and does not compete with GPU time; only the final variant's full speedrun A/B does. Pick it up whenever the model-overlay track is GPU-bound or blocked on Lambda time. The cheapest entry point is building `tools/eval_tokenizer.py` (Tier 1 metrics only) and running variant 4 (tokenizer-training corpus mix — no regex change, only a data filter).
+**[Tokenizer variants](ideas/tokenizer-variants/README.md)** is a **parallel track**, not part of this serialized sequence. Offline variant generation + offline filtering (compression / vocab / structural metrics) runs on a laptop and does not compete with GPU time; only the final variant's full speedrun A/B does. Pick it up whenever the model-overlay track is GPU-bound or blocked on Lambda time. The `tools/eval_tokenizer.py` harness exists and has been validated against the cached tokenizer. **Substantial prior art** lives in two `veryfansome/nanochat` branches (`seed_tokens`: morpheme-seeded BPE; `force_merges_wip`: forced cross-boundary common-phrase merges with regex carve-out for inference consistency). Recommended re-engagement order: cherry-pick the space-prefix digit micro-optimization from `force_merges_wip` (validated +1.09–1.23% compression), then re-run prior-art variants through the new eval harness, then design new variants. See the catalog README's "Prior art" and "Sequencing within this track" sections.
 
 The [non-backprop LLM](ideas/non-backprop/README.md) is a **separate research track**, not part of this capability-tuning sequence. Pursue independently.
 
