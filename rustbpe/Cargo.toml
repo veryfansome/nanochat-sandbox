@@ -1,0 +1,23 @@
+[package]
+name = "rustbpe"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rustbpe"
+# cdylib so maturin builds a Python-loadable extension module.
+# Not present in Karpathy's upstream Cargo.toml — added here because the
+# upstream wheel is built via a CI-side maturin invocation that supplies
+# this flag, and we need a self-contained local build.
+crate-type = ["cdylib"]
+
+[dependencies]
+dary_heap = "0.3"
+indexmap = "2.2"
+fancy-regex = "0.16.1"
+log = "0.4.28"
+pyo3 = { version = "0.23.3", features = ["extension-module"] }
+pyo3-log = "0.12.4"
+ahash = "0.8.12"
+rayon = "1.11.0"
+compact_str = "0.9.0"

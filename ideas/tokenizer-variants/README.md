@@ -129,14 +129,17 @@ Adjustments needed given the prior-art lessons:
 
 ## Implementation paths
 
-Updated given prior art:
+The sandbox now vendors Karpathy's pristine rustbpe at [`../../rustbpe/`](../../rustbpe/) (lifted from upstream commit `9467d83`) and provides a parallel-crate overlay pattern at [`../../rustbpe_variants/`](../../rustbpe_variants/) — each variant is its own Rust crate producing a uniquely-named Python module, so multiple variants coexist in one venv. Build with `bash runs/build_rustbpe.sh` (pristine) or `VARIANT=<name> bash runs/build_rustbpe.sh`. See [`../../SETUP.md`](../../SETUP.md) "Tokenizer variants" for the full workflow and [`../../rustbpe_variants/README.md`](../../rustbpe_variants/README.md) for the add-a-variant recipe.
 
-1. **Lift existing branch infrastructure into sandbox** — recommended for variants 6 + 7. Don't re-implement from scratch. The Rust code, the YAML/Python lists, and the regex carve-out are all working and tested. Wrap them as a sandbox-side overlay that points at current-master rustbpe with the modifications applied.
-2. **Pure-Python custom BPE trainer** — for new merge algorithms (variant 10) where the prior art doesn't help. Slower (pure-Python BPE is ~days on 2B chars), but you don't need 2B for a filter-tier experiment — 200M chars gives a comparable vocab in ~5h.
-3. **Fork rustbpe in-tree** — for variants where the Python wrapper isn't sufficient (variant 8, 10). The source is single-file; `maturin develop` rebuilds in ~10s.
-4. **HuggingFace `tokenizers` library** — for non-BPE algorithms (variants 11, 12).
+Three implementation paths in priority order:
 
-The sandbox project's overlay discipline applies: don't edit `nanochat/` master; either work in a parallel rustbpe build (path 3) or wrap the existing prior-art branches (path 1) without merging them into master.
+1. **Parallel-crate Rust variant** (default) — copy `sandbox/rustbpe/` to `sandbox/rustbpe_variants/<name>/`, rename the package + `#[pymodule]`, add variant logic, build, then write `wrappers/tok_train_<name>.py` that aliases `sys.modules['rustbpe']` to your variant before `runpy`ing `scripts.tok_train`. This is the path for **all merge-producer variants** (6, 7, 8, 9, 10) and for **regex-only changes that need wrapper isolation** (1, 2, 3 if you don't want to touch baseline `SPLIT_PATTERN`). For prior art (variants 6, 7), use the port-forward checklist in `rustbpe_variants/README.md` — lift `lib.rs` directly from the `seed_tokens` / `force_merges_wip` branches.
+
+2. **Python-only variant** — for regex (variants 1, 2, 3) and corpus mix (variant 5) where rustbpe doesn't need changes, a thin wrapper is sufficient. `wrappers/tok_train_<name>.py` monkeypatches `nanochat.tokenizer.SPLIT_PATTERN` (or wraps `parquets_iter_batched` for the corpus filter) and `runpy`s `scripts.tok_train`. No Rust build needed; uses the PyPI rustbpe.
+
+3. **HuggingFace `tokenizers` library** — for non-BPE algorithms (variants 11, 12). Switches inference path away from tiktoken; bigger change. Use the existing `HuggingFaceTokenizer` class in `nanochat/tokenizer.py:39` as the inference-side hook.
+
+The sandbox project's overlay discipline applies: don't edit `nanochat/` master and don't edit `sandbox/rustbpe/` (vendored pristine). All variant work lives in `sandbox/rustbpe_variants/<name>/` (Rust changes) and `wrappers/tok_train_<name>.py` (Python wiring).
 
 ## Combines well with
 

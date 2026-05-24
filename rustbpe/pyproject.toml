@@ -1,0 +1,22 @@
+# Minimal maturin project file — not present in Karpathy's upstream rustbpe
+# (his PyPI wheels are built via a CI-side maturin command that supplies these
+# settings). Added here so `maturin develop` works from this directory without
+# extra flags. See ../rustbpe_variants/README.md for the variant-overlay pattern.
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rustbpe"
+version = "0.1.0"
+description = "Pristine vendored rustbpe — karpathy/nanochat@9467d83 (BPE tokenizer training; matches PyPI rustbpe 0.1.0)"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+module-name = "rustbpe"
+features = ["pyo3/extension-module"]

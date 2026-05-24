@@ -29,8 +29,12 @@ runs/
   speedrun.sh            # full GPU pipeline; swaps base_train → wrappers.train_$OVERLAY
   runcpu.sh              # CPU/macOS smoke run (depth=6, 5000 iters)
   lambda.sh              # Lambda Cloud REST wrapper: launch / bootstrap / ssh / terminate
+  build_rustbpe.sh       # build vendored rustbpe (or a variant); see "Tokenizer variants" below
 tools/
   compare_runs.py        # pull wandb metrics for N runs; side-by-side table + trajectory
+  eval_tokenizer.py      # offline tokenizer eval harness (Tier 1/2 metrics, multi-tokenizer compare)
+rustbpe/                 # PRISTINE vendored Karpathy rustbpe (commit 9467d83); built via build_rustbpe.sh
+rustbpe_variants/        # parallel-crate variants; each produces a uniquely-named Python module
 results/                 # per-run logs / checkpoints / metadata (gitignored)
 ```
 
@@ -318,6 +322,30 @@ diff ../nanochat/scripts/base_train.py wrappers/train_<idea>.py
 
 Pull harness improvements by hand-merging the diff after each upstream sync.
 
+## Tokenizer variants — `rustbpe/` + `rustbpe_variants/`
+
+For the tokenizer-experiment track (see [`ideas/tokenizer-variants/README.md`](ideas/tokenizer-variants/README.md)) we vendor Karpathy's `rustbpe` Rust crate at [`rustbpe/`](rustbpe/) — pristine, lifted from upstream commit `9467d83` (the last pristine version before user mods on the `seed_tokens` / `force_merges_wip` branches). Variants live in [`rustbpe_variants/<name>/`](rustbpe_variants/) as fully independent crates producing uniquely-named Python modules so multiple variants coexist in one venv.
+
+**Default state:** the venv has PyPI `rustbpe` from `uv sync`. This is functionally identical to our vendored pristine (both build from the same source). Build the vendored copy only when you want to modify the Rust source for experiments.
+
+**Build commands:**
+```bash
+# Build pristine vendored rustbpe → overrides PyPI rustbpe in venv
+bash runs/build_rustbpe.sh
+
+# Build a variant (must exist at rustbpe_variants/<name>/)
+VARIANT=seed_tokens bash runs/build_rustbpe.sh
+
+# Release-mode build (slower compile, faster runtime; for actual training)
+RELEASE=1 bash runs/build_rustbpe.sh
+```
+
+**Reverting to PyPI:** `uv sync` reinstalls the PyPI version, overriding any locally-built copy. So the default-after-setup state is always PyPI; build commands are explicitly scoped to variant work.
+
+**Prereqs:** Rust toolchain (`rustup` from https://rustup.rs/). `maturin` auto-installs into the sandbox venv on first build. Incremental rebuilds in dev mode complete in ~5–10s.
+
+See [`rustbpe_variants/README.md`](rustbpe_variants/README.md) for the variant-overlay pattern (Cargo / pyproject / `#[pymodule]` renames; matching `wrappers/tok_train_<name>.py` to alias `sys.modules['rustbpe']` before invoking `scripts.tok_train`).
+
 ## Quick reference
 
 | Action | Command |
@@ -326,6 +354,9 @@ Pull harness improvements by hand-merging the diff after each upstream sync.
 | Provision Lambda instance + bootstrap | `read ID IP < <(bash runs/lambda.sh launch \| tail -1); bash runs/lambda.sh bootstrap "$ID"` |
 | Terminate Lambda instance | `bash runs/lambda.sh terminate <id>` |
 | Compare runs (A/B from wandb) | `uv run python -m tools.compare_runs RUN_A RUN_B [RUN_C ...]` |
+| Evaluate tokenizer(s) offline | `uv run python -m tools.eval_tokenizer [--tokenizers ours,gpt2,gpt4,/path/...] [--full]` |
+| Build vendored rustbpe (pristine) | `bash runs/build_rustbpe.sh` |
+| Build a rustbpe variant | `VARIANT=<name> bash runs/build_rustbpe.sh` |
 | Verify wiring | `uv run python -m wrappers.smoke_zloss` |
 | Full GPU run | `OVERLAY=zloss bash runs/speedrun.sh` |
 | CPU smoke run | `OVERLAY=zloss bash runs/runcpu.sh` |
