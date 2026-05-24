@@ -233,32 +233,30 @@ EOF
 
     # Seed wandb credentials on the host. Key piped over SSH stdin (never on
     # command line) so it doesn't appear in process listings on either side.
-    # `wandb login` writes ~/.netrc with mode 600 on the remote; subsequent
-    # training runs auto-auth from there. The WANDB_API_KEY-required check at
-    # the top of this function means we get here only if it's set or
-    # SKIP_WANDB=1.
-    #
-    # Verification matters: in a previous iteration this step swallowed
-    # `wandb login` errors with `>/dev/null 2>&1` and didn't check the SSH
-    # exit code, so a silent failure here let training proceed and crash on
-    # wandb.init() ~5 min in. We now: (a) keep wandb's stderr visible, (b)
-    # check the SSH exit code, (c) verify ~/.netrc actually has the entry.
+    # `wandb login` is the authoritative check — trust its exit code rather
+    # than second-guessing where it writes credentials (file location varies
+    # across wandb versions: ~/.netrc, ~/.config/wandb/, etc.). The
+    # WANDB_API_KEY-required check at the top of this function means we get
+    # here only if it's set or SKIP_WANDB=1.
     if [ -n "${WANDB_API_KEY:-}" ]; then
         echo "==> seeding wandb credentials on the host (from local WANDB_API_KEY)" >&2
+        # Non-interactive ssh doesn't source ~/.bashrc / ~/.profile, so the
+        # uv installer's PATH addition (~/.local/bin) isn't picked up. Add it
+        # explicitly. (setup.sh / speedrun.sh / runcpu.sh do the same at top.)
         if ssh -o StrictHostKeyChecking=accept-new "$user@$ip" \
-            'cd ~/sandbox && uv run wandb login --relogin "$(cat)" 2>&1 >/dev/null && grep -q "machine api.wandb.ai" ~/.netrc && echo "    wandb login: ok (verified ~/.netrc)"' \
+            'export PATH="$HOME/.local/bin:$PATH" && cd ~/sandbox && uv run wandb login --relogin "$(cat)"' \
             <<< "$WANDB_API_KEY"; then
-            :  # success message already printed by the remote command
+            echo "    wandb login: ok" >&2
         else
             cat >&2 <<EOF
 
-ERROR: wandb login on the host failed or did not write ~/.netrc as expected.
-       See the wandb error output above (if any). Common causes:
+ERROR: wandb login on the host exited non-zero. See the wandb output above.
+       Common causes:
          - WANDB_API_KEY value is malformed (extra whitespace? wrong format?)
          - wandb CLI couldn't reach api.wandb.ai (network / proxy issue)
          - the venv on the host doesn't have wandb installed (re-run bootstrap
            to ensure setup.sh finished)
-       Training will crash on wandb.init() ~5 min in; fix this before launching.
+       Training will crash on wandb.init() ~5 min in; fix before launching.
 
        Workaround: ssh in and run \`uv run wandb login\` interactively, then
        re-launch training (no need to re-bootstrap).
