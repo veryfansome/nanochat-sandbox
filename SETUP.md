@@ -86,12 +86,16 @@ For Lambda Cloud, `runs/lambda.sh` wraps the REST API to provision, bootstrap, S
 export LAMBDA_API_KEY=...           # https://cloud.lambda.ai/api-keys
 export LAMBDA_SSH_KEY=mykey         # name of an SSH key already uploaded to Lambda
                                     # (not a local file path)
+export WANDB_API_KEY=...            # optional; if set, `bootstrap` will pipe it
+                                    # to the host over stdin and run `wandb
+                                    # login` there so training auto-authenticates
 
 # 1. launch an 8xH100 (default; --type / --region to override). Auto-picks a
 #    region with capacity. Polls until active; final stdout line is "<id> <ip>".
 read ID IP < <(bash runs/lambda.sh launch | tail -1)
 
-# 2. rsync this sandbox/ to the instance and run setup.sh on it
+# 2. rsync this sandbox/ to the instance, run setup.sh, and (if WANDB_API_KEY
+#    is set) seed wandb credentials on the host
 bash runs/lambda.sh bootstrap "$ID"
 
 # 3. SSH in

@@ -20,6 +20,22 @@
 #   WANDB_RUN   wandb run name (default: dummy = disabled)
 #   NANOCHAT_BASE_DIR  artifact dir (default: ~/.cache/nanochat)
 #   FORCE_RETRAIN_TOKENIZER  set to 1 to retrain tokenizer even if cached (default: 0)
+#   USE_FP8     pass --fp8 to base_train (default: 1; set to 0 for A100 / V100
+#               or any non-H100 hardware that lacks FP8 tensor cores — upstream
+#               speedrun's leaderboard times assume H100 SXM5 with fp8)
+#   WINDOW_PATTERN  --window-pattern for base_train (default: SSSL, upstream
+#               speedrun). Set WINDOW_PATTERN=L on A100/V100/any non-FA3
+#               hardware: PyTorch SDPA has no sliding-window kernels, so the
+#               default SSSL pattern simulates with masking and tanks GPU
+#               utilization. L = full context attention everywhere, well-
+#               optimized in SDPA. Internally-consistent A/B is preserved as
+#               long as baseline and overlay runs share the same value.
+#   DEVICE_BATCH_SIZE  --device-batch-size for base_train / base_eval /
+#               chat_sft / chat_eval (default: 16, upstream speedrun, tuned
+#               for H100 80GB). Drop to 8 on A100 40GB to avoid OOM. Halving
+#               this doubles grad-accum steps (total batch size held constant
+#               by base_train), so wall-clock per training step roughly
+#               doubles. Lower = OOM-safe, slower; higher = more memory.
 
 set -euo pipefail
 
@@ -53,11 +69,30 @@ DEPTH="${DEPTH:-24}"
 MODEL_TAG="${MODEL_TAG:-d${DEPTH}_${OVERLAY:-baseline}}"
 WANDB_RUN="${WANDB_RUN:-dummy}"
 
+# FP8 toggle: default on (H100+); set USE_FP8=0 to drop --fp8 for A100/V100/etc.
+USE_FP8="${USE_FP8:-1}"
+FP8_FLAG=""
+[ "$USE_FP8" = "1" ] && FP8_FLAG="--fp8"
+
+# Window pattern: default SSSL (upstream speedrun, H100+FA3); set
+# WINDOW_PATTERN=L on A100/V100/any non-FA3 hardware (SDPA can't do
+# sliding-window efficiently).
+WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
+
+# Per-device per-microbatch size. Default 16 (H100 80GB). Drop to 8 on A100
+# 40GB to avoid OOM. base_train holds the total batch size constant by
+# adjusting grad-accum steps, so halving this doubles wall-clock per step
+# but preserves the effective batch.
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
+
 echo "==> overlay:      ${OVERLAY:-(baseline)}"
 echo "==> train module: $TRAIN_MODULE"
 echo "==> model tag:    $MODEL_TAG"
 echo "==> nproc:        $NPROC"
 echo "==> depth:        $DEPTH"
+echo "==> fp8:          $USE_FP8"
+echo "==> window:       $WINDOW_PATTERN"
+echo "==> dev batch:    $DEVICE_BATCH_SIZE"
 echo "==> wandb run:    $WANDB_RUN"
 echo "==> base dir:     $NANOCHAT_BASE_DIR"
 echo "==> nanochat:     $(git -C ../nanochat rev-parse --short HEAD)"
@@ -87,14 +122,18 @@ fi
 echo "Waiting for background dataset download to complete..."
 wait $DATASET_PID
 
-# Mirrors upstream: --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8
-# The only swap is $TRAIN_MODULE in place of scripts.base_train.
+# Mirrors upstream: --depth=24 --target-param-data-ratio=8 (+ --fp8 if
+# USE_FP8=1, default). The only swap is $TRAIN_MODULE in place of
+# scripts.base_train. $FP8_FLAG is "" or "--fp8" — bash word-splitting drops
+# the arg cleanly when empty. --window-pattern and --device-batch-size are
+# env-controlled for non-H100 hardware compatibility.
 torchrun --standalone --nproc_per_node="$NPROC" -m "$TRAIN_MODULE" -- \
-    --depth="$DEPTH" --target-param-data-ratio=8 --device-batch-size=16 --fp8 \
+    --depth="$DEPTH" --target-param-data-ratio=8 --device-batch-size="$DEVICE_BATCH_SIZE" $FP8_FLAG \
+    --window-pattern="$WINDOW_PATTERN" \
     --model-tag="$MODEL_TAG" --run="$WANDB_RUN"
 
 torchrun --standalone --nproc_per_node="$NPROC" -m scripts.base_eval -- \
-    --model-tag="$MODEL_TAG" --device-batch-size=16
+    --model-tag="$MODEL_TAG" --device-batch-size="$DEVICE_BATCH_SIZE"
 
 # Archive base-stage artifacts to sandbox/results/$MODEL_TAG/ BEFORE SFT (or
 # the next run) overwrites them. Eval CSV path doesn't include $MODEL_TAG
@@ -114,6 +153,9 @@ git -C ../nanochat rev-parse HEAD > "$ARCHIVE_DIR/NANOCHAT_COMMIT" 2>/dev/null |
     echo "WANDB_RUN=$WANDB_RUN"
     echo "DEPTH=$DEPTH"
     echo "NPROC=$NPROC"
+    echo "USE_FP8=$USE_FP8"
+    echo "WINDOW_PATTERN=$WINDOW_PATTERN"
+    echo "DEVICE_BATCH_SIZE=$DEVICE_BATCH_SIZE"
     [ -n "${Z_LOSS_COEFF:-}" ] && echo "Z_LOSS_COEFF=$Z_LOSS_COEFF"
     echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$ARCHIVE_DIR/ENV"
@@ -125,7 +167,7 @@ curl -L -o "$NANOCHAT_BASE_DIR/identity_conversations.jsonl" \
     https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 torchrun --standalone --nproc_per_node="$NPROC" -m scripts.chat_sft -- \
-    --model-tag="$MODEL_TAG" --device-batch-size=16 --run="$WANDB_RUN"
+    --model-tag="$MODEL_TAG" --device-batch-size="$DEVICE_BATCH_SIZE" --run="$WANDB_RUN"
 torchrun --standalone --nproc_per_node="$NPROC" -m scripts.chat_eval -- \
     --model-tag="$MODEL_TAG" -i sft
 
