@@ -36,6 +36,14 @@
 #               this doubles grad-accum steps (total batch size held constant
 #               by base_train), so wall-clock per training step roughly
 #               doubles. Lower = OOM-safe, slower; higher = more memory.
+#   USE_SFT     run chat_sft + chat_eval after base_train (default: 0). This
+#               *differs* from upstream's speedrun: our default workflow is
+#               overlay A/B, where neither overlay touches SFT, so chat_eval
+#               just adds noise + cost (~$10-20/run) without informative
+#               signal. Set USE_SFT=1 if you want the chat pipeline (full
+#               nanochat experience, or to validate a base checkpoint that
+#               looked interesting). The base checkpoint persists either way,
+#               so you can manually re-run SFT against it later.
 
 set -euo pipefail
 
@@ -85,6 +93,12 @@ WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 # but preserves the effective batch.
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
 
+# Run chat_sft + chat_eval after base_train? Default OFF — neither overlay
+# touches SFT, so chat_eval at our scale is noisy and not informative for
+# A/B comparison. The base checkpoint persists; SFT can be re-run manually
+# against any saved checkpoint if needed. Set USE_SFT=1 for the full pipeline.
+USE_SFT="${USE_SFT:-0}"
+
 echo "==> overlay:      ${OVERLAY:-(baseline)}"
 echo "==> train module: $TRAIN_MODULE"
 echo "==> model tag:    $MODEL_TAG"
@@ -93,6 +107,7 @@ echo "==> depth:        $DEPTH"
 echo "==> fp8:          $USE_FP8"
 echo "==> window:       $WINDOW_PATTERN"
 echo "==> dev batch:    $DEVICE_BATCH_SIZE"
+echo "==> sft:          $USE_SFT"
 echo "==> wandb run:    $WANDB_RUN"
 echo "==> base dir:     $NANOCHAT_BASE_DIR"
 echo "==> nanochat:     $(git -C ../nanochat rev-parse --short HEAD)"
@@ -156,20 +171,25 @@ git -C ../nanochat rev-parse HEAD > "$ARCHIVE_DIR/NANOCHAT_COMMIT" 2>/dev/null |
     echo "USE_FP8=$USE_FP8"
     echo "WINDOW_PATTERN=$WINDOW_PATTERN"
     echo "DEVICE_BATCH_SIZE=$DEVICE_BATCH_SIZE"
+    echo "USE_SFT=$USE_SFT"
     [ -n "${Z_LOSS_COEFF:-}" ] && echo "Z_LOSS_COEFF=$Z_LOSS_COEFF"
     echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$ARCHIVE_DIR/ENV"
 echo "==> archived base-stage artifacts to $ARCHIVE_DIR/"
 
 # -----------------------------------------------------------------------------
-# SFT
-curl -L -o "$NANOCHAT_BASE_DIR/identity_conversations.jsonl" \
-    https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+# SFT + chat_eval (opt-in via USE_SFT=1 — see header for why default is off)
+if [ "$USE_SFT" = "1" ]; then
+    curl -L -o "$NANOCHAT_BASE_DIR/identity_conversations.jsonl" \
+        https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
-torchrun --standalone --nproc_per_node="$NPROC" -m scripts.chat_sft -- \
-    --model-tag="$MODEL_TAG" --device-batch-size="$DEVICE_BATCH_SIZE" --run="$WANDB_RUN"
-torchrun --standalone --nproc_per_node="$NPROC" -m scripts.chat_eval -- \
-    --model-tag="$MODEL_TAG" -i sft
+    torchrun --standalone --nproc_per_node="$NPROC" -m scripts.chat_sft -- \
+        --model-tag="$MODEL_TAG" --device-batch-size="$DEVICE_BATCH_SIZE" --run="$WANDB_RUN"
+    torchrun --standalone --nproc_per_node="$NPROC" -m scripts.chat_eval -- \
+        --model-tag="$MODEL_TAG" -i sft
+else
+    echo "==> skipping chat_sft + chat_eval (USE_SFT=0 — set USE_SFT=1 to run them)" >&2
+fi
 
 # -----------------------------------------------------------------------------
 # Final report (markdown)
