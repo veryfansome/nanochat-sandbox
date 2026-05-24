@@ -204,12 +204,15 @@ This is the entire integration — `base_train.py`'s `from nanochat.gpt import G
 
 ### 3. The smoke test — `wrappers/smoke_<idea>.py`
 
-Three checks (no data, no training):
+Four required checks + one conditional (no data, no training):
+
 - **(a) Forward-correctness**: build a tiny baseline and a subclass with identical weights, run forward on random tokens, assert the difference equals what your math says it should.
 - **(b) Config-portability**: `asdict(my_idea_model.config).keys()` equals `asdict(baseline.config).keys()` — confirms no overlay-only fields leak into the saved checkpoint. **This would have caught a real bug in z-loss.** Skip only if your overlay genuinely needs to change the config (see hyperparameter-placement section above).
 - **(c) Monkeypatch**: after `g.GPT = MyIdeaGPT`, assert `from nanochat.gpt import GPT` resolves to `MyIdeaGPT`.
+- **(d) Fused/naive numerical equivalence** *(only if your overlay has a custom `torch.autograd.Function` fast path)*: assert loss bit-exact and gradients agree to ~1e-4 vs the naive two-op formulation. See `wrappers/smoke_zloss.py` check `(d)` for the template.
+- **(e) Eval-path equivalence — REQUIRED for any overlay that adds to the loss tensor**: with a nonzero overlay coefficient, `MyIdeaGPT(..., loss_reduction='none')` and `MyIdeaGPT(..., loss_reduction='sum')` must match vanilla GPT exactly. The eval path (`nanochat/loss_eval.py`'s `evaluate_bpb`) calls the model with `loss_reduction='none'` to compute per-token bpb and expects baseline-comparable numbers. **Aux losses must be confined to `loss_reduction='mean'`** (the training path) — any contribution on the eval path inflates `val/bpb` and makes overlay runs non-comparable to baseline. See `wrappers/smoke_zloss.py` check `(e)` for the template. (This is not optional — z-loss had this bug for an entire d24 trip despite the rule being documented in `overlay/README.md`. The smoke is enforcement; the docs are not.)
 
-`wrappers/smoke_zloss.py` is the working template — copy it and adapt the math check. Always run the smoke before any real training.
+`wrappers/smoke_zloss.py` is the working template — copy it and adapt the math check + the overlay-coefficient name. Always run the smoke before any real training.
 
 ### Overrides that may also be needed
 

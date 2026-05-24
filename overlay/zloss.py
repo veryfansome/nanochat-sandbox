@@ -136,8 +136,10 @@ def _fused_ce_zloss(logits: torch.Tensor, targets: torch.Tensor, z_coeff: float,
 
 class ZLossGPT(GPT):
     """GPT + auxiliary z-loss term. `z_coeff` lives as an instance attribute
-    (not a config field — see module docstring). Fused autograd by default,
-    naive opt-in via `ZLOSS_FUSED=0`.
+    (not a config field — see module docstring). **Naive** (`F.cross_entropy` +
+    `torch.logsumexp`) is the default; fused Python autograd (`_FusedCEZLoss`)
+    is opt-in via `ZLOSS_FUSED=1`. See the module docstring for why naive wins
+    on throughput in pure PyTorch.
     """
 
     def __init__(self, config):
@@ -164,7 +166,13 @@ class ZLossGPT(GPT):
             ignore_index=-1,
             reduction=loss_reduction,
         )
-        if self.z_loss_coeff == 0.0:
+        # Eval-path contract: when `loss_reduction != 'mean'`, `nanochat/loss_eval.py`
+        # is computing per-token CE for `val/bpb` and expects baseline-comparable
+        # numbers. Adding the scalar z-loss term here broadcasts a constant offset
+        # onto every per-token loss, inflating bpb by `z_coeff·E[lse²] / mean_bytes /
+        # ln 2`. The aux supervision is a training regularizer only; the eval metric
+        # must reflect pure next-token prediction. (Smoke check (e) enforces this.)
+        if self.z_loss_coeff == 0.0 or loss_reduction != 'mean':
             return ce
         lse = torch.logsumexp(logits, dim=-1)  # (B, T)
         mask = (targets != -1)

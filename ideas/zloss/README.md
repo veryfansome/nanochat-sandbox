@@ -1,33 +1,47 @@
 # z-loss
 
-Status: **implemented** — overlay + wrapper + smoke are checked in; real-data validation pending.
+Status: **validated at d24/8xA100 — real positive result.** CORE +5.15% (base_eval, full), throughput cost <1%, val/bpb cost in noise (artifact-corrected). Worth adopting.
 Target repo: `nanochat` (Karpathy) — kept **pristine**, never edited.
 
-## Current state
+## Current state — d24 results (8xA100 40GB)
 
-The mechanism is live and smoke-verified:
+| metric | baseline | zloss | Δ | notes |
+|---|---:|---:|---:|---|
+| CORE (`base_eval`, full per-task) | 0.250488 | **0.263387** | **+0.01290 (+5.15%)** | 16 wins / 5 losses / 1 tie of 22 (one-sided sign test dropping the tie: p ≈ 0.013) |
+| CORE (wandb, mid-training subsample) | 0.260098 | 0.268057 | +0.00796 (+3.06%) | subsample noisier; base_eval is authoritative |
+| val/bpb (final, observed) | 0.71609 | 0.72009 | +0.00400 (+0.56%) | **artifactual — see "Eval-path bug" below** |
+| val/bpb (corrected, post-fix) | 0.71609 | ~0.71609 ± noise | ≈ 0 | no underlying perplexity cost |
+| train tok/sec | 291,210 | 288,483 | −0.94% | within noise |
+| total time | 5h33m | 5h36m | +0.95% | ~$1 extra |
 
-- [`../../overlay/zloss.py`](../../overlay/zloss.py) — `ZLossGPT(GPT)`. Forward returns `baseline_CE + z_coeff · mean(logsumexp(logits)²)` over non-ignored target positions. Two implementations:
-  - **Naive** (default) — `F.cross_entropy(logits, ...)` + `torch.logsumexp(logits, ...)` as two separate ops. PyTorch's C++ CE is highly optimized; the extra `(B,T,V)` saved-for-backward tensor costs ~7% throughput at d6/M4 but no other measurable problem. This is the right default in pure PyTorch.
-  - **Fused — Python autograd** (opt-in via `ZLOSS_FUSED=1`) — a custom `torch.autograd.Function` (`_FusedCEZLoss`) that computes CE + z-term from one `log_softmax` and saves only `log_probs` for backward. **Numerically correct** (bit-exact loss + ~2e-8 grad agreement, verified by smoke check `(d)`) and saves ~50% backward memory, but in pure PyTorch it replaces optimized C++ CE with Python ops — measured ~32% slower than baseline at d6/M4. Kept as a numerical reference / for memory-constrained scenarios; a real throughput win requires a CUDA/Triton fused kernel (Liger, cut-cross-entropy), which is out of scope here.
+The CORE gain is concentrated on high-N robust tasks: **piqa +3.9pp** (N=1838), **commonsense_qa +3.4pp** (N=1221), **lambada +1.7pp**, **coqa +2.0pp**. Big bigbench-subtask wins (dyck +6.2pp, lsat_ar +6.0pp) are real but inflated by sampling on small N. The few regressions are small (≤2.2pp) and concentrated on noisier tasks. The asymmetry — robust wins on big datasets, small losses on noisy ones — is what a real-but-modest improvement looks like.
+
+### Eval-path bug (discovered post-hoc; fixed)
+
+The reported val/bpb regression of +0.004 turned out to be entirely artifactual. The original `ZLossGPT.forward` added the scalar z-loss term (`z_coeff · mean(lse²)`) to the CE tensor regardless of `loss_reduction`. When `nanochat/loss_eval.py` called `model(x, y, loss_reduction='none')` to compute val/bpb, the scalar broadcast onto every per-token loss, inflating bpb by `z_coeff·E[lse²] / mean_bytes / ln 2`. With `z_coeff=1e-4` and `mean(lse²) ≈ 100-150` at trained scale, that's exactly the observed Δbpb ≈ 0.004.
+
+**Fix**: `forward` now branches on `loss_reduction != 'mean'` and returns plain CE on the eval path (matching `mtp.py`'s pattern). **Smoke check `(e)` enforces this contract** — with nonzero `z_coeff`, `ZLossGPT(..., loss_reduction='none')` must match vanilla GPT exactly. The bug would have been caught immediately had the smoke checked this; the lesson "aux losses must be confined to the training path" was documented in [`../../overlay/README.md`](../../overlay/README.md) but text-only lessons aren't enforcement.
+
+The d24 CORE result is unaffected (CORE is evaluated by a separate pipeline that doesn't go through this forward path).
+
+### Components
+
+- [`../../overlay/zloss.py`](../../overlay/zloss.py) — `ZLossGPT(GPT)`. Training path returns `baseline_CE + z_coeff · mean(logsumexp(logits)²)`; eval path (`loss_reduction != 'mean'`) returns plain CE. Two implementations:
+  - **Naive** (default) — `F.cross_entropy` + `torch.logsumexp` as two separate ops. PyTorch's C++ CE is highly optimized; the extra `(B,T,V)` saved-for-backward tensor costs ~7% throughput at d6/M4 and ~1% at d24/8xA100. Right default in pure PyTorch.
+  - **Fused — Python autograd** (opt-in via `ZLOSS_FUSED=1`) — a custom `torch.autograd.Function` (`_FusedCEZLoss`) that computes CE + z-term from one `log_softmax` and saves only `log_probs` for backward. **Numerically correct** (bit-exact loss + ~2e-8 grad agreement, smoke check `(d)`) and saves ~50% backward memory, but ~32% slower than baseline at d6/M4 (Python ops replace optimized C++ CE). Kept as a numerical reference / for memory-constrained scenarios; a real throughput win requires a CUDA/Triton fused kernel (Liger, cut-cross-entropy).
 - [`../../wrappers/train_zloss.py`](../../wrappers/train_zloss.py) — patches `nanochat.gpt.GPT` then `runpy.run_module("scripts.base_train")`. Does **not** patch `GPTConfig`. Six lines.
-- [`../../wrappers/smoke_zloss.py`](../../wrappers/smoke_zloss.py) — verifies (a) forward math, (b) config-portability (no overlay-only fields leak into the saved checkpoint), (c) monkeypatch, (d) fused-vs-naive numerical equivalence (loss bit-exact, gradients within ~2e-8). Passes in <5 sec with no data.
+- [`../../wrappers/smoke_zloss.py`](../../wrappers/smoke_zloss.py) — verifies (a) forward math, (b) config-portability, (c) monkeypatch, (d) fused-vs-naive equivalence, (e) eval-path contract. Passes in <5 sec with no data.
 
 Run the smoke any time: `uv run python -m wrappers.smoke_zloss`.
 
-Next milestone — real-data validation:
-
-- Cheap: `OVERLAY=zloss bash runs/runcpu.sh` (~50 min on M4); compare `val_bpb` vs. a baseline run on the same nanochat commit + seed.
-- Real: `OVERLAY=zloss bash runs/speedrun.sh` on a GPU node; primary metrics are CORE and `val_bpb`, plus training-loss spike frequency/max (stability is half the point of z-loss).
-
-For A/B-ing the fused vs naive implementations (to confirm the memory/throughput observations below):
+For A/B-ing the fused vs naive implementations (to reconfirm the memory/throughput observations below):
 
 ```bash
-# default = fused
-WANDB_RUN=d6_zloss_fused MODEL_TAG=d6_zloss_fused OVERLAY=zloss bash runs/runcpu.sh
+# default = naive (no env var needed)
+WANDB_RUN=d6_zloss_naive MODEL_TAG=d6_zloss_naive OVERLAY=zloss bash runs/runcpu.sh
 
-# opt out: naive
-ZLOSS_FUSED=0 WANDB_RUN=d6_zloss_naive MODEL_TAG=d6_zloss_naive OVERLAY=zloss bash runs/runcpu.sh
+# opt in: fused (Python autograd)
+ZLOSS_FUSED=1 WANDB_RUN=d6_zloss_fused MODEL_TAG=d6_zloss_fused OVERLAY=zloss bash runs/runcpu.sh
 
 uv run python -m tools.compare_runs d6_baseline d6_zloss_naive d6_zloss_fused
 ```

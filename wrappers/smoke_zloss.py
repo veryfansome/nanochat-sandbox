@@ -11,6 +11,11 @@ Verifies, without training and without data:
       `wrappers/train_zloss.py` uses for `scripts.base_train`.
   (d) Fused == naive: the fused autograd path and the naive two-op path
       produce numerically equivalent loss AND gradients on a tiny model.
+  (e) Eval-path contract: with a nonzero z_coeff, ZLossGPT called with
+      `loss_reduction='none'` (the path nanochat/loss_eval.py uses for
+      val/bpb) must return per-token CE that matches vanilla GPT exactly.
+      A previous regression silently added the scalar z-loss term on this
+      path, inflating val/bpb by a constant offset on every token.
 
 Run:
     uv run python -m wrappers.smoke_zloss
@@ -178,6 +183,56 @@ def check_fused_equivalence() -> None:
         print("[PASS] (d) Fused and naive paths give equivalent loss and gradients.")
 
 
+def check_eval_path_contract() -> None:
+    """With nonzero z_coeff, `loss_reduction='none'` must return per-token CE
+    that matches vanilla GPT exactly. This is the path `nanochat/loss_eval.py`
+    uses to compute val/bpb. Any contribution from the z-loss term inflates
+    the metric and makes overlay runs non-comparable to baseline.
+
+    Regression coverage: a previous version applied `+ z_coeff·z` (a scalar)
+    to `ce` regardless of reduction; with reduction='none' the scalar broadcast
+    onto every per-token loss, inflating val/bpb by a constant offset.
+    """
+    device = torch.device("cpu")
+    torch.manual_seed(0)
+    cfg = GPTConfig(**CFG_KWARGS)
+
+    with _env("Z_LOSS_COEFF", "0.1"):  # exaggerated; bug-was-here would dwarf 1e-4 too
+        base = RealGPT(cfg)
+        base.init_weights()
+        base = base.to(device)
+
+        z = ZLossGPT(cfg).to(device)
+        z.load_state_dict(base.state_dict())
+        assert z.z_loss_coeff == 0.1 and not z.use_fused
+
+        B, T = 2, 16
+        idx = torch.randint(0, CFG_KWARGS["vocab_size"], (B, T), device=device)
+        targets = torch.randint(0, CFG_KWARGS["vocab_size"], (B, T), device=device)
+        targets[0, 5] = -1  # exercise the mask
+        targets[1, 10] = -1
+
+        with torch.no_grad():
+            base.eval(); z.eval()
+            ce_base_none = base(idx, targets=targets, loss_reduction='none')
+            ce_z_none = z(idx, targets=targets, loss_reduction='none')
+            ce_base_sum = base(idx, targets=targets, loss_reduction='sum')
+            ce_z_sum = z(idx, targets=targets, loss_reduction='sum')
+
+        max_abs_none = (ce_base_none - ce_z_none).abs().max().item()
+        abs_sum = (ce_base_sum - ce_z_sum).abs().item()
+        print(f"  reduction='none': max |Δ per-token CE| = {max_abs_none:.2e}  (shape: {ce_z_none.shape})")
+        print(f"  reduction='sum':  |Δ total|            = {abs_sum:.2e}")
+        assert max_abs_none < 1e-6, (
+            f"z-loss leaks into eval path (reduction='none'): max per-token diff "
+            f"= {max_abs_none:.2e}. The z-loss term must only apply when "
+            f"loss_reduction='mean' — see `forward` and overlay/README.md "
+            f"'Aux losses are a training-time regularizer'."
+        )
+        assert abs_sum < 1e-5, f"z-loss leaks into eval path (reduction='sum'): {abs_sum:.2e}"
+        print("[PASS] (e) Eval path returns baseline-comparable CE — z-loss term confined to reduction='mean'.")
+
+
 if __name__ == "__main__":
     print("=== z-loss overlay smoke test ===")
     print("\n[a] forward-correctness (naive default)")
@@ -188,4 +243,6 @@ if __name__ == "__main__":
     check_monkeypatch()
     print("\n[d] fused == naive (loss + gradients)")
     check_fused_equivalence()
+    print("\n[e] eval-path contract (loss_reduction != 'mean' → baseline-comparable)")
+    check_eval_path_contract()
     print("\nAll checks passed.")

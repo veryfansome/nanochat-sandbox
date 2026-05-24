@@ -6,8 +6,8 @@ Working state of the project — implementation progress, current focus, sequenc
 
 | Idea | Designed | Implemented | Smoke ✓ | Real-data ✓ |
 |------|:--------:|:-----------:|:-------:|:-----------:|
-| [z-loss](ideas/zloss/README.md) | ✓ | ✓ (naive default; fused autograd opt-in via `ZLOSS_FUSED=1`) | ✓ (a/b/c/d) | partial — d6/M4 only |
-| [MTP](ideas/mtp/README.md) | ✓ | ✓ (naive only; shared unembedding; k=3 default) | ✓ (a/b/c) | d6/M4 measured — val/bpb +4.17%, tok/sec −32% vs baseline (expected toy-scale signature of a scale-dependent technique). GPU validation pending. |
+| [z-loss](ideas/zloss/README.md) | ✓ | ✓ (naive default; fused autograd opt-in via `ZLOSS_FUSED=1`) | ✓ (a/b/c/d/e) | **✓ d24/8xA100 — real positive: CORE +5.15%, val/bpb cost ≈ 0 (artifact-corrected)** |
+| [MTP](ideas/mtp/README.md) | ✓ | ✓ (naive only; shared unembedding; k=3 default) | ✓ (a/b/c) | **✓ d24/8xA100 — net negative: val/bpb +8.78%, CORE "win" one-task; deprioritized** |
 | [Deep supervision](ideas/deep-supervision/README.md) | ✓ | — | — | — |
 | [Token-level loss weighting](ideas/token-loss-weighting/README.md) | ✓ | — | — | — |
 | [Differential attention](ideas/diff-attention/README.md) | ✓ | — | — | — |
@@ -17,29 +17,54 @@ Working state of the project — implementation progress, current focus, sequenc
 | [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | partial — `tools/eval_tokenizer.py` harness done; pristine `sandbox/rustbpe/` vendored; three variants ported (`space_digits` [Py-only], `force_merges` [Rust], `seed_tokens` [Rust]) | ✓ all three (smoke_tok_train_{space_digits,force_merges,seed_tokens}) | — |
 | [Non-backprop (DFA → block-local)](ideas/non-backprop/README.md) | ✓ (research track) | — | — | — |
 
-## Currently in flight
+## d24 trio results (8xA100 40GB, ~$337 wall-clock)
 
-Three overlays measured at d6/M4 scale; runs synced to wandb and archived under `results/`. Every result here is mechanism-verification, not capability claim — the d6/5000-iter regime is below the noise/signal threshold for any of these techniques per `ideas/README.md` "Lessons learned (ideation)".
+Sequential trio on a single Lambda instance; baseline included SFT (subsequently `USE_SFT` defaulted to 0 — workflow tweak, not a hardware constraint). All three share the same nanochat commit, seed, and hardware envvars (`USE_FP8=0 WINDOW_PATTERN=L`). MTP needed `DEVICE_BATCH_SIZE=4` (vs 8 for the others) to fit 40GB HBM with k=3 aux softmaxes.
 
-- **`d6_baseline`** (wandb `qdoniwrj`) — `val/bpb` 1.16534. Pure baseline reference. (Original CORE CSV was overwritten before auto-archive landed; recovering it would require a retrain.)
-- **`d6_zloss`** (wandb `szesl4yg`) — `val/bpb` 1.17007 (+0.41% vs baseline; within noise). Naive `F.cross_entropy` + `torch.logsumexp`. tok/sec ~7% under baseline. CORE 0.0361.
-- **`d6_zloss_fused`** (wandb `de562k89`, killed at ~300 steps) — confirmed the Python fused-autograd path is **numerically correct** (bit-exact loss + ~2e-8 grad agreement vs naive) but **~32% slower than baseline** in pure PyTorch (Python ops replace C++ CE). Default flipped to naive; opt in via `ZLOSS_FUSED=1`. See `ideas/zloss/README.md` "Expected cost".
-- **`d6_mtp`** (wandb `bcv9920m`) — `val/bpb` 1.21398 (+4.17% vs baseline; stable +0.045–0.049 gap from step ~500 onward). tok/sec ~32% under baseline (4 separate `F.cross_entropy` calls). CORE −0.0179. The val/bpb regression is the expected toy-scale MTP signature: aux supervision diverts gradient capacity from the main objective, and at 37M params / 5000 iters the model can't afford the dual objective. See `ideas/mtp/README.md` "Current state" for details.
+| | baseline | zloss | mtp |
+|---|---:|---:|---:|
+| wandb | `qmsi105c` | `06731h2o` | `b35xnu0d` |
+| `DEVICE_BATCH_SIZE` | 8 | 8 | **4** (k=3 softmaxes pushed B=8 to OOM) |
+| val/bpb (final) | 0.71609 | 0.72009* | 0.77898 |
+| CORE (`base_eval`, full) | 0.250488 | **0.263387** | 0.258635 |
+| tok/sec | 291,210 | 288,483 | 260,517 |
+| total time | 5h33m | 5h36m | 6h13m |
 
-Compare any combination:
+*zloss val/bpb is inflated by ~0.004 due to an eval-path bug (since fixed) — see below. mtp's batch-size asymmetry preserves total optimization signal (`base_train` holds total batch in tokens constant via grad-accum) but worth noting in any writeup.
+
+### Headline verdicts
+
+- **zloss is a real positive result and should be adopted.** CORE +5.15% with 16 wins / 5 losses / 1 tie across 22 tasks (one-sided sign test dropping the tie: p ≈ 0.013); val/bpb cost is ≈ 0 once the bug is corrected; throughput cost <1%. The CORE gain concentrates on robust high-N tasks (piqa +3.9pp on N=1838, commonsense_qa +3.4pp, lambada +1.7pp, coqa +2.0pp).
+
+- **MTP at our k=3, α=0.3, shared-unembedding config is a net loss at d24.** val/bpb regression got *worse* at scale (+4.17% at d6 → +8.78% at d24), not better as Gloeckle et al. predict. CORE "+3.25%" is essentially one task (boolq +0.111; excluding it, mean Δ across 21 tasks is +0.003 — pure noise). Sign test p ≈ 0.19, not significant. Compute cost +12%. Three rescue paths exist (α=0.1 + k=1 single-aux-head, DeepSeek-MTP architecture, scale to d30+) but none are next-up.
+
+### Eval-path bug in zloss (now fixed)
+
+The original `ZLossGPT.forward` added the scalar z-loss term to the CE tensor on every code path, including `loss_reduction='none'` (the path `nanochat/loss_eval.py` uses for val/bpb). That inflated val/bpb by a constant offset of `z_coeff·E[lse²] / mean_bytes / ln 2` ≈ 0.004 — exactly the originally-observed regression. Fix: `forward` now branches on `loss_reduction != 'mean'`. **Smoke check `(e)` was added to enforce this contract** — the lesson was already documented in [`overlay/README.md`](overlay/README.md), but text-only lessons aren't enforcement. MTP got the contract right because it was written *after* the lesson landed; zloss missed it because the rule postdated its first implementation. The d24 CORE result for zloss is unaffected by this bug — CORE is computed by a separate pipeline.
+
+### Earlier d6/M4 results (kept for reference)
+
+- **`d6_baseline`** (wandb `qdoniwrj`) — `val/bpb` 1.16534. Pure baseline reference.
+- **`d6_zloss`** (wandb `szesl4yg`) — `val/bpb` 1.17007 (within noise). tok/sec ~7% under baseline. CORE 0.0361.
+- **`d6_zloss_fused`** (wandb `de562k89`, killed at ~300 steps) — Python fused-autograd path is **numerically correct** (bit-exact loss + ~2e-8 grad agreement vs naive) but **~32% slower than baseline** in pure PyTorch. Default flipped to naive; opt in via `ZLOSS_FUSED=1`.
+- **`d6_mtp`** (wandb `bcv9920m`) — `val/bpb` 1.21398 (+4.17%). Showed the d24 regression's signature already at toy scale.
+
+Compare any subset (CORE now shows both wandb mid-training subsample and authoritative `base_eval` from local `eval.csv`):
 
 ```bash
-uv run python -m tools.compare_runs d6_baseline d6_zloss [d6_zloss_fused] [d6_mtp]
+uv run python -m tools.compare_runs d24_baseline d24_zloss d24_mtp
 ```
 
-## Suggested sequencing
+## Suggested sequencing (updated post-d24)
 
-1. **Cheapest first** — batch-size A/B (config-only), z-loss (done at d6 scale), layer-wise LR (overlay, ~0 cost), and **token-level loss weighting** (entropy / focal variants — pure-loss overlay, no extra model). Quick signal, no real engineering.
-2. **MTP** — the main capability + sample-efficiency lever. Next big build per the plan.
-3. **Deep supervision** — depth-axis complement to MTP; fold into the same subclass for one combined experiment. Token weighting's **RHO-Loss variant** can fold in here too (it shares the same `forward` surface and needs a reference model that can be added once for both).
+1. **z-loss is settled — adopt as the default for future speedruns.** Single open question worth ablating: turn off the existing logit-softcap (`gpt.py:472`) with z-loss on; the hard cap may now be unnecessary. Cheap d24 ablation, ~$100.
+2. **Deep supervision** — depth-axis complement to MTP; folds into the same `MTPGPT` subclass for one combined experiment. Token weighting's **RHO-Loss variant** can fold in here too (shares `forward` surface; needs a reference model that can be added once for both).
+3. **Token-level loss weighting** (entropy / focal variants) — pure-loss overlay, no extra model, independent of MTPGPT line. Cheap parallel track.
 4. **Differential attention** — independent architecture A/B.
 5. **Adaptive sequence length (Part A of adaptive-schedule)** — harness change, but the model needs no edits and Part A is the rare idea that should make the speedrun **faster on wall-clock** at the same final loss. Cheap-ish entry into the harness-change tier.
 6. **Online data selection + adaptive batch size (Part B of adaptive-schedule)** — bigger, harness-touching; pursue if earlier results justify it. Both share the copied-`base_train.py` pattern, so fold into a single forked harness. Online data selection is complementary to token weighting (sample-level vs. token-level signal shaping), so worth A/B-ing alone, weighting alone, and combined.
+
+MTP rescue probes (α=0.1+k=1 first) only happen if a follow-up idea raises a specific question that an MTP variant can answer. Don't revisit MTP for its own sake at d24.
 
 **[Tokenizer variants](ideas/tokenizer-variants/README.md)** is a **parallel track**. Infrastructure is now end-to-end ready: `tools/eval_tokenizer.py` harness validated; pristine rustbpe vendored at `sandbox/rustbpe/` (Karpathy@9467d83) with `runs/build_rustbpe.sh` for local builds; parallel-crate variants pattern in `sandbox/rustbpe_variants/`. **Three variants ported** from `veryfansome/nanochat` prior art:
 
@@ -53,17 +78,12 @@ The [non-backprop LLM](ideas/non-backprop/README.md) is a **separate research tr
 
 ## Next concrete steps
 
-1. **Real-data validation of z-loss and MTP on GPU.** d6/M4 results aren't capability-meaningful for either; both are scale-dependent techniques whose wins (if any) appear at GPT-2+ scale per the literature. Lambda speedrun via [`runs/lambda.sh`](runs/lambda.sh) → on the instance:
+1. **Optional zloss val/bpb re-eval** — the d24 zloss run's val/bpb is inflated by ~0.004 due to the eval-path bug (since fixed). Either re-run for a citable number (~$80, one Lambda spin) or document the corrected value analytically (`0.71609 + noise`, matching baseline — derivable from the fix mechanics). The CORE win is unaffected; this is bookkeeping.
 
-   ```bash
-   WANDB_RUN=d24_baseline bash runs/speedrun.sh
-   WANDB_RUN=d24_zloss MODEL_TAG=d24_zloss OVERLAY=zloss bash runs/speedrun.sh
-   WANDB_RUN=d24_mtp   MODEL_TAG=d24_mtp   OVERLAY=mtp   bash runs/speedrun.sh
-   uv run python -m tools.compare_runs d24_baseline d24_zloss d24_mtp
-   ```
+2. **Add smoke check (d) "eval-path equivalence" to MTP's smoke** — `mtp.py` honors the contract, but `wrappers/smoke_mtp.py` doesn't verify it. Copy the pattern from `wrappers/smoke_zloss.py` check (e). Cheap insurance against a future regression.
 
-2. **Build the next overlay** — per sequencing, **deep supervision** (folds into the same `MTPGPT` subclass) or **differential attention** (independent architecture A/B). Deep supervision is the more natural next step since the MTPGPT scaffolding is already in place. **Token-level loss weighting (entropy/focal variant)** is a viable parallel cheap track — pure-loss, no extra model, independent of the MTPGPT line — pick it up alongside if you want a second cheap signal in flight.
+3. **Build the next overlay** — per sequencing, **deep supervision** (folds into the existing `MTPGPT` subclass, scaffolding already in place) or **token-level loss weighting** (entropy/focal — pure-loss overlay, no extra model). Deep supervision is the more natural next step; token weighting is a viable parallel cheap track if you want two signals in flight.
 
-3. **Tokenizer-variants track (parallel, no GPU)** — build `tools/eval_tokenizer.py` (Tier 1 metrics: per-domain compression, vocab inspection, structural reversibility battery) and run variant 4 (tokenizer-training corpus mix) end-to-end as a workflow shakeout. Anything that survives Tier 1 + 2 + a d6 probe gets queued for the next Lambda session as an extra A/B alongside the model-side runs.
+4. **Tokenizer-variants track (parallel, no GPU)** — three variants now smoke-pass at d6/local scale. Next: train each on the full corpus, run `tools/eval_tokenizer.py` to compare on Tier 1/2 metrics, pick survivors for a Lambda speedrun A/B alongside the next model-overlay trio.
 
-4. After that: differential attention, then online data selection if the earlier results justify the harness-touching investment.
+5. After that: differential attention, then online data selection if the earlier results justify the harness-touching investment.

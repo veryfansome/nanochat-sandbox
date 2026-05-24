@@ -1,50 +1,73 @@
 # Multi-Token Prediction (MTP)
 
-Status: **implemented** — overlay + wrapper + smoke + d6/M4 A/B measured. GPU validation pending.
+Status: **validated at d24/8xA100 — deprioritized.** val/bpb regression got *worse* at scale (+4.17% at d6 → +8.78% at d24), CORE "win" is essentially driven by a single task. Three rescue paths exist (scale, DeepSeek-MTP architecture, lower α + k=1) but none are next-up.
 Target repo: `nanochat` (Karpathy) — kept **pristine**, never edited.
 
-## Current state
+## Current state — d24 results (8xA100 40GB)
 
-The mechanism is live and smoke-verified:
+| metric | baseline | mtp (k=3, α=0.3) | Δ |
+|---|---:|---:|---:|
+| val/bpb (final) | 0.71609 | 0.77898 | **+0.06288 (+8.78%)** |
+| CORE (`base_eval`, full) | 0.250488 | 0.258635 | +0.00815 (+3.25%) — but see caveat |
+| CORE (wandb, mid-train sub) | 0.260098 | 0.262987 | +0.00289 (+1.11%) |
+| train tok/sec | 291,210 | 260,517 | −10.54% |
+| total time | 5h33m | 6h13m | +12% |
 
-- [`../../overlay/mtp.py`](../../overlay/mtp.py) — `MTPGPT(GPT)`. Forward returns `baseline_CE + (α/k) · Σ_{d=1..k} CE(logits[:, :-d, :], targets[:, d:])` on the training path; pure baseline CE on the eval path (`loss_reduction='none'`) so `val/bpb` stays directly comparable.
+**MTP needed `DEVICE_BATCH_SIZE=4` on 40GB HBM** (vs baseline's 8); the extra k=3 saved softmaxes pushed OOM at batch=8.
+
+### The CORE "win" is one task
+
+Per-task sign test: mtp wins 13/22 tasks, loses 8, ties 1. P(≥13/21) ≈ 0.19 — **not statistically significant**. The mean +0.008 CORE delta is dominated by a single outlier: **boolq +0.111** (still negative-centered for both runs, but mtp is "less wrong"). Excluding boolq, mtp's mean Δ across the remaining 21 tasks is **+0.003** — pure noise.
+
+Most striking: **mtp hurts factoid-recall tasks**: bigbench_qa_wikidata −0.046, squad −0.025, jeopardy −0.005. Plausible mechanism: MTP's aux objective pulls representations toward "smooth multi-token continuations," which actively damages precise discrete factual memorization. Factoid recall wants sharp, peaky next-token distributions; MTP fights that.
+
+### CORE-per-bpb-cost vs zloss (comparable trio, same compute budget)
+
+| | CORE % gain | val/bpb % loss | CORE gain per bpb cost |
+|---|---:|---:|---:|
+| zloss | +5.15% | ≈ 0% (artifact-corrected) | unbounded — basically free |
+| mtp | +3.25% (mostly boolq) | +8.78% | 0.37 — poor |
+
+zloss dominates mtp on every axis at this scale.
+
+### Why the literature's "MTP helps at scale" claim doesn't hold here
+
+Gloeckle et al. (2024) report MTP becomes net-positive at multi-billion-parameter scale with parallel linear heads. d24 (~560M params) is in their "still negative" regime. d6 → d24 made the val/bpb regression *worse* relative-wise, not better — so scale alone, between these two points, didn't help. Either the threshold is further out (d30+, costing ~$500/trio to test), or our config diverges from the paper's in ways that matter (k, α, shared vs separate unembedding, no DeepSeek-block).
+
+### Rescue paths (none are next-up)
+
+If MTP gets revisited later, ordered by cost:
+
+1. **α=0.1, k=1** — cheapest probe. Single-aux-head, lower aux weight. Tests whether the trunk can afford *some* multi-token supervision without the capacity tax we saw at α=0.3, k=3. One extra `(B, T, V)` softmax + one extra CE call vs baseline (near-baseline compute, ~1-2% tok/sec hit at scale), ~$80 to run.
+2. **DeepSeek-MTP architecture** — separate transformer block per prediction depth (not parallel heads on shared trunk). Different cost profile, different objective shape. Substantial implementation work.
+3. **Scale to d30** — actually test the literature's claim at a closer-to-paper scale. ~$500 for a baseline+mtp pair.
+
+Per [`../../STATUS.md`](../../STATUS.md), the higher-priority next steps are deep supervision, token-level loss weighting, and differential attention. MTP rescue probes only happen if those raise specific questions answerable by an MTP variant.
+
+### Components (unchanged)
+
+- [`../../overlay/mtp.py`](../../overlay/mtp.py) — `MTPGPT(GPT)`. Training path: `baseline_CE + (α/k) · Σ_{d=1..k} CE(logits[:, :-d, :], targets[:, d:])`. Eval path (`loss_reduction != 'mean'`): pure baseline CE — `val/bpb` is directly comparable. (This is the contract zloss got wrong; mtp got it right because the lesson was written *after* zloss's first implementation. See [`../zloss/README.md`](../zloss/README.md) "Eval-path bug" for the story.)
 - [`../../wrappers/train_mtp.py`](../../wrappers/train_mtp.py) — six lines: patch `nanochat.gpt.GPT` → `MTPGPT`, `runpy` `scripts.base_train`. Does **not** patch `GPTConfig`.
-- [`../../wrappers/smoke_mtp.py`](../../wrappers/smoke_mtp.py) — verifies (a) forward math, (b) config-portability, (c) monkeypatch. <5 sec, no data.
+- [`../../wrappers/smoke_mtp.py`](../../wrappers/smoke_mtp.py) — verifies (a) forward math, (b) config-portability, (c) monkeypatch. Worth adding (d) eval-path equivalence retroactively, matching zloss's smoke (e), to prevent future regressions.
 
-### Measured at d6 / 5000 iters on M4 (wandb `bcv9920m`, archived `results/d6_mtp/`)
+train/loss in wandb is **not** directly comparable to baseline — it includes `α · Σ aux_ce` (about 2.0 nats extra on d24 at α=0.3, k=3, matching baseline's 2.3 → mtp's 4.3). Use val/bpb for cross-run comparison.
+
+### Earlier — d6 / 5000 iters on M4 (wandb `bcv9920m`, archived `results/d6_mtp/`)
 
 | metric | d6_baseline | d6_mtp | Δ |
 |---|---:|---:|---:|
-| val/bpb (final, step 5000) | 1.16534 | 1.21398 | **+0.04864 (+4.17%)** |
-| train/tok_per_sec | 27,628 | 18,657 | **−32.5%** |
-| total time | 50.6 min | 71.3 min | +41% |
-| CORE (post-train eval) | not recoverable | −0.0179 | (within noise; below-random on centered tasks) |
+| val/bpb (final, step 5000) | 1.16534 | 1.21398 | +0.04864 (+4.17%) |
+| train/tok_per_sec | 27,628 | 18,657 | −32.5% |
 
-The val/bpb gap is **stable, not transient** — diverges from 0 at step 0, locks in at +0.045–0.049 by step ~500, holds for the remaining ~4500 steps. This is the expected toy-scale signature of MTP: the model has 37M params and 5000 warmup-heavy iters; asking the residual stream to also encode lookahead for tokens 2–4 ahead diverts gradient budget the main objective can't spare. The literature (Gloeckle 2024, DeepSeek-V3) shows the win at scale, where the model can afford the dual objective and the denser supervision becomes a sample-efficiency lever rather than a capacity tax. tok/sec hit (−32%) tracks the cost of 4 separate `F.cross_entropy` calls per step — similar magnitude to the Python-fused-zloss number, same root cause. Expect this to shrink to a few percent at GPT-2 / GPU scale where the trunk dominates wall-clock.
+The d6 result said "doesn't help at toy scale" (correctly). The hope was scale would flip it; d24 shows it doesn't, at least between these two points. The d6 val/bpb signature (stable +0.045-0.049 from step ~500) was directionally identical to d24's (+0.055-0.063 stable from step ~250) — same mechanism, just bigger absolute regression. **The "more training, less aux tax" expectation didn't materialize.**
 
-train/loss in wandb is **not** directly comparable to baseline — it includes the aux contribution. Use val/bpb for cross-run comparison.
+### Implementation choices (unchanged — d24 deprioritization is about results, not design)
 
-### Implementation choices (per the agreed plan)
-
-- **Naive only.** k separate `F.cross_entropy` calls on shifted target slices. Each saves its own softmax for backward, so peak saved-for-backward memory at the loss = (k+1) × `(B, T, V)` slice. Worked example of the loss-shape gotcha from `../../overlay/README.md`. A Python fused autograd would halve this but cost throughput per the z-loss experience; revisit only if scale-up memory forces it.
-- **Shared unembedding** with the main `lm_head`. No extra parameters; all heads use the same logits with different shifted targets. The trunk is regularized to encode multi-step-ahead information in the residual stream.
+- **Naive only.** k separate `F.cross_entropy` calls on shifted target slices. Each saves its own softmax for backward, so peak saved-for-backward memory at the loss ≈ (k+1) × `(B, T, V)` slice.
+- **Shared unembedding** with the main `lm_head`. No extra parameters.
 - **k = 3 default** (predicts t+2, t+3, t+4). Env var `MTP_HEADS`.
 - **Loss weighting**: total aux contribution = α (default 0.3); per-head = α/k. Env var `MTP_ALPHA`.
-- **Eval path** (`loss_reduction='none'`, used by `evaluate_bpb` to compute per-token bpb) returns main CE only — aux supervision is a training regularizer; mixing it into bpb would inflate the metric in a non-comparable way.
-
-Run the smoke any time: `uv run python -m wrappers.smoke_mtp`.
-
-### Next milestone — GPU validation at d24/Lambda
-
-The d6/M4 result tells us MTP doesn't help at toy scale (expected), not whether it helps at GPT-2 scale (the actual question). On Lambda:
-
-```bash
-WANDB_RUN=d24_baseline bash runs/speedrun.sh
-WANDB_RUN=d24_mtp MODEL_TAG=d24_mtp OVERLAY=mtp bash runs/speedrun.sh
-uv run python -m tools.compare_runs d24_baseline d24_mtp
-```
-
-At d24 scale the saved-for-backward stack from k=3 aux heads is roughly `4 × (16 × 2048 × 32768 × 4 bytes) ≈ 16 GB` — comfortable on a single H100 (80 GB HBM) and trivial across 8. The throughput hit should drop to a few percent (trunk dominates).
+- **Eval path** (`loss_reduction != 'mean'`) returns main CE only.
 
 ## Goal
 
@@ -69,11 +92,13 @@ Cheap variant — **Gloeckle et al. 2024** ("Better & Faster LLMs via Multi-toke
 
 Do **not** use the DeepSeek-V3 MTP variant here — it uses a full transformer block per prediction depth (~one extra layer each), far more expensive than linear heads.
 
-### Recommended starting config
+### Recommended starting config (historical — superseded by d24 result)
 
-- `k = 3` extra heads (predict `t+2, t+3, t+4`).
-- Use **fused / cut cross-entropy** (Liger-style) for every head — never materialize the full `(B, T, vocab)` logits tensor. This removes the memory blowup; the `d×V` matmul FLOPs remain (irreducible).
-- Loss weighting: start with equal weights, or mild decay for deeper heads (e.g. `1.0, 0.5, 0.25`) — tune.
+This was the original plan; **what's actually implemented** is shown above under "Implementation choices." The differences worth noting:
+
+- ~~Use **fused / cut cross-entropy** (Liger-style) for every head~~ — we went **naive** (k separate `F.cross_entropy` calls). Rationale per the z-loss work: a Python `torch.autograd.Function` reimplementing CE is *slower* than naive in pure PyTorch (no CUDA/Triton kernel to back it). A true Liger-style fused CE would still help at scale but is out of scope for this overlay.
+- `k = 3` extra heads — kept as default.
+- Loss weighting `α/k` per head (total aux contribution `α=0.3`) — kept; rescue path explores `α=0.1, k=1`.
 
 ## Overlay implementation plan
 
