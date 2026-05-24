@@ -9,9 +9,12 @@ Working state of the project — implementation progress, current focus, sequenc
 | [z-loss](ideas/zloss/README.md) | ✓ | ✓ (naive default; fused autograd opt-in via `ZLOSS_FUSED=1`) | ✓ (a/b/c/d) | partial — d6/M4 only |
 | [MTP](ideas/mtp/README.md) | ✓ | ✓ (naive only; shared unembedding; k=3 default) | ✓ (a/b/c) | d6/M4 measured — val/bpb +4.17%, tok/sec −32% vs baseline (expected toy-scale signature of a scale-dependent technique). GPU validation pending. |
 | [Deep supervision](ideas/deep-supervision/README.md) | ✓ | — | — | — |
+| [Token-level loss weighting](ideas/token-loss-weighting/README.md) | ✓ | — | — | — |
 | [Differential attention](ideas/diff-attention/README.md) | ✓ | — | — | — |
 | [Online data selection + batch-size tuning](ideas/online-data-selection/README.md) | ✓ | — | — | — |
+| [Adaptive sequence length / batch size](ideas/adaptive-schedule/README.md) | ✓ | — | — | — |
 | [Layer-wise LR / staged maturation](ideas/layerwise-lr/README.md) | ✓ | — | — | — |
+| [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | — | — | — |
 | [Non-backprop (DFA → block-local)](ideas/non-backprop/README.md) | ✓ (research track) | — | — | — |
 
 ## Currently in flight
@@ -31,11 +34,14 @@ uv run python -m tools.compare_runs d6_baseline d6_zloss [d6_zloss_fused] [d6_mt
 
 ## Suggested sequencing
 
-1. **Cheapest first** — batch-size A/B (config-only), z-loss (done at d6 scale), and layer-wise LR (overlay, ~0 cost). Quick signal, no real engineering.
+1. **Cheapest first** — batch-size A/B (config-only), z-loss (done at d6 scale), layer-wise LR (overlay, ~0 cost), and **token-level loss weighting** (entropy / focal variants — pure-loss overlay, no extra model). Quick signal, no real engineering.
 2. **MTP** — the main capability + sample-efficiency lever. Next big build per the plan.
-3. **Deep supervision** — depth-axis complement to MTP; fold into the same subclass for one combined experiment.
+3. **Deep supervision** — depth-axis complement to MTP; fold into the same subclass for one combined experiment. Token weighting's **RHO-Loss variant** can fold in here too (it shares the same `forward` surface and needs a reference model that can be added once for both).
 4. **Differential attention** — independent architecture A/B.
-5. **Online data selection** — bigger, harness-touching; pursue if earlier results justify it.
+5. **Adaptive sequence length (Part A of adaptive-schedule)** — harness change, but the model needs no edits and Part A is the rare idea that should make the speedrun **faster on wall-clock** at the same final loss. Cheap-ish entry into the harness-change tier.
+6. **Online data selection + adaptive batch size (Part B of adaptive-schedule)** — bigger, harness-touching; pursue if earlier results justify it. Both share the copied-`base_train.py` pattern, so fold into a single forked harness. Online data selection is complementary to token weighting (sample-level vs. token-level signal shaping), so worth A/B-ing alone, weighting alone, and combined.
+
+**[Tokenizer variants](ideas/tokenizer-variants/README.md)** is a **parallel track**, not part of this serialized sequence. Offline variant generation + offline filtering (compression / vocab / structural metrics) runs on a laptop and does not compete with GPU time; only the final variant's full speedrun A/B does. Pick it up whenever the model-overlay track is GPU-bound or blocked on Lambda time. The cheapest entry point is building `tools/eval_tokenizer.py` (Tier 1 metrics only) and running variant 4 (tokenizer-training corpus mix — no regex change, only a data filter).
 
 The [non-backprop LLM](ideas/non-backprop/README.md) is a **separate research track**, not part of this capability-tuning sequence. Pursue independently.
 
@@ -50,6 +56,8 @@ The [non-backprop LLM](ideas/non-backprop/README.md) is a **separate research tr
    uv run python -m tools.compare_runs d24_baseline d24_zloss d24_mtp
    ```
 
-2. **Build the next overlay** — per sequencing, **deep supervision** (folds into the same `MTPGPT` subclass) or **differential attention** (independent architecture A/B). Deep supervision is the more natural next step since the MTPGPT scaffolding is already in place.
+2. **Build the next overlay** — per sequencing, **deep supervision** (folds into the same `MTPGPT` subclass) or **differential attention** (independent architecture A/B). Deep supervision is the more natural next step since the MTPGPT scaffolding is already in place. **Token-level loss weighting (entropy/focal variant)** is a viable parallel cheap track — pure-loss, no extra model, independent of the MTPGPT line — pick it up alongside if you want a second cheap signal in flight.
 
-3. After that: differential attention, then online data selection if the earlier results justify the harness-touching investment.
+3. **Tokenizer-variants track (parallel, no GPU)** — build `tools/eval_tokenizer.py` (Tier 1 metrics: per-domain compression, vocab inspection, structural reversibility battery) and run variant 4 (tokenizer-training corpus mix) end-to-end as a workflow shakeout. Anything that survives Tier 1 + 2 + a d6 probe gets queued for the next Lambda session as an extra A/B alongside the model-side runs.
+
+4. After that: differential attention, then online data selection if the earlier results justify the harness-touching investment.

@@ -59,6 +59,18 @@ Notes:
 - **z-loss** (`../zloss/README.md`) — apply z-loss to **every** aux head (each produces its own vocab logits subject to drift). Near-zero added cost.
 - Orthogonal to differential attention, batch-size tuning, and layer-wise LR.
 
+## Downstream — adaptive-depth / early-exit (essentially free once aux heads exist)
+
+Aux heads are placed for a training-side reason (depth-axis signal density), but the same heads enable adaptive computation downstream — without a separate overlay. Two flavors, increasing in implementation cost:
+
+- **Inference-time early exit (free).** Keep the aux heads at inference time and exit each sequence at the first head whose top-token confidence (or entropy) crosses a threshold. Saves trunk forward FLOPs at decode. CALM (Schuster et al. 2022) reports ~2–3× inference speedup at <1% quality loss on standard LMs. Cost: zero training-side, a few lines of inference-side logic to consult an aux head per block and short-circuit. **Worth doing immediately once deep supervision lands and has measurable signal.**
+
+- **Training-time adaptive depth (~tens of lines).** During training, stop backproping through later blocks for sequences whose intermediate aux head is already confident. Forward still runs all blocks (later aux heads need signal); backward stops early per sequence. Expected wall-clock saving over a full speedrun: **~5–12%** (small early in training when no exits are confident; grows late). Modest as a pure speedup, but it's incremental on machinery already built rather than a new overlay.
+
+The relevant brain-inspired connection is the **conditional-computation / adaptive-compute** line (MoD, ACT). That whole family is hardware-awkward when implemented at per-token granularity (variable tensor shapes per block, gather/scatter overhead, FA3 friction). Sequence-level early-exit on top of deep supervision sidesteps all of that — no shape change, no router, no per-block gather — at the cost of a coarser granularity (whole sequences, not individual tokens). For this project's scale, that trade is the right one.
+
+Net framing: **build deep supervision for the depth-axis signal-density argument**; once it works, the inference-time early-exit comes for free and the training-time variant is a small follow-on. Don't build either before deep supervision has a real-data win on its own — the early-exit thresholds are meaningless without trustworthy intermediate heads.
+
 ## Testing / A-B
 
 - Same pinned nanochat commit + same seed as baseline.

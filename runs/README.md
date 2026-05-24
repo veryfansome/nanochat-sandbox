@@ -94,4 +94,10 @@ One d24 base-only speedrun (`USE_SFT=0`). Trio = baseline + zloss + mtp sequenti
 uv run python -m tools.compare_runs d24_baseline d24_zloss d24_mtp
 ```
 
-Per-run artifacts auto-archive to `~/sandbox/results/<MODEL_TAG>/` on the host (eval CSV, base-model reports, meta.json, NANOCHAT_COMMIT, ENV). `rsync` back to local if you want a copy beyond wandb.
+Per-run artifacts auto-archive to `~/sandbox/results/<MODEL_TAG>/` on the host (eval CSV, base-model reports, meta.json, NANOCHAT_COMMIT, ENV). Pull them — plus the final concatenated `report.md` — back to local `sandbox/results/` with:
+
+```bash
+bash runs/lambda.sh pull "$ID"
+```
+
+`pull` is additive (no `--delete`) and idempotent — safe to re-run between runs to incrementally accumulate per-`MODEL_TAG` archives as each completes. The `report.md` gets a UTC timestamp suffix so successive pulls don't clobber prior copies.

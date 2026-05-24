@@ -15,6 +15,7 @@
 #   bash runs/lambda.sh status     <instance_id>
 #   bash runs/lambda.sh ssh        <instance_id>
 #   bash runs/lambda.sh bootstrap  <instance_id>      # rsync sandbox/ + run setup.sh
+#   bash runs/lambda.sh pull       <instance_id>      # rsync host's ~/sandbox/results/ (auto-archives) + report.md → local
 #   bash runs/lambda.sh terminate  <instance_id>
 #
 # Env defaults (override per-command with flags above):
@@ -281,6 +282,43 @@ EOF
 EOF
 }
 
+cmd_pull() {
+    local id="${1:?usage: pull <id>}"
+    local ip user
+    ip=$(_resolve_ip "$id")
+    user="${LAMBDA_SSH_USER:-ubuntu}"
+
+    local dest="$SANDBOX_DIR/results"
+    mkdir -p "$dest"
+
+    # Mirror the host's auto-archive dirs. rsync is additive (no --delete) so
+    # multiple pulls accumulate cleanly; running it twice on the same data is a
+    # no-op. Per-run dirs are keyed by MODEL_TAG and won't collide between runs.
+    echo "==> rsync $user@$ip:~/sandbox/results/ → $dest/" >&2
+    rsync -av \
+        -e "ssh -o StrictHostKeyChecking=accept-new" \
+        "$user@$ip:~/sandbox/results/" "$dest/"
+
+    # The concatenated report.md (from `python -m nanochat.report generate` at
+    # the end of speedrun.sh) is written to cwd, which is ~/sandbox on the host.
+    # Save it alongside the per-run archive dirs with a UTC timestamp so
+    # successive pulls (after multiple runs) don't clobber each other.
+    if ssh -o StrictHostKeyChecking=accept-new "$user@$ip" "test -f ~/sandbox/report.md" 2>/dev/null; then
+        local ts="$(date -u +%Y%m%dT%H%M%SZ)"
+        local report_dest="$dest/report_${ts}.md"
+        rsync -av \
+            -e "ssh -o StrictHostKeyChecking=accept-new" \
+            "$user@$ip:~/sandbox/report.md" "$report_dest" >&2
+        echo "==> pulled report.md → $report_dest" >&2
+    else
+        echo "==> no ~/sandbox/report.md on host yet (speedrun's report-generate step hasn't run)" >&2
+    fi
+
+    echo >&2
+    echo "==> local $dest/:" >&2
+    ls -la "$dest" >&2
+}
+
 cmd_terminate() {
     local id="${1:?usage: terminate <id>}"
     local payload
@@ -301,6 +339,7 @@ case "$CMD" in
     status)    cmd_status    "$@" ;;
     ssh)       cmd_ssh       "$@" ;;
     bootstrap) cmd_bootstrap "$@" ;;
+    pull)      cmd_pull      "$@" ;;
     terminate) cmd_terminate "$@" ;;
     *) echo "unknown command: $CMD" >&2; exit 1 ;;
 esac

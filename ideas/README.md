@@ -9,17 +9,21 @@ Curated catalog of experiments. Each entry has its own folder with a design doc;
 | [MTP](mtp/README.md) — multi-token prediction | capability + sample efficiency | pure model-side (forward/loss) |
 | [z-loss](zloss/README.md) | training stability + small quality gain | pure model-side (forward/loss) |
 | [Deep supervision](deep-supervision/README.md) — intermediate-layer aux losses | capability (depth-axis signal density) | pure model-side (forward/loss) |
+| [Token-level loss weighting](token-loss-weighting/README.md) — entropy / focal / RHO-Loss | sample efficiency (reshape per-token signal) | pure model-side (forward/loss) |
 | [Differential attention](diff-attention/README.md) | capability + scaling | architecture subclass |
 | [Online data selection + batch-size tuning](online-data-selection/README.md) | sample efficiency | config-only (A) / harness change (B) |
+| [Adaptive sequence length / batch size](adaptive-schedule/README.md) — schedule what's currently fixed | compute efficiency (A) + sample efficiency (B) | harness change |
 | [Layer-wise LR / staged maturation](layerwise-lr/README.md) | depth-staged plasticity (brain-inspired) | overlay (`setup_optimizer`) / harness change for staged freezing |
+| [Tokenizer variants](tokenizer-variants/README.md) — offline-evaluable pre-tokenization / vocab experiments | capability ceiling (representational atoms) | preprocessing artifact (parallel track, no GPU until A/B) |
 | [Non-backprop LLM](non-backprop/README.md) — DFA → block-local | non-backprop credit assignment; memory / parallelism / forgetting | model subclass + harness change (separate research track) |
 
 ## Overlay fit — what the categories mean
 
-- **pure model-side** — only changes the loss/`forward` of `GPT`. Rides the patch + `runpy` wrapper with **zero harness edits**. (MTP, z-loss, deep supervision)
+- **pure model-side** — only changes the loss/`forward` of `GPT`. Rides the patch + `runpy` wrapper with **zero harness edits**. (MTP, z-loss, deep supervision, token-level loss weighting)
 - **architecture subclass** — subclass an attention/MLP module; patch the class before `runpy`. Still zero harness edits. (Differential attention)
 - **config-only** — a CLI arg on `base_train.py`; no code at all. (Batch-size tuning)
-- **harness change** — restructures the training loop; needs a **copied** `base_train.py` diffed against upstream periodically. (Online data selection, non-backprop, layer-wise-LR variant B)
+- **harness change** — restructures the training loop; needs a **copied** `base_train.py` diffed against upstream periodically. (Online data selection, adaptive sequence length / batch size, non-backprop, layer-wise-LR variant B)
+- **preprocessing artifact** — produces a non-model artifact (e.g. a trained tokenizer) that the existing pipeline consumes via its cache. No nanochat edits, no harness edits. Iteration happens offline; GPU is paid only for the final A/B. (Tokenizer variants)
 
 ## Lessons learned (ideation)
 
@@ -31,7 +35,7 @@ For *implementation* lessons (gotchas in writing the overlay subclass / forward)
 
 ## Sequencing principle
 
-Cheap things first (config + pure-loss overlays), then the main capability lever (MTP) + its depth-axis complement (deep supervision) folded into one subclass, then architecture A/B (differential attention), then harness-changing items. The non-backprop track is independent (different goal: memory / parallelism / forgetting, not the speedrun). See [`../STATUS.md`](../STATUS.md) for the explicit plan and current state.
+Cheap things first (config + pure-loss overlays — z-loss, token-level loss weighting [entropy/focal variants]), then the main capability lever (MTP) + its depth-axis complement (deep supervision) folded into one subclass — token weighting's RHO-Loss variant folds in here too if signal warrants — then architecture A/B (differential attention), then harness-changing items (online data selection, adaptive sequence length / batch size — both share the copied-`base_train.py` pattern, so fold them into one fork when both land). The non-backprop track is independent (different goal: memory / parallelism / forgetting, not the speedrun). **Tokenizer variants** run in parallel with the model-overlay sequence — offline iteration doesn't compete with GPU time, only the final variant's speedrun A/B does, so it can progress whenever model-side work is GPU-bound. See [`../STATUS.md`](../STATUS.md) for the explicit plan and current state.
 
 ## Considered, not adopted
 
