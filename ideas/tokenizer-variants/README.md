@@ -111,6 +111,35 @@ Organized by which knob each touches. Items marked **(prior art)** have implemen
 11. **Unigram LM tokenizer** (SentencePiece-style). Different inference algorithm; would route through `HuggingFaceTokenizer`. Bigger change but tests the "is BPE itself optimal" question.
 12. **WordPiece** — same shape as 11.
 
+### Input preprocessing
+
+13. **Case-marker variant** — lossless casing-collapse via preprocessing. Replace cased word forms in the input stream with a small set of case-marker special tokens + the lowercased base:
+    - `The` → `<|cap|> the`
+    - `USA` → `<|allcaps|> usa`
+    - `getUserId` → `get <|cap|> user <|cap|> id`  (open: handle camelCase or keep cased as one chunk)
+
+    Compression gain comes from collapsing all capitalized variants of a word into the shared lowercase form. With ~32K vocab, capitalized variants of common words probably consume 500–2000 slots today; releasing them is a likely few-percent compression win on FineWeb val — roughly comparable order to force_merges, applied to surface form rather than phrase boundaries. **Lossless** because case is restored at inference via the marker tokens, so this is val/bpb-comparable to baseline (unlike a naive "lowercase everything" preprocessor, which would inflate bpb-comparability by changing the prediction task — see "Open questions" below for the bpb math).
+
+    **Implementation** (~200–300 LOC; pure-Python, no Rust):
+    - **Encode-side preprocessor**: tokenizer-time pass over input text that emits `<|cap|>` / `<|allcaps|>` before lowercased chunks; runs *before* `SPLIT_PATTERN`.
+    - **Two new special tokens**: `<|cap|>`, `<|allcaps|>` added to `SPECIAL_TOKENS`.
+    - **BPE training on the preprocessed stream**: standard rustbpe via the pristine crate; the markers occur frequently enough that the model learns them naturally.
+    - **Decode-side postprocessor**: invert markers at output time, mirroring how chat templates handle role markers.
+    - **`render_conversation` integration**: SFT path expects to control mask values per token; case markers need consistent mask treatment.
+
+    **Trade-offs vs other variants on the list**:
+    - **Different mechanism** from regex (1–3), corpus mix (5), and merge-producer changes (6–10): operates *before* tokenization runs, normalizing the input stream rather than tuning what BPE produces. Combines cleanly with all of the above (orthogonal — surface form ⊥ phrase boundaries ⊥ morphological structure).
+    - **Inference path gets wrapped**: model outputs need a postprocessor before display / downstream use. Similar lift to how SFT chat templates handle `<|user_start|>` etc.
+    - **No Rust work needed.** Implementation lives entirely on the Python side (preprocessor + special-token additions + decoder wrapper).
+
+    **Open questions**:
+    - **Marker set size**: just `<|cap|>` + `<|allcaps|>`, or also a `<|titlecase|>` for words like `iPhone`? Adding more markers spends more vocab on the marker tokens themselves; fewer markers means edge-case words can't be expressed losslessly.
+    - **camelCase / PascalCase handling for code**: split on case transitions (preserves identifier semantics in lowercased form but uses many markers) or treat as a single cased chunk (no compression on identifiers, but simpler)? Hybrid: split for prose, keep cased for code-typed regions — needs language detection.
+    - **Unicode case rules**: Turkish dotless `i`, German `ß` → `SS` (lossy uppercase), final-sigma in Greek. Standard `str.lower()` gets some of these wrong; a Unicode-aware case normalizer is needed for non-English prose.
+    - **bpb math**: a lossless encode→decode roundtrip preserves the byte stream, so per-byte cross-entropy on the same held-out text is directly comparable to baseline. The model has more tokens per byte to predict, but they're more predictable (markers + lowercase chunks have lower entropy than mixed-case). Whether net val/bpb improves is an empirical question; the variant is *comparable* to baseline either way.
+    - **Interaction with proper-noun semantics**: `Apple` and `apple` collapse to the same lowercase form preceded by a marker. The marker carries the case-distinction signal that the model has to learn to associate with named-entity-vs-common-noun semantics. This may or may not be as easy to learn as the current "two separate tokens" representation. Untested.
+    - **CORE eval interaction**: case-restoration on output is well-defined for prose, but CORE tasks that include code or specific casing requirements would need the decoder pipeline integrated correctly. Should be solvable but adds a path that needs testing.
+
 ## Evaluation — what changes given prior art
 
 The eval harness is already built: [`../../tools/eval_tokenizer.py`](../../tools/eval_tokenizer.py). It computes:
@@ -156,7 +185,8 @@ The sandbox project's overlay discipline applies: don't edit `nanochat/` master 
 5. **Re-engage variant 7 (forced merges)** from `force_merges_wip` — biggest expected compression gain; needs the methodological discipline below to avoid the "compression-isn't-comparable" trap.
 6. **Re-engage variant 6 (seed tokens)** from `seed_tokens` — interesting, less validated; do after 7 establishes the workflow.
 7. **Variants 4 (vocab grid), 8 (min_frequency), 9 (vocab pruning)** — narrower questions, do as targeted follow-ups.
-8. **Variants 10 (branch entropy), 11/12 (non-BPE algorithms)** — speculative, defer.
+8. **Variant 13 (case-marker)** — pursue if either (a) force_merges' d6 transfer to val/bpb is positive AND we want to chase more lossless-compression sources, or (b) we want a more disciplined version of the "lowercase everything" intuition without giving up val/bpb-comparability or CORE eval. Combines orthogonally with whichever variants land first.
+9. **Variants 10 (branch entropy), 11/12 (non-BPE algorithms)** — speculative, defer.
 
 ## Open questions
 
@@ -165,6 +195,7 @@ The sandbox project's overlay discipline applies: don't edit `nanochat/` master 
 - For forced merges: which phrases to force. The `FORCED_PAIRS` list on `force_merges_wip` is ~70 hand-picked; data-driven selection (top-K cross-boundary bigrams by frequency in a held-out corpus, subject to a grammatical-role filter) might be more principled and reproducible.
 - For seed tokens: which morphemes to seed. The `seed_tokens.yaml` list is intuition-driven; an ablation across morpheme subsets could surface which categories matter.
 - Whether to combine forced merges + seed tokens — they target different parts of the merge DAG (early/morphemic vs late/phrasal); plausibly complementary.
+- For case-marker (variant 13): whether the model learns to use marker tokens as efficient case-distinction signals, or whether it spends gradient relearning that `<|cap|> apple` and `apple` are semantically related but distinct (named-entity vs common-noun). camelCase / Unicode case rules are settled-by-design choices, not empirical questions — but interact with eval pipelines that need a working decode-side postprocessor.
 
 ## References
 

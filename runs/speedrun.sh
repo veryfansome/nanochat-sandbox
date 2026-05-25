@@ -17,7 +17,11 @@
 #               ensures baseline and overlay A/B runs don't overwrite each other
 #   NPROC       --nproc_per_node for torchrun (default: 8)
 #   DEPTH       --depth for base_train (default: 24, matches upstream speedrun)
-#   WANDB_RUN   wandb run name (default: dummy = disabled)
+#   WANDB_RUN   wandb run name (default: dummy = disabled). Stable so
+#               tools.compare_runs (which keys on wandb name) keeps working.
+#   WANDB_SUFFIX  set to 1 to append _YYYYMMDD_HHMM (UTC) to WANDB_RUN, so
+#               reruns of the same name don't share a wandb display name.
+#               Default: 0 (stable name).
 #   NANOCHAT_BASE_DIR  artifact dir (default: ~/.cache/nanochat)
 #   FORCE_RETRAIN_TOKENIZER  set to 1 to retrain tokenizer even if cached (default: 0)
 #   USE_FP8     pass --fp8 to base_train (default: 1; set to 0 for A100 / V100
@@ -62,13 +66,15 @@ mkdir -p "$NANOCHAT_BASE_DIR"
 # Keep wandb's local cache under NANOCHAT_BASE_DIR (see runcpu.sh for rationale).
 export WANDB_DIR="$NANOCHAT_BASE_DIR"
 
-# Overlay selection: empty => baseline (upstream scripts.base_train)
 OVERLAY="${OVERLAY:-}"
 if [ -n "$OVERLAY" ]; then
     TRAIN_MODULE="wrappers.train_$OVERLAY"
     RUN_TAG="${OVERLAY}"
 else
-    TRAIN_MODULE="scripts.base_train"
+    # Baseline routes through wrappers.base_train (not scripts.base_train) so
+    # wrappers/__init__.py installs the core_eval prefix-safety patch before
+    # mid-train CORE runs. No-op for prefix-stable tokenizers. See wrappers/_patches.py.
+    TRAIN_MODULE="wrappers.base_train"
     RUN_TAG="baseline"
 fi
 
@@ -76,6 +82,10 @@ NPROC="${NPROC:-8}"
 DEPTH="${DEPTH:-24}"
 MODEL_TAG="${MODEL_TAG:-d${DEPTH}_${OVERLAY:-baseline}}"
 WANDB_RUN="${WANDB_RUN:-dummy}"
+# Opt-in UTC timestamp suffix; see header for the trade-off.
+if [ "$WANDB_RUN" != "dummy" ] && [ "${WANDB_SUFFIX:-0}" = "1" ]; then
+    WANDB_RUN="${WANDB_RUN}_$(date -u +%Y%m%d_%H%M)"
+fi
 
 # FP8 toggle: default on (H100+); set USE_FP8=0 to drop --fp8 for A100/V100/etc.
 USE_FP8="${USE_FP8:-1}"
@@ -102,6 +112,7 @@ USE_SFT="${USE_SFT:-0}"
 echo "==> overlay:      ${OVERLAY:-(baseline)}"
 echo "==> train module: $TRAIN_MODULE"
 echo "==> model tag:    $MODEL_TAG"
+echo "==> wandb run:    $WANDB_RUN"
 echo "==> nproc:        $NPROC"
 echo "==> depth:        $DEPTH"
 echo "==> fp8:          $USE_FP8"
@@ -147,7 +158,9 @@ torchrun --standalone --nproc_per_node="$NPROC" -m "$TRAIN_MODULE" -- \
     --window-pattern="$WINDOW_PATTERN" \
     --model-tag="$MODEL_TAG" --run="$WANDB_RUN"
 
-torchrun --standalone --nproc_per_node="$NPROC" -m scripts.base_eval -- \
+# wrappers.base_eval (not scripts.base_eval directly) so the prefix-safety
+# patch is applied + boundary-crossing summary printed. See wrappers/_patches.py.
+torchrun --standalone --nproc_per_node="$NPROC" -m wrappers.base_eval -- \
     --model-tag="$MODEL_TAG" --device-batch-size="$DEVICE_BATCH_SIZE"
 
 # Archive base-stage artifacts to sandbox/results/$MODEL_TAG/ BEFORE SFT (or
@@ -161,6 +174,8 @@ EVAL_CSV=$(ls -t "$NANOCHAT_BASE_DIR/base_eval/base_model_"*.csv 2>/dev/null | h
 [ -n "$EVAL_CSV" ] && cp "$EVAL_CSV" "$ARCHIVE_DIR/eval.csv"
 cp "$NANOCHAT_BASE_DIR/report/base-model-"*.md "$ARCHIVE_DIR/" 2>/dev/null || true
 cp "$NANOCHAT_BASE_DIR/base_checkpoints/$MODEL_TAG/meta_"*.json "$ARCHIVE_DIR/meta.json" 2>/dev/null || true
+# LM tokenization boundary-crossing stats (written by wrappers/base_eval.py)
+cp "$NANOCHAT_BASE_DIR/base_eval/lm_boundary_stats.json" "$ARCHIVE_DIR/" 2>/dev/null || true
 git -C ../nanochat rev-parse HEAD > "$ARCHIVE_DIR/NANOCHAT_COMMIT" 2>/dev/null || true
 {
     echo "MODEL_TAG=$MODEL_TAG"

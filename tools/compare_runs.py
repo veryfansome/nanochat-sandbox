@@ -28,6 +28,9 @@ What it pulls (per run):
     full per-task budget). Two CORE columns are shown side by side because the
     in-training subsample uses a smaller per-task budget and can disagree with
     the post-training base_eval by ~0.01; the base_eval number is the citable one.
+  - LM tokenization boundary-crossing rate from `lm_boundary_stats.json` (written
+    by wrappers/base_eval.py). Non-zero means LM-task CORE for that run isn't
+    directly comparable to prefix-stable baselines — see wrappers/_patches.py.
   - Trajectory: val/bpb at every eval step (shared steps shown side by side)
   - train/loss summary: count, max, min, last-5 mean
 
@@ -157,6 +160,29 @@ def _load_eval_csv(run_name: str, run_index: dict[str, Path]) -> tuple[dict[str,
     return out, archive_dir
 
 
+def _load_boundary_stats(run_name: str, run_index: dict[str, Path]) -> dict | None:
+    """Read `lm_boundary_stats.json` from the run's archive if present.
+
+    Written by wrappers/base_eval.py at end-of-eval. Records how often
+    LM-style CORE prompts had a tokenization-boundary-crossing merge under
+    the prefix-safety patch (wrappers/_patches.py); non-zero rates mean
+    LM-task CORE numbers from this run aren't directly comparable to runs
+    with a different tokenization. Returns None if archive missing, json
+    missing, or json malformed (graceful degrade — older archives predate
+    this file, treated the same as runs that didn't trigger LM eval)."""
+    archive_dir = run_index.get(run_name)
+    if archive_dir is None:
+        return None
+    path = archive_dir / "lm_boundary_stats.json"
+    if not path.exists():
+        return None
+    try:
+        with path.open() as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def _hist(run: Any, key: str) -> list[tuple[int, float]]:
     """Return [(step, value), ...] in step order, skipping rows with None."""
     rows = run.history(keys=["step", key], pandas=False)
@@ -179,7 +205,12 @@ def _fmt_delta(value: float, ref: float, spec: str) -> str:
     return f"{sign}{spec.format(delta)} ({sign}{pct:.2f}%)"
 
 
-def print_summary_table(runs: dict[str, Any], ref_name: str, eval_scores: dict[str, dict[str, float]]) -> None:
+def print_summary_table(
+    runs: dict[str, Any],
+    ref_name: str,
+    eval_scores: dict[str, dict[str, float]],
+    boundary_stats: dict[str, dict | None],
+) -> None:
     ordered = [ref_name] + [n for n in runs if n != ref_name]
     col_w = max(20, max(len(n) for n in ordered) + 2)
     headers = ["metric"] + ordered + [f"Δ vs {ref_name}" for _ in ordered[1:]]
@@ -218,6 +249,23 @@ def print_summary_table(runs: dict[str, Any], ref_name: str, eval_scores: dict[s
                 v = eval_scores.get(name, {}).get(task)
                 cells.append(_fmt_delta(v, ref_val, spec) if (v is not None and ref_val is not None) else "—")
             print(row(cells))
+
+    # LM tokenization-boundary-crossing rate (sidecar JSON written by
+    # wrappers/base_eval.py). Non-zero means LM-task CORE for that run isn't
+    # directly comparable to prefix-stable baselines — see wrappers/_patches.py.
+    # Empty value (—) means: archive predates the JSON, or no LM eval ran.
+    if any(b for b in boundary_stats.values()):
+        print("-" * total_w)
+        cells = ["LM bndry-crossing %"]
+        for name in ordered:
+            b = boundary_stats.get(name)
+            cells.append(
+                f"{b['boundary_crossing_pct']:.2f}% ({b['n_boundary_crossing']}/{b['n_total']})"
+                if b and b.get("n_total") else "—"
+            )
+        # No delta column — this is a per-run quality marker, not a metric to subtract.
+        cells.extend([""] * (len(ordered) - 1))
+        print(row(cells))
     print("=" * total_w)
 
 
@@ -250,7 +298,12 @@ def print_train_loss_stats(runs: dict[str, Any]) -> None:
         print(f"  {name:<24} count={len(losses):4d}  max={max(losses):.4f}  min={min(losses):.4f}  final_mean(last5)={mean(losses[-min(5, len(losses)):]):.4f}")
 
 
-def as_json(runs: dict[str, Any], eval_scores: dict[str, dict[str, float]], eval_dirs: dict[str, Path | None]) -> dict:
+def as_json(
+    runs: dict[str, Any],
+    eval_scores: dict[str, dict[str, float]],
+    eval_dirs: dict[str, Path | None],
+    boundary_stats: dict[str, dict | None],
+) -> dict:
     out: dict[str, dict] = {}
     for name, run in runs.items():
         archive_dir = eval_dirs.get(name)
@@ -262,6 +315,7 @@ def as_json(runs: dict[str, Any], eval_scores: dict[str, dict[str, float]], eval
             "summary": {k: run.summary.get(k) for k, _, _ in SUMMARY_FIELDS},
             "archive_dir": str(archive_dir) if archive_dir else None,
             "eval_csv": {task: eval_scores.get(name, {}).get(task) for task, _, _ in EVAL_CSV_FIELDS},
+            "lm_boundary_stats": boundary_stats.get(name),
             "trajectory": {key: _hist(run, key) for key in TRAJECTORY_FIELDS},
         }
         out[name] = rec
@@ -302,13 +356,15 @@ def main(argv: list[str] | None = None) -> int:
     run_index = _build_run_index(results_dir)
     eval_scores: dict[str, dict[str, float]] = {}
     eval_dirs: dict[str, Path | None] = {}
+    boundary_stats: dict[str, dict | None] = {}
     for name in args.runs:
         scores, archive_dir = _load_eval_csv(name, run_index)
         eval_scores[name] = scores
         eval_dirs[name] = archive_dir
+        boundary_stats[name] = _load_boundary_stats(name, run_index)
 
     if args.json:
-        json.dump(as_json(runs, eval_scores, eval_dirs), sys.stdout, default=str, indent=2)
+        json.dump(as_json(runs, eval_scores, eval_dirs, boundary_stats), sys.stdout, default=str, indent=2)
         print()
         return 0
 
@@ -327,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {n:<24} id={r.id}  state={r.state}  {r.url}{marker}{csv_marker}")
     print()
 
-    print_summary_table(runs, ref, eval_scores)
+    print_summary_table(runs, ref, eval_scores, boundary_stats)
     print_trajectory(runs, ref, "val/bpb")
     print_train_loss_stats(runs)
     return 0

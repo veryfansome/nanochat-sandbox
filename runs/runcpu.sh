@@ -13,12 +13,18 @@
 #   OVERLAY     idea name; empty (default) = upstream baseline (scripts.base_train)
 #   MODEL_TAG   checkpoint dir name (default: d6_${OVERLAY:-baseline}); ensures
 #               baseline and overlay A/B runs don't overwrite each other
-#   WANDB_RUN   wandb run name (default: dummy = disabled)
+#   WANDB_RUN   wandb run name (default: dummy = disabled). Stable so
+#               tools.compare_runs (which keys on wandb name) keeps working.
+#   WANDB_SUFFIX  set to 1 to append _YYYYMMDD_HHMM (UTC) to WANDB_RUN, so
+#               reruns of the same name don't share a wandb display name.
+#               Default: 0 (stable name).
 #   NANOCHAT_BASE_DIR  artifact dir (default: ~/.cache/nanochat)
 #   FORCE_RETRAIN_TOKENIZER  set to 1 to retrain tokenizer even if cached (default: 0)
 #   KEEP_CHECKPOINT  set to 1 to preserve the trained checkpoint (default: 0 = cleanup
 #                    after base_eval; wandb has the curves and the report has metrics,
 #                    so the ~500 MB checkpoint is wasted disk for a CPU sanity run)
+#   MAX_PER_TASK  cap on examples per CORE task (default: 16 = pipeline smoke;
+#                 raise to ~500 for a real comparison, +~30 min on M4 / d6).
 
 set -euo pipefail
 
@@ -41,15 +47,24 @@ if [ -n "$OVERLAY" ]; then
     TRAIN_MODULE="wrappers.train_$OVERLAY"
     RUN_TAG="${OVERLAY}"
 else
-    TRAIN_MODULE="scripts.base_train"
+    # Baseline routes through wrappers.base_train (not scripts.base_train) so
+    # wrappers/__init__.py installs the core_eval prefix-safety patch before
+    # mid-train CORE runs. No-op for prefix-stable tokenizers. See wrappers/_patches.py.
+    TRAIN_MODULE="wrappers.base_train"
     RUN_TAG="baseline"
 fi
 MODEL_TAG="${MODEL_TAG:-d6_${OVERLAY:-baseline}}"
 WANDB_RUN="${WANDB_RUN:-dummy}"
+# Opt-in UTC timestamp suffix; see header for the trade-off.
+if [ "$WANDB_RUN" != "dummy" ] && [ "${WANDB_SUFFIX:-0}" = "1" ]; then
+    WANDB_RUN="${WANDB_RUN}_$(date -u +%Y%m%d_%H%M)"
+fi
+MAX_PER_TASK="${MAX_PER_TASK:-16}"
 
 echo "==> overlay:      ${OVERLAY:-(baseline)}"
 echo "==> train module: $TRAIN_MODULE"
 echo "==> model tag:    $MODEL_TAG"
+echo "==> wandb run:    $WANDB_RUN"
 
 # Tokenizer + data (small)
 python -m nanochat.dataset -n 8
@@ -79,7 +94,9 @@ python -m "$TRAIN_MODULE" \
     --model-tag="$MODEL_TAG" \
     --run="$WANDB_RUN"
 
-python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16 --model-tag="$MODEL_TAG"
+# wrappers.base_eval (not scripts.base_eval directly) so the prefix-safety
+# patch is applied + boundary-crossing summary printed. See wrappers/_patches.py.
+python -m wrappers.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task="$MAX_PER_TASK" --model-tag="$MODEL_TAG"
 
 # Archive run artifacts to sandbox/results/$MODEL_TAG/ BEFORE the next run can
 # wipe them. The eval CSV path doesn't include $MODEL_TAG (upstream writes
@@ -92,6 +109,8 @@ EVAL_CSV=$(ls -t "$NANOCHAT_BASE_DIR/base_eval/base_model_"*.csv 2>/dev/null | h
 [ -n "$EVAL_CSV" ] && cp "$EVAL_CSV" "$ARCHIVE_DIR/eval.csv"
 cp "$NANOCHAT_BASE_DIR/report/base-model-"*.md "$ARCHIVE_DIR/" 2>/dev/null || true
 cp "$NANOCHAT_BASE_DIR/base_checkpoints/$MODEL_TAG/meta_"*.json "$ARCHIVE_DIR/meta.json" 2>/dev/null || true
+# LM tokenization boundary-crossing stats (written by wrappers/base_eval.py)
+cp "$NANOCHAT_BASE_DIR/base_eval/lm_boundary_stats.json" "$ARCHIVE_DIR/" 2>/dev/null || true
 git -C ../nanochat rev-parse HEAD > "$ARCHIVE_DIR/NANOCHAT_COMMIT" 2>/dev/null || true
 {
     echo "MODEL_TAG=$MODEL_TAG"
