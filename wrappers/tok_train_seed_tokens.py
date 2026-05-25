@@ -94,17 +94,58 @@ def apply_patches():
         )
         pattern = tokenizer.get_pattern()
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()
-        # Contiguity check from the seed_tokens branch — surfaces bugs in the
-        # constructive merge-chain builder where some token ids aren't allocated.
+        # Two distinct missing-id regimes, only one of which is benign:
+        #   - **Tail shortfall** (unique ids dense in `[0, n_unique)` but
+        #     `n_unique < vocab_size_no_special`): BPE legitimately stops early
+        #     when the corpus runs out of useful merges (small `--max_chars`,
+        #     smoke/dev runs). Baseline rustbpe does the same. `tokens_offset =
+        #     len(mergeable_ranks)` places special tokens above max_id, no
+        #     collision. Warn and proceed.
+        #   - **Interior hole** (some id in `[0, max_id]` is unallocated): the
+        #     constructive merge-chain builder allocated ids non-contiguously.
+        #     This is a Rust-trainer bug, not a small-corpus condition. Raise
+        #     so the bug surfaces instead of risking a corrupted encoding;
+        #     whether tiktoken catches the eventual overlap depends on its
+        #     version.
+        #
+        # **Discriminator note**: we test against `len(set(ids))`, not raw
+        # `len(ids)`. The Rust trainer can legitimately emit duplicate ids via
+        # alias merges (`ensure_merge_pair` reuses an `existing_id` when seed
+        # construction lands on an already-allocated pair). Raw list length is
+        # inflated by aliases and is not a reliable proxy for ID density — a
+        # hole plus enough aliases can make a list-length check pass while the
+        # underlying ID space is sparse. The unique-id count directly asserts
+        # the invariant downstream consumers need (every id in `[0, max_id]`
+        # is allocated to some token).
         ids = [v for _, v in mergeable_ranks_list]
-        missing = sorted(set(range(vocab_size_no_special)) - set(ids))
-        if missing:
+        unique_ids = set(ids)
+        n_unique = len(unique_ids)
+        max_id = max(ids) if ids else -1
+        if max_id >= n_unique:
+            missing = sorted(set(range(max_id + 1)) - unique_ids)
             raise ValueError(
-                f"rustbpe_seed_tokens export missing token ids: "
-                f"count={len(missing)}, sample={missing[:20]}"
+                f"rustbpe_seed_tokens produced sparse mergeable ids: "
+                f"{n_unique} unique ids allocated but max id is {max_id} "
+                f"(would be {n_unique - 1} if dense). Missing ids in "
+                f"[0, {max_id}]: {missing[:10]}"
+                f"{'...' if len(missing) > 10 else ''}. Indicates a bug in "
+                f"the constructive merge-chain builder, not a small-corpus "
+                f"stop — special tokens at `tokens_offset = "
+                f"len(mergeable_ranks)` would risk colliding with existing "
+                f"mergeable ids above the hole."
+            )
+        if n_unique < vocab_size_no_special:
+            import warnings
+            warnings.warn(
+                f"rustbpe_seed_tokens produced {n_unique}/{vocab_size_no_special} "
+                f"unique merges ({vocab_size_no_special - n_unique} short). "
+                f"Likely cause: training corpus too small to fill the vocab. "
+                f"Ids are dense from 0 — special tokens place safely above "
+                f"max_id. Proceeding with reduced vocab.",
+                stacklevel=2,
             )
         mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
-        tokens_offset = len(mergeable_ranks)
+        tokens_offset = len(mergeable_ranks)  # safe: dict size >= n_unique > max_id per check above
         special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
         enc = tiktoken.Encoding(
             name="rustbpe_seed_tokens",

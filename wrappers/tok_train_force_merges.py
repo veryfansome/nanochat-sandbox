@@ -72,8 +72,52 @@ def apply_patches():
         )
         pattern = tokenizer.get_pattern()
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()
+        # Defensive: `tokens_offset = len(mergeable_ranks)` is only safe when
+        # unique ids are dense in `[0, n_unique)`. force_merges's trainer
+        # assigns ids sequentially during base BPE, then runs
+        # `apply_forced_merges_at_end` — by design, no interior holes. But if
+        # a future Rust-side change broke that invariant, special tokens at
+        # `len(mergeable_ranks)` could collide with mergeable ids above the
+        # hole. Mirror the seed_tokens discriminator: tail shortfall (small-
+        # corpus stop) → warn; interior hole → raise.
+        #
+        # **Discriminator note**: we test against `len(set(ids))`, not raw
+        # `len(ids)`. `apply_forced_merges_at_end` reuses an `existing_id`
+        # whenever the forced concat already exists in the vocab, so duplicate
+        # ids in `mergeable_ranks_list` are expected. Raw list length is
+        # inflated by aliases and not a reliable proxy for density — a future
+        # bug that creates both an interior hole and an alias duplicate in
+        # the same export could slip past a list-length check. Unique-id
+        # count directly asserts the property downstream consumers need.
+        # See wrappers/tok_train_seed_tokens.py for the deeper discussion.
+        ids = [v for _, v in mergeable_ranks_list]
+        unique_ids = set(ids)
+        n_unique = len(unique_ids)
+        max_id = max(ids) if ids else -1
+        if max_id >= n_unique:
+            missing = sorted(set(range(max_id + 1)) - unique_ids)
+            raise ValueError(
+                f"rustbpe_force_merges produced sparse mergeable ids: "
+                f"{n_unique} unique ids allocated but max id is {max_id} "
+                f"(would be {n_unique - 1} if dense). Missing ids in "
+                f"[0, {max_id}]: {missing[:10]}"
+                f"{'...' if len(missing) > 10 else ''}. Indicates a bug in "
+                f"the forced-merge injection (post-train) — special tokens "
+                f"at `tokens_offset = len(mergeable_ranks)` would risk "
+                f"colliding with existing mergeable ids above the hole."
+            )
+        if n_unique < vocab_size_no_special:
+            import warnings
+            warnings.warn(
+                f"rustbpe_force_merges produced {n_unique}/{vocab_size_no_special} "
+                f"unique merges ({vocab_size_no_special - n_unique} short). "
+                f"Likely cause: training corpus too small to fill the vocab. "
+                f"Ids are dense from 0 — special tokens place safely above "
+                f"max_id. Proceeding with reduced vocab.",
+                stacklevel=2,
+            )
         mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
-        tokens_offset = len(mergeable_ranks)
+        tokens_offset = len(mergeable_ranks)  # safe: dict size >= n_unique > max_id per check above
         special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
         enc = tiktoken.Encoding(
             name="rustbpe_force_merges",

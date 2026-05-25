@@ -383,11 +383,17 @@ impl Tokenizer {
                 reserved_merges, total_capacity, vocab_size
             );
         }
-        let num_merges = total_capacity.saturating_sub(reserved_merges);
+        // Phase 1 target: leave room for `reserved_merges` forced specs. If fewer than
+        // `reserved_merges` actually fire (operands missing, or the concat is already a token),
+        // Phase 2 backfills the unused slots with normal BPE merges so the final vocab is
+        // exactly `vocab_size` regardless of how many forced specs succeed. Fixes a bug
+        // where vocab silently underfilled when forced specs were skipped.
+        let phase1_target = total_capacity.saturating_sub(reserved_merges);
         log::info!(
-            "Starting BPE training: total capacity = {} merges ({} normal + {} reserved for forced merges), \
+            "Starting BPE training: total capacity = {} merges ({} normal phase-1 + {} reserved \
+             for forced merges; unused reservations will be backfilled with normal merges), \
              blocking {} pairs from merging",
-            total_capacity, num_merges, reserved_merges.min(total_capacity), blocked_specs.len(),
+            total_capacity, phase1_target, reserved_merges.min(total_capacity), blocked_specs.len(),
         );
         self.merges.clear();
 
@@ -417,11 +423,16 @@ impl Tokenizer {
         }
 
         // ---- Merge loop ----
-        log::info!("Starting merge loop");
+        // Wrapped in a phase-loop so we can re-enter after `apply_forced_merges_at_end`
+        // to backfill any reservation slots that went unused.
+        log::info!("Starting merge loop (phase 1, target = {} merges)", phase1_target);
         let mut merges_done = 0u32;
         let mut last_log_percent = 0u32;
+        let mut phase: u8 = 1;
+        let mut current_target = phase1_target;
 
-        'merge_loop: while merges_done < num_merges {
+        'phase_loop: loop {
+        'merge_loop: while merges_done < current_target {
             let Some(mut top) = heap.pop() else { break; };
 
             // Lazy refresh
@@ -435,6 +446,13 @@ impl Tokenizer {
             }
             if top.count == 0 {
                 break;
+            }
+
+            // On phase-2 re-entry, the heap may pop a pair that was already merged
+            // by apply_forced_merges_at_end (the heap doesn't know about those).
+            // Skip — re-inserting would clobber the forced merge rule with a new id.
+            if self.merges.contains_key(&top.pair) {
+                continue 'merge_loop;
             }
 
             // Skip pairs we already decided are banned
@@ -540,19 +558,58 @@ impl Tokenizer {
 
             merges_done += 1;
 
-            // Log progress every 1%
-            let current_percent = (merges_done * 100) / num_merges;
-            if current_percent > last_log_percent {
-                log::info!(
-                    "Progress: {}% ({}/{} merges) - Last merge: {:?} -> {} (frequency: {})",
-                    current_percent, merges_done, num_merges, top.pair, new_id, top.count
-                );
-                last_log_percent = current_percent;
+            // Log progress every 1% (relative to current phase target; avoids div-by-zero
+            // when current_target == 0, which can happen if all capacity is reserved).
+            if current_target > 0 {
+                let current_percent = (merges_done * 100) / current_target;
+                if current_percent > last_log_percent {
+                    log::info!(
+                        "Phase {} progress: {}% ({}/{} merges) - Last merge: {:?} -> {} (frequency: {})",
+                        phase, current_percent, merges_done, current_target, top.pair, new_id, top.count
+                    );
+                    last_log_percent = current_percent;
+                }
             }
         }
+        // --- End of inner 'merge_loop ---
 
-        log::info!("Finished training: {} merges completed", merges_done);
-        apply_forced_merges_at_end(&blocked_specs, &forced_specs, &mut self.merges, vocab_size, &mut merges_done);
+        match phase {
+            1 => {
+                log::info!("Finished phase-1: {} normal merges completed", merges_done);
+                let before_forced = merges_done;
+                apply_forced_merges_at_end(
+                    &blocked_specs, &forced_specs, &mut self.merges, vocab_size, &mut merges_done,
+                );
+                let applied = merges_done - before_forced;
+                let unused_reservation = reserved_merges.saturating_sub(applied);
+                log::info!(
+                    "Applied {}/{} forced merges; {} reservation slots unused",
+                    applied, reserved_merges, unused_reservation,
+                );
+                if merges_done < total_capacity {
+                    // Phase 2: backfill any unused reservation slots with normal BPE merges
+                    // so vocab is exactly `vocab_size`. The heap and pair_counts state is
+                    // still alive; apply_forced_merges_at_end only touched self.merges and
+                    // merges_done. The "skip if already merged" check at the top of the
+                    // loop handles heap entries for pairs that were force-merged above.
+                    phase = 2;
+                    current_target = total_capacity;
+                    last_log_percent = 0;
+                    log::info!(
+                        "Starting phase-2 backfill ({} additional normal merges to reach \
+                         total capacity = {})",
+                        current_target - merges_done, total_capacity,
+                    );
+                    continue 'phase_loop;
+                }
+                break 'phase_loop;
+            }
+            _ => {
+                log::info!("Finished phase-2 backfill: {} total merges completed", merges_done);
+                break 'phase_loop;
+            }
+        }
+        } // end 'phase_loop
     }
 }
 

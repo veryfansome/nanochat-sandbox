@@ -7,6 +7,9 @@ Verifies:
   (c) Seed-token YAML loads + produces the expected position-aware variants.
   (d) `train_from_iterator` accepts seed_tokens kwarg.
   (e) End-to-end: train on a tiny synthetic corpus, encode/decode roundtrip.
+  (f) **Wrapper path**: apply_patches() + tk.RustBPETokenizer.train_from_iterator
+      on a small corpus must succeed without raising (regression check for the
+      strict-contiguity false positive that crashed small-corpus runs).
 
 No real data; runs in <2s.
 """
@@ -67,5 +70,36 @@ with tempfile.TemporaryDirectory() as tmp:
     decoded = enc.decode(ids)
     assert decoded == test, f"roundtrip failed: {decoded!r} != {test!r}"
     print(f"[e] roundtrip OK ({len(ids)} tokens for {len(test)} bytes)")
+
+    # (f) Wrapper-path regression: invoke the wrapper's apply_patches() shim
+    # and call the patched train_from_iterator on a small corpus. Pre-fix, the
+    # wrapper raised ValueError on a strict contiguity check whenever BPE stopped
+    # early (corpus too small to fill vocab). Now it should succeed and warn.
+    #
+    # Pick vocab_size large enough that the rustbpe_seed_tokens crate's
+    # constructive merge-chain pre-flight passes (it needs ~3-4x the seed
+    # count in merge slots), but the corpus is still too small to fill the
+    # vocab — which is the exact scenario that used to trip the wrapper.
+    from wrappers.tok_train_seed_tokens import apply_patches
+    apply_patches()  # idempotent — already aliased above
+    import nanochat.tokenizer as tk
+    small_corpus = ["hello world. this is a short corpus. " * 30]
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result_tok = tk.RustBPETokenizer.train_from_iterator(iter(small_corpus), 4096)
+    assert result_tok is not None, "wrapper-path train returned None"
+    vocab_n = result_tok.get_vocab_size()
+    assert vocab_n > 256, f"wrapper-path train produced impossibly small vocab: {vocab_n}"
+    contiguity_warnings = [x for x in w if "rustbpe_seed_tokens" in str(x.message)]
+    # Corpus is small enough that BPE WILL stop early → contiguity warning must fire.
+    # If it doesn't, either the wrapper's warning logic is broken or the corpus
+    # was unexpectedly large enough to saturate vocab.
+    assert contiguity_warnings, (
+        f"expected contiguity warning on small-corpus training; got 0. "
+        f"Result vocab: {vocab_n}; all warnings: {[str(x.message) for x in w]}"
+    )
+    print(f"[f] wrapper-path train succeeded ({vocab_n} tokens, "
+          f"{len(contiguity_warnings)} contiguity warning(s) as expected)")
 
 print("\nall smoke checks passed")
