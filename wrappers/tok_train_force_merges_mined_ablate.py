@@ -1,13 +1,10 @@
 """
-Fine-grained DERIVED-pair ablation training.
+Trainer for arbitrary DERIVED subsets via `INCLUDE_INDICES` (0-based,
+comma-separated). Variant dir encodes the index list so subsets coexist.
+Used for single-pair attribution when cumulative ablation narrows the
+regressor to a bucket — see pairs_mined_ablate.py.
 
-Trains with an arbitrary subset of the 20 mined DERIVED pairs as specified
-by INCLUDE_INDICES (comma-separated 0-based indices). Variant base dir
-includes the index list in its name so multiple subsets coexist.
-
-Usage:
-    INCLUDE_INDICES=0,1,2,...,14,16 \\
-        uv run python -m wrappers.tok_train_force_merges_mined_ablate
+Usage: INCLUDE_INDICES=0,1,2,...,14,16 uv run python -m wrappers.tok_train_force_merges_mined_ablate
 """
 import os
 import runpy

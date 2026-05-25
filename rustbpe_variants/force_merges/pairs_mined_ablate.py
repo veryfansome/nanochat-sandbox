@@ -1,21 +1,15 @@
 """
-Arbitrary-subset variant for fine-grained DERIVED ablation.
+Arbitrary-subset DERIVED variant for single-pair attribution. Env
+`INCLUDE_INDICES` = comma-separated 0-based indices into the 20 mined
+DERIVED list; only those are included (all 87 mined FORCED + 2 numeric
+DERIVED always present). Used when cumulative ablation
+(pairs_mined_derived_subset.py) narrows the regressor to a bucket and you
+need to isolate which specific pair(s) within it are responsible.
 
-Reads INCLUDE_INDICES from the environment as a comma-separated list of
-0-based indices into the 20 mined DERIVED list (artifact
-mined/forced_pairs_climbmix_20rg_twopass.py). Includes only those pairs;
-numeric DERIVED ("00","0") + (",","000") + all mined FORCED are always
-included.
-
-Why this exists: cumulative ablation (pairs_mined_v2_subset.py) only tells
-us "the bucket [K_a, K_b] contains a regressor"; it can't distinguish
-multiple individually-sufficient causes within the bucket. This module lets
-the driver train K=15 + {only pair #i} for each i, isolating each pair's
-marginal effect.
-
-INCLUDE_INDICES="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,16"  → K=15 + just pair #16
-INCLUDE_INDICES=""                                       → no mined DERIVED
-INCLUDE_INDICES not set                                  → all 20 (= v2)
+Examples:
+  INCLUDE_INDICES="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,16"  → K=15 + pair #16
+  INCLUDE_INDICES=""                                       → no mined DERIVED
+  INCLUDE_INDICES unset                                    → all 20
 """
 
 import os

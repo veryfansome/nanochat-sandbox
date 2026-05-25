@@ -1,27 +1,18 @@
 """
 Tokenizer variant: forced cross-boundary common-phrase merges.
 
-Lifted from veryfansome/nanochat@force_merges_wip. The Rust crate
-`rustbpe_force_merges` (built via `VARIANT=force_merges bash runs/build_rustbpe.sh`)
-adds `forced_pairs=` and `blocked_pairs=` kwargs to `train_from_iterator` and
-runs `apply_forced_merges_at_end` after normal BPE training. The Python wrapper
-patches SPLIT_PATTERN with the regex carve-out so cross-boundary phrases form
-single pre-tok chunks at inference (otherwise tiktoken would never apply the
-forced merges).
+The Rust crate `rustbpe_force_merges` (built via
+`VARIANT=force_merges bash runs/build_rustbpe.sh`) adds `forced_pairs=` /
+`blocked_pairs=` kwargs to `train_from_iterator` and runs
+`apply_forced_merges_at_end` after normal BPE training. This wrapper patches
+SPLIT_PATTERN with the regex carve-out so cross-boundary phrases form single
+pre-tok chunks at inference (otherwise tiktoken can't apply the forced merge).
 
-See ../rustbpe_variants/force_merges/pairs.py for the FORCED_PAIRS / BLOCKED_PAIRS
-data + the derived SPLIT_PATTERN, and ../ideas/tokenizer-variants/README.md
-"force_merges_wip" for the design rationale.
+Pair list at `rustbpe_variants/force_merges/pairs.py` (data-driven, see
+STATUS.md §force_merges for construction provenance).
 
 Usage:
-    # Build the rustbpe variant once (and after any Rust edit):
-    VARIANT=force_merges bash runs/build_rustbpe.sh
-
-    # Then train:
-    uv run python -m wrappers.tok_train_force_merges
-
-Output:
-    ~/.cache/nanochat-variants/force_merges/tokenizer/
+    uv run python -m wrappers.tok_train_force_merges  →  ~/.cache/nanochat-variants/force_merges/tokenizer/
 """
 import runpy
 

@@ -1,26 +1,17 @@
 """
-Cumulative ablation driver for the mined FORCED_PAIRS list.
+Cumulative ablation over the FORCED list. For each K value, trains a
+tokenizer with the top-K mined FORCED pairs (via
+`wrappers.tok_train_force_merges_mined_forced_subset` + env `MINED_TOP_K`),
+runs `tools.eval_tokenizer`, then diffs the JSONs to surface which Tier-1
+metric changes at which K step. Output is a delta table on stdout +
+per-K JSON cache at `results/mined_ablation/`.
 
-Trains a sequence of tokenizers using the top-K mined pairs for several K
-values, runs eval_tokenizer on each, and emits a delta table showing which
-metric changes at each step. The intent mirrors the user's original
-incremental hand-curation workflow: add candidates in batches, verify each
-step.
+Tier-1 signal floor is coarse — most regression-worthy effects only show up
+at Lambda-scale CORE/val/bpb. This tool flags suspicious buckets to drill
+into there; a clean run is permission to skip further mining-list scrutiny.
 
 Usage:
     uv run python -m tools.ablate_mined --k-values 25,50,75,87
-
-Each K value triggers a fresh tokenizer training (~5-6 min each on CPU) and
-writes to ~/.cache/nanochat-variants/force_merges_mined_k${K}/tokenizer/.
-After all training completes, eval_tokenizer is invoked with all K dirs and
-the resulting JSON is diffed.
-
-This tool exists mainly to validate that no individual bucket of mined
-candidates causes a Tier-1 regression. With the current Tier-1 metrics the
-signal floor is coarse — most regression-worthy effects only surface at
-Lambda-scale CORE/val/bpb eval. The output identifies suspicious buckets to
-re-test there; a fully-clean run gives confidence to ship the larger mined
-list.
 """
 
 import argparse
@@ -41,7 +32,7 @@ def train_one(k: int) -> Path:
     env = {**os.environ, "MINED_TOP_K": str(k)}
     res = subprocess.run(
         ["uv", "run", "python", "-m",
-         "wrappers.tok_train_force_merges_mined_subset"],
+         "wrappers.tok_train_force_merges_mined_forced_subset"],
         env=env, capture_output=True, text=True,
     )
     if res.returncode != 0:

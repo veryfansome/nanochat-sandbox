@@ -1,21 +1,9 @@
 """
-DERIVED-pair ablation variant of pairs_mined_v2.
-
-Same as pairs_mined_v2 except the two-pass-mined DERIVED list is truncated
-to the top-K entries via the DERIVED_TOP_K environment variable (default:
-all). Used by tools/ablate_derived.py to attribute the v0→v2 `english`
-regression to specific DERIVED additions.
-
-  FORCED_PAIRS = mined-v0 (87 pass-1 pairs)
-                 + (top-K of 20 two-pass DERIVED)
-                 + 2 numeric DERIVED (always included; needed for currency)
-
-K=0  ≡ pairs_mined_v1 (mined-v0 FORCED + numeric DERIVED only)
-K=20 ≡ pairs_mined_v2 (full kitchen sink)
-
-The 20 two-pass DERIVED entries are ordered by frequency rank in the
-artifact at mined/forced_pairs_climbmix_20rg_twopass.py — see that file for
-counts. Cumulative ablation walks K = 0, 5, 10, 15, 20.
+DERIVED-list subset for ablation. Loads the two-pass mining artifact;
+keeps all 87 mined FORCED + 2 numeric DERIVED fixed, truncates the 20
+mined DERIVED to top-K via env `DERIVED_TOP_K` (default: all). Used by
+`tools/ablate_derived.py`. Walk K = 0, 5, 10, 15, 20 to bracket Tier-1
+regressions.
 """
 
 import os

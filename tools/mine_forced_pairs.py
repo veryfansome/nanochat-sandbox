@@ -1,54 +1,43 @@
 """
-Data-driven candidate generation for the force_merges tokenizer variant.
+Data-driven candidate generation for the force_merges tokenizer.
 
-Replaces the hand-picked FORCED_PAIRS list in
-rustbpe_variants/force_merges/pairs.py with a frequency-ranked list mined from
-the actual pretraining corpus, filtered by grammatical role (closed-class
-function words). The output is a pairs.py-compatible Python list that can be
-diffed against, merged with, or swapped for the hand-picked list.
+Counts cross-boundary bigrams from a corpus sample: apply the BASELINE
+pre-tokenization regex, walk adjacent chunk pairs (chunk_i, chunk_{i+1})
+within each document, rank by frequency. Adjacent chunks are precisely the
+pairs that BPE *can't* learn today because pre-tok splits them — i.e. the
+candidates for forced cross-boundary merges.
 
-Why this exists (Track C of ideas/tokenizer-variants/README.md):
-  The 70-pair hand-picked list is intuition-driven. A reproducible
-  data-driven selection — top-K cross-boundary bigrams by frequency in a
-  held-out corpus, subject to a grammatical-role filter — is more principled,
-  surfaces phrases the human curator forgot, and re-runs cleanly when the
-  corpus changes.
+Two filters constrain candidates before ranking:
+  - Grammatical role: only pairs whose LHS is closed-class (punctuation,
+    preposition, conjunction, auxiliary, determiner) and RHS is closed-class
+    (determiner, auxiliary, pronoun, conjunction, capitalized sentence-
+    starter, punctuation). See LHS_FUNCTION_WORDS / RHS_FUNCTION_WORDS.
+    Frequency alone over-selects on content-word bigrams that don't
+    generalize across domains.
+  - Shadow detection: a pair `(c, d)` is shadowed by emitted `(a, b)` when
+    `b == c` (operand consumed) or `a == d` (regex precedence pre-emption).
+    Shadowed pairs would never fire under the leftmost-first alternation.
 
-What "cross-boundary bigram" means here:
-  Apply the BASELINE pre-tokenization regex (no force_merges carve-out).
-  Each document becomes a sequence of pre-tok chunks. Adjacent chunks
-  (chunk_i, chunk_{i+1}) are precisely the pairs that BPE *cannot* learn to
-  merge today, because pre-tok splits them. These are the candidates for
-  forced cross-boundary merges. We count them on a sample and rank.
+`--two-pass` adds a second pass that re-pre-tokenizes against an augmented
+SPLIT_PATTERN with the pass-1 carve-outs, then mines bigrams whose LHS is a
+pass-1 concatenation. Recovers depth-2 phrases (e.g. `(" of the", " most")`)
+that single-pass can't see.
 
-Grammatical-role filter:
-  Frequency alone over-selects on common content words (e.g. " of"+" course"
-  in business prose; " the"+" company" in financial text). To target
-  genuinely syntactic-glue phrases — the kind that translate across domain
-  shifts — restrict pairs to closed-class function words on both sides. See
-  LHS_CLASSES / RHS_CLASSES below for the role inventory.
+Output: a `pairs.py`-compatible Python module with `FORCED_PAIRS` (and, with
+`--two-pass`, `DERIVED_PAIRS`) — see `rustbpe_variants/force_merges/mined/`
+for the artifacts currently used by `pairs.py`.
 
-Conflict detection:
-  When listed in a single regex alternation, two pairs (a,b) and (c,d) can
-  shadow each other if b == c (right side of one == left side of the other):
-  once the higher-priority pair consumes the shared token, the lower-priority
-  pair's left operand is gone. The tool flags shadowed candidates so the
-  emitted list can be reordered or pruned.
+Usage:
+    # Two-pass mining, write artifact for the canonical pairs.py to import.
+    uv run python -m tools.mine_forced_pairs --row-groups 20 --two-pass \\
+        --top-k 150 --top-k-derived 20 \\
+        --out-py rustbpe_variants/force_merges/mined/forced_pairs_climbmix_20rg_twopass.py
 
-Usage (typical):
-    # Scan one shard, default filter, top 100, write a pairs.py-style list.
-    uv run python -m tools.mine_forced_pairs --shards 1 --top-k 100 \\
-        --out-py mined_pairs.py
-
-    # Compare against the existing hand-picked list.
-    uv run python -m tools.mine_forced_pairs --shards 1 --top-k 100 \\
+    # Diff a new mining run against the in-tree list.
+    uv run python -m tools.mine_forced_pairs --row-groups 20 --top-k 150 \\
         --compare-to rustbpe_variants/force_merges/pairs.py
 
-    # Loose filter (LHS only) for exploration.
-    uv run python -m tools.mine_forced_pairs --shards 1 --top-k 200 \\
-        --filter loose
-
-No GPU. Runs in ~1 minute per shard on a laptop.
+No GPU. ~10s per row group on a laptop; a 20-row-group two-pass run takes ~5 min.
 """
 
 import argparse

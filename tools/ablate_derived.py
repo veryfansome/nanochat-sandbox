@@ -1,17 +1,18 @@
 """
-DERIVED-pair cumulative ablation driver.
+Cumulative ablation over the DERIVED list. For each K value, trains a
+tokenizer with all 87 mined FORCED + top-K mined DERIVED + 2 numeric
+DERIVED (via `wrappers.tok_train_force_merges_mined_derived_subset` + env
+`DERIVED_TOP_K`), runs `tools.eval_tokenizer`, diffs the JSONs. Outputs a
+delta table on stdout + per-K JSON cache at `results/derived_ablation/`.
 
-Trains a sequence of tokenizers with DERIVED_TOP_K ∈ {0, 5, 10, 15, 20}
-(numeric DERIVED + full FORCED stay fixed) and diffs the eval output. K=0
-is symlinked to the already-trained force_merges_mined_v1 (numeric DERIVED
-only); K=20 to force_merges_mined_v2 (full kitchen sink). The middle K
-values are trained fresh.
+Drill-down workflow after this surfaces a regressing bucket: re-run with
+finer `--k-values` (e.g. `15,16,17,18,19,20`) to single-step the bucket;
+if multiple pairs in the bucket are individually-sufficient causes, use
+`wrappers.tok_train_force_merges_mined_ablate` with `INCLUDE_INDICES` to
+attribute.
 
 Usage:
-    uv run python -m tools.ablate_derived
-
-Outputs per-K eval JSONs at results/derived_ablation/eval_d${K}.json plus a
-diff table on stdout.
+    uv run python -m tools.ablate_derived --k-values 0,5,10,15,20
 """
 
 import argparse
@@ -24,20 +25,8 @@ from pathlib import Path
 HOME = Path.home()
 
 
-def ensure_baseline_links():
-    """Symlink k=0 → force_merges_mined_v1, k=20 → force_merges_mined_v2."""
-    aliases = {
-        0: HOME / ".cache/nanochat-variants/force_merges_mined_v1",
-        20: HOME / ".cache/nanochat-variants/force_merges_mined_v2",
-    }
-    for k, target in aliases.items():
-        link = HOME / f".cache/nanochat-variants/force_merges_mined_v2_d{k}"
-        if not link.exists() and target.exists():
-            link.symlink_to(target)
-
-
 def train_one(k: int) -> Path:
-    out_dir = HOME / f".cache/nanochat-variants/force_merges_mined_v2_d{k}/tokenizer"
+    out_dir = HOME / f".cache/nanochat-variants/force_merges_mined_derived_d{k}/tokenizer"
     if out_dir.exists() and (out_dir / "tokenizer.pkl").exists():
         print(f"  [skip] DERIVED_TOP_K={k} already trained at {out_dir}",
               file=sys.stderr)
@@ -46,7 +35,7 @@ def train_one(k: int) -> Path:
     env = {**os.environ, "DERIVED_TOP_K": str(k)}
     res = subprocess.run(
         ["uv", "run", "python", "-m",
-         "wrappers.tok_train_force_merges_mined_v2_subset"],
+         "wrappers.tok_train_force_merges_mined_derived_subset"],
         env=env, capture_output=True, text=True,
     )
     if res.returncode != 0:
@@ -144,8 +133,6 @@ def main():
 
     k_values = sorted(int(x) for x in args.k_values.split(","))
     args.results_dir.mkdir(parents=True, exist_ok=True)
-
-    ensure_baseline_links()
 
     reports = []
     for k in k_values:

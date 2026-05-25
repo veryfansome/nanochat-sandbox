@@ -215,8 +215,14 @@ EOF
     user="${LAMBDA_SSH_USER:-ubuntu}"
 
     echo "==> rsync $SANDBOX_DIR/ → $user@$ip:~/sandbox/" >&2
+    # Excludes: .venv (host-built, Lambda will uv sync fresh); __pycache__/*.pyc
+    # (rebuilt on first import); results (per-run archives — pulled the other
+    # direction); target (~900MB of Mac-built Rust artifacts under rustbpe/ +
+    # rustbpe_variants/*/, useless on Linux — Lambda rebuilds via
+    # runs/build_rustbpe.sh if a variant is actually needed there).
     rsync -av --delete \
         --exclude=.venv --exclude=__pycache__ --exclude=results --exclude='*.pyc' \
+        --exclude=target \
         -e "ssh -o StrictHostKeyChecking=accept-new" \
         "$SANDBOX_DIR/" "$user@$ip:~/sandbox/"
 

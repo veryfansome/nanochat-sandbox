@@ -1,17 +1,7 @@
 """
-Cumulative-subset variant of pairs_mined.py for incremental ablation.
-
-Loads the same mined FORCED_PAIRS artifact as pairs_mined.py but truncates
-to the top-K entries by frequency rank. K is read from the MINED_TOP_K
-environment variable at import time (default: all entries).
-
-Used by tools/ablate_mined.py to train a sequence of tokenizers at K ∈
-{25, 50, 75, 87} and probe where (if anywhere) adding more mined-only
-candidates causes a Tier-1 regression. The intent mirrors the user's
-original incremental hand-curation workflow: add candidates in batches,
-verify each step.
-
-DERIVED_PAIRS is empty (single-pass) — ablation is on the FORCED list only.
+FORCED-list subset for ablation. Loads the pass-1 mining artifact and
+truncates to the top-K entries by frequency rank (env `MINED_TOP_K`,
+default: all). Used by `tools/ablate_mined.py`. No DERIVED.
 """
 
 import os
