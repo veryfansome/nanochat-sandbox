@@ -14,7 +14,7 @@ Working state of the project — implementation progress, current focus, sequenc
 | [Online data selection + batch-size tuning](ideas/online-data-selection/README.md) | ✓ | — | — | — |
 | [Adaptive sequence length / batch size](ideas/adaptive-schedule/README.md) | ✓ | — | — | — |
 | [Layer-wise LR / staged maturation](ideas/layerwise-lr/README.md) | ✓ | — | — | — |
-| [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | partial — `tools/eval_tokenizer.py` harness done; pristine `sandbox/rustbpe/` vendored; three variants ported (`space_digits` [Py-only], `force_merges` [Rust], `seed_tokens` [Rust]) | ✓ all three (smoke_tok_train_{space_digits,force_merges,seed_tokens}) | — |
+| [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | partial — `tools/eval_tokenizer.py` harness done; pristine `sandbox/rustbpe/` vendored; three variants ported (`space_digits` [Py-only], `force_merges` [Rust, data-driven curated 2026-05-25], `seed_tokens` [Rust]) | ✓ all three (smoke_tok_train_{space_digits,force_merges,seed_tokens}) | **in-flight: `d24_force_merges` Lambda speedrun vs `d24_baseline`** |
 | [Non-backprop (DFA → block-local)](ideas/non-backprop/README.md) | ✓ (research track) | — | — | — |
 
 ## d24 trio results (8xA100 40GB, ~$337 wall-clock)
@@ -68,16 +68,24 @@ MTP rescue probes (α=0.1+k=1 first) only happen if a follow-up idea raises a sp
 
 **[Tokenizer variants](ideas/tokenizer-variants/README.md)** is a **parallel track**. Infrastructure is now end-to-end ready: `tools/eval_tokenizer.py` harness validated; pristine rustbpe vendored at `sandbox/rustbpe/` (Karpathy@9467d83) with `runs/build_rustbpe.sh` for local builds; parallel-crate variants pattern in `sandbox/rustbpe_variants/`. **Three variants ported** from `veryfansome/nanochat` prior art:
 
-- **`space_digits`** (Python-only) — adds optional leading space before the digit clause in `SPLIT_PATTERN`. Wrapper: `wrappers/tok_train_space_digits.py`. Smoke: `wrappers/smoke_tok_train_space_digits.py`. Uses PyPI rustbpe; no Rust build needed.
-- **`force_merges`** (Rust) — forced cross-boundary common-phrase merges (` of the`, `, and`, etc.) via regex carve-out. Crate: `rustbpe_variants/force_merges/` (`rustbpe_force_merges` module); canonical pair list at `pairs.py` (87 mined FORCED + 15 mined DERIVED + 2 numeric DERIVED = 104, vocab=32768). Build: `VARIANT=force_merges bash runs/build_rustbpe.sh`. On a 15M-char climbmix sample: **−6.5% total tokens vs baseline** (3.27M → 3.06M), trading ~237 rare-content BPE merges (` Staphylococcus`, ` philosophers`, inflected forms) for ~237 high-frequency phrasal merges (` of the`, `, and the`, `. The`, ` can be`).
+- **`space_digits`** (Python-only) — adds optional leading space before the digit clause in `SPLIT_PATTERN`. Wrapper: `wrappers/tok_train_space_digits.py`. Smoke: `wrappers/smoke_tok_train_space_digits.py`. Uses PyPI rustbpe; no Rust build needed. (Note: the `?` leading-space tweak is also folded into `force_merges`'s `SPLIT_PATTERN`, so running both is redundant.)
+- **`force_merges`** (Rust) — forced cross-boundary common-phrase merges (` of the`, `, and`, etc.) via regex carve-out. Crate: `rustbpe_variants/force_merges/` (`rustbpe_force_merges` module); canonical pair list at `pairs.py` (87 mined FORCED + 15 mined DERIVED + 2 numeric DERIVED = 104, vocab=32768). Build: `VARIANT=force_merges bash runs/build_rustbpe.sh`. On a 15M-char climbmix sample: **−6.5% total tokens vs baseline** (3.27M → 3.06M), trading ~237 rare-content BPE merges (` Staphylococcus`, ` philosophers`, inflected forms) for ~237 high-frequency phrasal merges (` of the`, `, and the`, `. The`, ` can be`). Construction provenance + per-pair attribution + vocab-cost mechanism + known issues + reusable infrastructure detailed in the `force_merges curation details` subsection below.
+- **`seed_tokens`** (Rust) — morpheme-seeded BPE with constructive merge-chain builder. Crate: `rustbpe_variants/seed_tokens/` (`rustbpe_seed_tokens` module). Data: `rustbpe_variants/seed_tokens/seed_tokens.yaml` (~200 morphemes). Wrapper + smoke under `wrappers/`. Build: `VARIANT=seed_tokens bash runs/build_rustbpe.sh`.
+- **`case_marker`** (designed only, not yet implemented) — lossless casing collapse via input preprocessing: cased words → `<|cap|>` / `<|allcaps|>` marker tokens + lowercased base. Pure-Python (~200-300 LOC); no Rust work. Orthogonal to all merge-producer variants. Catalog entry: `ideas/tokenizer-variants/README.md` variant 13. Decision-gated on force_merges Lambda speedrun outcome.
 
-### How `pairs.py` was constructed (2026-05-25)
+`force_merges` was data-driven curated 2026-05-25 and the resulting tokenizer is currently in a Lambda speedrun (`d24_force_merges` vs `d24_baseline` `qmsi105c`). `space_digits` and `seed_tokens` smoke-pass at d6/local scale but haven't been trained on the full corpus yet — same eval workflow (`tools/eval_tokenizer.py` → speedrun A/B) applies.
+
+The [non-backprop LLM](ideas/non-backprop/README.md) is a **separate research track**, not part of this capability-tuning sequence. Pursue independently.
+
+### force_merges curation details
+
+#### How `pairs.py` was constructed (2026-05-25)
 
 Replaced a ~70-pair hand-picked list (lifted from `veryfansome/nanochat@force_merges_wip`) with a data-driven list derived end-to-end from corpus statistics + Tier-1 ablation. Tooling preserved for re-curation; intermediate exploration variants (v0–v5) were consolidated away.
 
-1. **Two-pass corpus mining** (`tools/mine_forced_pairs.py --two-pass`, 20 climbmix row groups, ~60M chars). Pass 1 mines cross-boundary bigrams from the baseline pre-tokenization with a closed-class grammatical-role filter (LHS = punctuation/preposition/conjunction/auxiliary; RHS = determiner/auxiliary/pronoun/conjunction/capitalized-sentence-starter). Pass 2 re-mines bigrams whose LHS is a pass-1 concatenation — recovers depth-2 phrases like `(" of the", " most")`, `(" can be", " a")` that single-pass can't see. Artifacts at `rustbpe_variants/force_merges/mined/forced_pairs_climbmix_20rg{,_twopass}.py`.
+1. **Two-pass corpus mining** (`tools/mine_forced_pairs.py --two-pass`, 20 climbmix row groups, ~60M chars). Pass 1 mines cross-boundary bigrams from the baseline pre-tokenization with a hand-curated continuation whitelist (LHS leans closed-class — prepositions, conjunctions, auxiliaries, punctuation — plus discourse markers + `one`/`two`; RHS leans the same way plus common open-class verbs that empirically show up in glue phrases — `make`, `find`, `want`, `need`). Pass 2 re-mines bigrams whose LHS is a pass-1 concatenation — recovers depth-2 phrases like `(" of the", " most")`, `(" can be", " a")` that single-pass can't see. Artifacts at `rustbpe_variants/force_merges/mined/forced_pairs_climbmix_20rg{,_twopass}.py`.
 
-2. **Tier-1 sanity check** against the hand-picked baseline (79.6% pair coverage at top-150). Single-pass mining matches/beats hand-picked on English prose; loses `currency` by 1 token because numeric DERIVED pairs (`("00","0")`, `(",","000")`) fail the function-word filter. Added back as hand-additions.
+2. **Tier-1 sanity check** against the hand-picked baseline (79.6% pair coverage at top-150). Single-pass mining matches/beats hand-picked on English prose; loses `currency` by 1 token because numeric DERIVED pairs (`("00","0")`, `(",","000")`) fail the continuation-whitelist filter (numeric RHS). Added back as hand-additions.
 
 3. **Kitchen-sink (all 22 DERIVED, "v2")** improves `modern_prose` (+1.8%) but regresses `english` (−2.1%, +1 token). Token-diff diagnosis: lost the `"izards"` BPE merge (used in "wizards") because the extra carve-outs consumed vocab budget.
 
@@ -86,7 +94,7 @@ Replaced a ~70-pair hand-picked list (lifted from `veryfansome/nanochat@force_me
    - *Drill-down* (K=15..20): the regression appears in a single step (K=15→16); all later K transitions flat.
    - *Single-pair attribution* (`INCLUDE_INDICES`, K=15 + only one of pairs #17–20): **all four individually displace `izards`**. The regressor is "whichever pair you add 16th" — the threshold is the vocab budget, not a specific pair.
 
-5. **Curation rule**: stop at the K where Tier-1 starts to regress. Final = 15 mined DERIVED + 2 numeric DERIVED. Pairs #16–20 dropped despite real corpus frequency (count=794–1,031 each in 60M sample); they're past what the 32K vocab budget accommodates cheaply.
+5. **Curation rule**: pick the smallest no-regression cutoff under the Tier-1 probe battery. K=15 + 2 numeric DERIVED is what that rule produces here, but the "regression" is one-token swings on probes 198–216 bytes long — near the floor of what Tier-1 can detect. Pairs #16–20 are not provably defective in absolute terms (count=794–1,031 each in 60M sample); they're past what 32K vocab accommodates cheaply *given the other 102 forced merges already in*. Final Lambda val/bpb is what should arbitrate whether to revisit.
 
 6. **Vocab-cost bracketing** — would a small vocab bump rescue pairs #16–20?
 
@@ -97,9 +105,9 @@ Replaced a ~70-pair hand-picked list (lifted from `veryfansome/nanochat@force_me
    | +10 vocab, 20 DERIVED                  | 4.21 (recovered) | ✓ | ✓ | ✓ | ✓ |
    | +20 vocab, 20 DERIVED                  | 4.21 | ✓ | ✓ | ✓ | ✓ |
 
-   Each forced merge has an effective **~2× vocab cost**: 1 reservation slot for the carve-out token, plus ~1 BPE-priority shift since each carve-out also pushes its punctuation-less variant (` but the`, ` If the`, ` and other`, ` be a`) into the top-budget BPE merges. +5 vocab gives BPE 5 extra slots but needs ~10 to absorb 5 new derived pairs, so 4 borderline merges get displaced. Rule of thumb: **for N derived pairs, budget ~2N extra vocab**. The +10 candidate ("v5") beat the K=15 final by only 1,114 tokens out of 3.06M on real corpus (0.036%) — not worth the constraint deviation. Final stays at 32K.
+   Specifically for this 5-pair bundle (pairs #16–20), +5 vocab was not enough but +10 was. The mechanism that fits: each derived carve-out reserves 1 slot for the carve-out token itself, and also tends to push a related BPE-priority merge (the punctuation-less variant — ` but the`, ` If the`, ` and other`, ` be a`) into the top-budget slots, displacing a borderline pre-existing merge. That's ~2 slots of pressure per carve-out for *this* bundle. It is **not** verified as a general per-pair law — only one bracketing experiment, on one bundle of 5 phrases that all happen to be punctuated continuations of common verbs/conjunctions. Replicating on a different bundle would tell us whether it generalizes. The +10 "v5" candidate beat the K=15 final by only 1,114 tokens out of 3.06M on real corpus (0.036%) — not worth the constraint deviation regardless of whether the 2× claim generalizes. Final stays at 32K.
 
-### Per-pair DERIVED attribution (top-20 mined)
+#### Per-pair DERIVED attribution (top-20 mined)
 
 | rank | pair | verdict | evidence |
 |---:|---|:-:|---|
@@ -108,22 +116,32 @@ Replaced a ~70-pair hand-picked list (lifted from `veryfansome/nanochat@force_me
 | 7–15 | `(', which', ' is')`, `('. There', ' are')`, `(' of the', ' most')`, `('. In', ' the')`, `('. They', ' are')`, `(', and', ' it')`, `(', and', ' a')`, `('. In', ' this')`, `(' of the', ' following')` | KEEP | Tier-1 silent |
 | **16–20** | **`(', but', ' the')`, `('. If', ' the')`, `(', and', ' other')`, `(' can be', ' a')`, `(' to be', ' a')`** | **DROP** | each individually displaces ` w`+`izards` → ` w`+`iz`+`ards` (−0.088 bpt english) |
 
-### Reusable infrastructure
+#### Known issues / queued for the next mining iteration
 
-- `tools/mine_forced_pairs.py` — corpus miner; closed-class role filter, single-pass + `--two-pass`, shadow detection. Outputs `pairs.py`-compatible artifacts.
+- **Shadow detection had two bugs in the original `detect_shadows`** (`tools/mine_forced_pairs.py`); both are now fixed in code but **the in-tree pairs.py was curated under the buggy versions**:
+  1. *Case 2 "regex precedence" overflag.* The original rule flagged `(c, d)` as shadowed by `(a, b)` when `pa == b`. Wrong — e.g. it dropped `(' one', ' of')` as "shadowed by ` of the`," but at pos 0 of " one of the" the regex actually matches ` one of` (7 bytes) first; ` of the` would only start at pos 4. Removed.
+  2. *Chained false-shadowing.* Even with case 1 only (`pb == a`), the rule added every prior pair to `seen` regardless of whether the prior was itself shadowed — so a shadowed prior could spuriously shadow later candidates. Witness in the current artifact: `(' to', ' do')` at [`rustbpe_variants/force_merges/mined/forced_pairs_climbmix_20rg_twopass.py:84`](rustbpe_variants/force_merges/mined/forced_pairs_climbmix_20rg_twopass.py) marked "SHADOWED by `(' is', ' to')`," but `(' is', ' to')` itself is shadowed on the line above. Fixed: only un-shadowed (emitted) priors participate in conflict checks.
+
+  Net effect on the in-tree pairs.py: the mined set is slightly smaller than what a corrected re-mining would produce. The currently-trained tokenizer is internally consistent (it uses what was mined), so no immediate action is required; re-mining with the fixed `detect_shadows` is queued for the next curation iteration.
+
+- **Ablate-driver cache invalidation** keys both the tokenizer variant dir (`force_merges_mined_{k|derived_d}{K}_{hash}/`) and the eval JSON (`eval_{k|d}{K}_{hash}.json`) by an 8-char hash of all tokenizer-defining inputs: the mining artifact, the subset module, `pairs.py` (BLOCKED_PAIRS), the wrapper, `rustbpe_variants/force_merges/src/lib.rs`, and a git fingerprint of upstream `nanochat` (HEAD SHA, with a hashed-files fallback). Any of these changing → fresh tokenizer + fresh eval automatically. `--force` on either driver bypasses both layers for the rare case where the installed `.so` was rebuilt outside this tree.
+
+#### Reusable infrastructure
+
+- `tools/mine_forced_pairs.py` — corpus miner; continuation-whitelist filter (closed-class-leaning LHS/RHS sets), single-pass + `--two-pass`, shadow detection. Outputs `pairs.py`-compatible artifacts.
 - `tools/ablate_mined.py` (env `MINED_TOP_K`) — cumulative ablation over the FORCED list.
 - `tools/ablate_derived.py` (env `DERIVED_TOP_K`) — cumulative ablation over the DERIVED list.
 - `wrappers/tok_train_force_merges_mined_{forced_subset,derived_subset,ablate}.py` + matching `pairs_mined_*.py` modules — FORCED / DERIVED / arbitrary-`INCLUDE_INDICES` subset trainers invoked by the ablation drivers.
 - Per-K eval JSONs at `results/{mined,derived}_ablation/`.
 - Mining artifacts at `rustbpe_variants/force_merges/mined/`.
 
-To re-curate against a different corpus: regenerate the mining artifacts, re-run `ablate_derived` to find the new K cutoff, update `_KEEP_DERIVED_K` in `pairs.py`. The 2× rule still applies.
-- **`seed_tokens`** (Rust) — morpheme-seeded BPE with constructive merge-chain builder. Crate: `rustbpe_variants/seed_tokens/` (`rustbpe_seed_tokens` module). Data: `rustbpe_variants/seed_tokens/seed_tokens.yaml` (~200 morphemes). Wrapper + smoke under `wrappers/`. Build: `VARIANT=seed_tokens bash runs/build_rustbpe.sh`.
-- **`case_marker`** (designed only, not yet implemented) — lossless casing collapse via input preprocessing: cased words → `<|cap|>` / `<|allcaps|>` marker tokens + lowercased base. Pure-Python (~200-300 LOC); no Rust work. Orthogonal to all merge-producer variants. Catalog entry: `ideas/tokenizer-variants/README.md` variant 13. Decision-gated on force_merges d6 outcome.
+Re-curation workflow (when corpus or curation rule changes):
+1. **Re-mine** (`tools/mine_forced_pairs.py --two-pass` with canonical defaults — see the docstring) → updates the artifacts under `rustbpe_variants/force_merges/mined/`.
+2. **Re-ablate** (`tools/ablate_derived.py`) → identifies the new K cutoff.
+3. **Paste** the new mined tuples into the `_MINED_FORCED` / `_MINED_DERIVED` literals in `pairs.py`.
+4. **Re-validate** the `_NUMERIC_DERIVED` hand-adds (`("00","0")`, `(",","000")`) against the new corpus + probe battery — they were originally added because the `currency` Tier-1 probe regressed by 1 token without them. On a different corpus the right numeric concat patterns may differ (or none may be needed). Run `tools/eval_tokenizer.py` against baseline + previous force_merges; if a probe regresses where a numeric carve-out would help, adjust the list.
 
-`force_merges` was data-driven curated 2026-05-25 and the resulting tokenizer is currently in a Lambda speedrun (`d24_force_merges` vs `d24_baseline` `qmsi105c`). `space_digits` and `seed_tokens` smoke-pass at d6/local scale but haven't been trained on the full corpus yet — same eval workflow (`tools/eval_tokenizer.py` → speedrun A/B) applies.
-
-The [non-backprop LLM](ideas/non-backprop/README.md) is a **separate research track**, not part of this capability-tuning sequence. Pursue independently.
+The "~2× vocab cost" finding is a starting hypothesis to test on the new bundle, not a guarantee.
 
 ## Next concrete steps
 

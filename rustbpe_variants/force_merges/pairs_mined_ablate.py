@@ -31,6 +31,12 @@ elif _raw == "":
     _indices = []
 else:
     _indices = sorted({int(x) for x in _raw.split(",") if x.strip()})
+    _bad = [i for i in _indices if not (0 <= i < len(_MINED_DERIVED_ALL))]
+    if _bad:
+        raise ValueError(
+            f"INCLUDE_INDICES contains out-of-range indices {_bad!r}; "
+            f"valid range is [0, {len(_MINED_DERIVED_ALL)})"
+        )
 
 _MINED_DERIVED = [_MINED_DERIVED_ALL[i] for i in _indices]
 

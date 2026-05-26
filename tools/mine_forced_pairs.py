@@ -8,15 +8,20 @@ pairs that BPE *can't* learn today because pre-tok splits them — i.e. the
 candidates for forced cross-boundary merges.
 
 Two filters constrain candidates before ranking:
-  - Grammatical role: only pairs whose LHS is closed-class (punctuation,
-    preposition, conjunction, auxiliary, determiner) and RHS is closed-class
-    (determiner, auxiliary, pronoun, conjunction, capitalized sentence-
-    starter, punctuation). See LHS_FUNCTION_WORDS / RHS_FUNCTION_WORDS.
+  - Continuation whitelist: only pairs whose LHS / RHS appear in the
+    LHS_FUNCTION_WORDS / RHS_FUNCTION_WORDS sets defined below. The sets
+    are hand-curated and lean closed-class (prepositions, conjunctions,
+    auxiliaries, determiners, pronouns, sentence-starters, punctuation),
+    but also include some open-class continuations that empirically show
+    up in the kind of glue phrases this tool targets (` make`, ` find`,
+    ` want`, etc. on RHS; ` one`, ` two`, discourse markers on LHS).
     Frequency alone over-selects on content-word bigrams that don't
     generalize across domains.
   - Shadow detection: a pair `(c, d)` is shadowed by emitted `(a, b)` when
-    `b == c` (operand consumed) or `a == d` (regex precedence pre-emption).
-    Shadowed pairs would never fire under the leftmost-first alternation.
+    `b == c` — the emitted carve-out consumes `c` wholesale, so the
+    candidate's left operand never appears in isolation and the forced
+    merge can't fire. (An earlier `a == d` "precedence" rule was removed
+    as over-conservative; see detect_shadows docstring for details.)
 
 `--two-pass` adds a second pass that re-pre-tokenizes against an augmented
 SPLIT_PATTERN with the pass-1 carve-outs, then mines bigrams whose LHS is a
@@ -24,11 +29,17 @@ pass-1 concatenation. Recovers depth-2 phrases (e.g. `(" of the", " most")`)
 that single-pass can't see.
 
 Output: a `pairs.py`-compatible Python module with `FORCED_PAIRS` (and, with
-`--two-pass`, `DERIVED_PAIRS`) — see `rustbpe_variants/force_merges/mined/`
-for the artifacts currently used by `pairs.py`.
+`--two-pass`, `DERIVED_PAIRS`). The artifacts under
+`rustbpe_variants/force_merges/mined/` are the provenance of the canonical
+list — `pairs.py` itself is a flat literal list, not a runtime importer.
+Regenerating pairs.py is a 4-step manual workflow: re-mine → re-ablate to
+find the K cutoff → paste mined tuples into pairs.py → re-validate the
+`_NUMERIC_DERIVED` hand-adds against the new corpus + probe battery (the
+miner can't surface numeric pairs; they're probe-driven hand-adds). See
+pairs.py docstring for the full recipe.
 
 Usage:
-    # Two-pass mining, write artifact for the canonical pairs.py to import.
+    # Two-pass mining, overwrite the provenance artifact for the canonical list.
     uv run python -m tools.mine_forced_pairs --row-groups 20 --two-pass \\
         --top-k 150 --top-k-derived 20 \\
         --out-py rustbpe_variants/force_merges/mined/forced_pairs_climbmix_20rg_twopass.py
@@ -57,12 +68,14 @@ BASELINE_SPLIT_PATTERN = (
 )
 
 # ---------------------------------------------------------------------------
-# Grammatical-role inventory
+# Continuation whitelist (LHS + RHS sets the candidate filter uses).
 #
-# Closed-class words only (small, finite sets that don't grow with vocabulary
-# expansion). The hand-picked FORCED_PAIRS list almost exclusively draws from
-# these classes — see rustbpe_variants/force_merges/pairs.py:48-145. We
-# enumerate them explicitly so the filter is auditable.
+# Leans closed-class but isn't strictly so — the RHS in particular includes
+# common open-class verbs (` make`, ` find`, ` want`, ` need`, ` get`...) that
+# empirically appear in the glue phrases this tool targets. The LHS includes
+# discourse markers (` However` etc.) and a couple of quantifiers (` one`,
+# ` two`) for the same reason. Treat this as a hand-curated whitelist whose
+# goal is "phrases worth carving out," not a linguistic taxonomy.
 #
 # All entries include the leading space because the baseline pre-tokenizer
 # produces space-prefixed word chunks (" the", not "the"). Bare-word entries
@@ -70,8 +83,8 @@ BASELINE_SPLIT_PATTERN = (
 
 PUNCT_LHS = {",", ".", ";", ":", "?", "!"}
 
-# Prepositions, conjunctions, articles, auxiliaries — function words that
-# legitimately glue to a following noun phrase or clause.
+# Prepositions, conjunctions, articles, auxiliaries + a few quantifiers /
+# discourse markers — what we accept on the LEFT of a candidate phrase.
 LHS_FUNCTION_WORDS = {
     # prepositions
     " of", " in", " on", " at", " to", " for", " from", " with", " by",
@@ -127,7 +140,7 @@ RHS_PUNCT = {",", "."}
 
 
 def classify_pair(a: str, b: str, mode: str) -> bool:
-    """Return True if (a, b) passes the grammatical-role filter."""
+    """Return True if (a, b) passes the continuation whitelist filter."""
     if mode == "none":
         return True
     lhs_ok = a in PUNCT_LHS or a in LHS_FUNCTION_WORDS
@@ -253,52 +266,50 @@ def classify_derived_pair(c: str, d: str, pass1_concats: set[str],
 # Conflict detection
 
 def detect_shadows(ordered_pairs, alternation_wins=False):
-    """For each pair, list the *higher-ranked* pairs that would shadow it.
+    """For each pair, list the *emitted* higher-ranked pairs that shadow it.
 
-    Shadow case 1 (always applies): b == c — the emitted pair's right operand
-    is the candidate's left operand. The emitted carve-out consumes that byte
-    sequence wholesale, so the candidate's LHS token never appears in
-    isolation and the forced merge can't fire.
+    A candidate `(c, d)` is shadowed by an emitted `(a, b)` when `b == c`:
+    the emitted carve-out consumes `c` wholesale, so the candidate's left
+    operand never appears in isolation and the forced merge can't fire.
 
-    Shadow case 2 (suppressed when alternation_wins=True): pa == b — the
-    emitted pair's left operand equals the candidate's right operand. This
-    can pre-empt the candidate via regex leftmost-first IF the emitted pair
-    is listed before the candidate. For DERIVED pairs (pass-2 output) this
-    doesn't apply — derived alternations are emitted FIRST in the regex
-    (DERIVED_PAIRS_EXPR precedes _FORCED_PAIRS_EXPR_BASE in pairs.py:165),
-    so the longer derived match wins regardless of frequency rank. Pass
-    alternation_wins=True for that case.
+    Only pairs that are themselves un-shadowed (= would actually appear in
+    the carve-out alternation) participate in conflict checks. A shadowed
+    prior is conceptually commented out — it wouldn't consume anything at
+    runtime — so it cannot legitimately shadow later candidates.
 
-    The hand-picked list at rustbpe_variants/force_merges/pairs.py:81-118
-    documents both cases in its inline comments — the `(" it", " is")`
-    family is case 1 (a==b in the prior == c in the candidate? no, that's
-    pa==b — same letters, different framing); `(" one", " of")` shadowed by
-    pairs starting with `" of"` is case 2.
+    Historical bugs (fixed):
+      1. An earlier version also flagged `pa == b` ("regex precedence")
+         shadows. Wrong: with emitted `(' of', ' the')` and candidate
+         `(' one', ' of')`, the rule flagged the candidate as shadowed,
+         but at pos 0 of " one of the" the alternation actually matches
+         ` one of` first (7 bytes); ` of the` would only start at pos 4.
+      2. An earlier version (including the `pb == a`-only fix) added every
+         pair to `seen` regardless of whether it was itself shadowed,
+         producing chained false-shadows like `(' to', ' do')` shadowed by
+         `(' is', ' to')` which was itself shadowed by `(' to', ' the')`.
+
+    The `alternation_wins` parameter is kept for backwards compatibility
+    but is now a no-op (the underlying assumption — that DERIVED pairs win
+    regex precedence over FORCED ones via DERIVED-first alternation order
+    — is still true, but with case 2 removed there's nothing to suppress).
 
     Args:
         ordered_pairs: list of ((a, b), count) in priority order (highest first).
-        alternation_wins: if True, suppress case 2 (use for derived pairs).
+        alternation_wins: ignored (kept for backwards compatibility).
 
     Returns:
-        dict mapping pair -> list of higher-ranked pairs that shadow it.
+        dict mapping pair -> list of emitted higher-ranked pairs that shadow it.
     """
+    del alternation_wins
     shadows: dict[tuple[str, str], list[tuple[str, str]]] = {}
-    seen: list[tuple[str, str]] = []
+    emitted: list[tuple[str, str]] = []
     for pair, _ in ordered_pairs:
-        a, b = pair
-        conflicts = []
-        for prior in seen:
-            pa, pb = prior
-            # Case 1: right-of-prior == left-of-candidate. Always shadows.
-            if pb == a:
-                conflicts.append(prior)
-            # Case 2: left-of-prior == right-of-candidate. Regex precedence;
-            # skip when the candidate wins precedence via alternation order.
-            elif pa == b and not alternation_wins:
-                conflicts.append(prior)
+        a, _b = pair
+        conflicts = [prior for prior in emitted if prior[1] == a]
         if conflicts:
             shadows[pair] = conflicts
-        seen.append(pair)
+        else:
+            emitted.append(pair)
     return shadows
 
 
@@ -438,11 +449,11 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--row-groups", type=int, default=10,
+        "--row-groups", type=int, default=20,
         help=(
-            "Number of parquet row groups to scan (default: 10; ~3M chars "
-            "each; ~84 row groups per shard). Use 0 to scan everything "
-            "available."
+            "Number of parquet row groups to scan (default: 20; matches the "
+            "canonical curation that produced the in-tree pairs.py — ~3M chars "
+            "per row group, ~84 row groups per shard). Use 0 to scan everything."
         ),
     )
     p.add_argument(
@@ -450,17 +461,17 @@ def main(argv=None):
         help="Cap total characters scanned (0 = no cap)",
     )
     p.add_argument(
-        "--top-k", type=int, default=100,
-        help="Emit top-K pairs after filtering (default: 100)",
+        "--top-k", type=int, default=150,
+        help="Emit top-K pairs after filtering (default: 150, canonical)",
     )
     p.add_argument(
-        "--min-count", type=int, default=100,
-        help="Drop pairs below this count (default: 100)",
+        "--min-count", type=int, default=200,
+        help="Drop pairs below this count (default: 200, canonical)",
     )
     p.add_argument(
         "--filter", choices=["function_word", "loose", "none"],
         default="function_word",
-        help="Grammatical-role filter mode (default: function_word)",
+        help="Continuation-whitelist filter mode (default: function_word)",
     )
     p.add_argument(
         "--out-py", type=Path, default=None,
@@ -483,12 +494,12 @@ def main(argv=None):
         ),
     )
     p.add_argument(
-        "--top-k-derived", type=int, default=15,
-        help="--two-pass only: top-K derived pairs to emit (default: 15)",
+        "--top-k-derived", type=int, default=20,
+        help="--two-pass only: top-K derived pairs (default: 20, canonical)",
     )
     p.add_argument(
-        "--min-count-derived", type=int, default=50,
-        help="--two-pass only: min count for derived pairs (default: 50)",
+        "--min-count-derived", type=int, default=100,
+        help="--two-pass only: min count for derived (default: 100, canonical)",
     )
     args = p.parse_args(argv)
 

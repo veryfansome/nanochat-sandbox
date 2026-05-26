@@ -16,20 +16,86 @@ Usage:
 
 import argparse
 import json
+import hashlib
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+_REPO = Path(__file__).parent.parent
 
-def train_one(k: int) -> Path:
-    """Train the mined_subset variant at MINED_TOP_K=k. Return tokenizer dir."""
-    out_dir = Path.home() / f".cache/nanochat-variants/force_merges_mined_k{k}/tokenizer"
-    if out_dir.exists() and (out_dir / "tokenizer.pkl").exists():
+
+def _upstream_nanochat_fingerprint() -> bytes:
+    """Best-effort fingerprint of upstream nanochat (next to the sandbox).
+
+    The wrapper imports `nanochat.tokenizer` and `runpy`s `scripts.tok_train`
+    — both upstream, both pull-able. Without including upstream state in the
+    cache key, a `git pull ../nanochat` can change tokenizer behavior with
+    our hash unchanged. We prefer the git HEAD SHA (covers all of upstream
+    in one shot); fall back to hashing the two files the wrapper directly
+    touches; if neither works, return a stable sentinel so the rest of the
+    hash still functions.
+    """
+    upstream = _REPO.parent / "nanochat"
+    try:
+        sha = subprocess.run(
+            ["git", "-C", str(upstream), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True, timeout=5,
+        ).stdout.strip()
+        return f"nanochat@{sha}".encode()
+    except Exception:
+        pass
+    parts = []
+    for rel in ("nanochat/tokenizer.py", "scripts/tok_train.py"):
+        f = upstream / rel
+        if f.exists():
+            parts.append(f.read_bytes())
+    return b"\n".join(parts) if parts else b"<upstream-unavailable>"
+
+
+# Hash of ALL tokenizer-defining inputs for the FORCED-subset wrapper.
+# Edits to any of these change the hash → variant dirs change →
+# trained-tokenizer and eval-JSON caches both invalidate automatically.
+# (For truly bypassing the cache without changing source — e.g. you suspect
+# stale state from a `.so` rebuilt outside this tree — pass `--force`.)
+_INPUT_FILES = [
+    # Pair source the subset module exec()s.
+    _REPO / "rustbpe_variants/force_merges/mined/forced_pairs_climbmix_20rg.py",
+    # Subset module: controls how pairs are loaded + filtered.
+    _REPO / "rustbpe_variants/force_merges/pairs_mined_forced_subset.py",
+    # pairs.py: BLOCKED_PAIRS source.
+    _REPO / "rustbpe_variants/force_merges/pairs.py",
+    # Wrapper: controls SPLIT_PATTERN patching, train_from_iterator kwargs,
+    # post-train density check.
+    _REPO / "wrappers/tok_train_force_merges_mined_forced_subset.py",
+    # Rust crate source: what `rustbpe_force_merges` actually does. We hash
+    # the source rather than the installed .so because (a) the .so path is
+    # platform-specific and (b) any behavior change requires editing source.
+    _REPO / "rustbpe_variants/force_merges/src/lib.rs",
+]
+_SRC_HASH = hashlib.sha1(
+    b"\n".join([p.read_bytes() for p in _INPUT_FILES]
+               + [_upstream_nanochat_fingerprint()])
+).hexdigest()[:8]
+
+
+def variant_dir(k: int) -> Path:
+    return Path.home() / f".cache/nanochat-variants/force_merges_mined_k{k}_{_SRC_HASH}"
+
+
+def train_one(k: int, force: bool = False) -> Path:
+    """Train the FORCED-subset variant at MINED_TOP_K=k. Return tokenizer dir."""
+    base = variant_dir(k)
+    out_dir = base / "tokenizer"
+    if out_dir.exists() and (out_dir / "tokenizer.pkl").exists() and not force:
         print(f"  [skip] K={k} already trained at {out_dir}", file=sys.stderr)
         return out_dir
-    print(f"  [train] K={k} ...", file=sys.stderr)
-    env = {**os.environ, "MINED_TOP_K": str(k)}
+    if force and out_dir.exists():
+        print(f"  [force] removing cached {out_dir}", file=sys.stderr)
+        import shutil
+        shutil.rmtree(base)
+    print(f"  [train] K={k} (src_hash={_SRC_HASH}) ...", file=sys.stderr)
+    env = {**os.environ, "MINED_TOP_K": str(k), "VARIANT_BASE": str(base)}
     res = subprocess.run(
         ["uv", "run", "python", "-m",
          "wrappers.tok_train_force_merges_mined_forced_subset"],
@@ -42,10 +108,28 @@ def train_one(k: int) -> Path:
     return out_dir
 
 
-def eval_one(tokenizer_dir: Path, json_out: Path) -> dict:
-    """Run eval_tokenizer on one tokenizer and parse the JSON output."""
+def eval_one(tokenizer_dir: Path, json_out: Path, force: bool = False) -> list:
+    """Run eval_tokenizer on one tokenizer and parse the JSON output.
+
+    Cache invalidation: if a cached JSON exists but its `spec` field
+    doesn't match the expected tokenizer_dir, the cache is stale (e.g.
+    because the wrapper output path was renamed). Re-run rather than trust.
+    `force=True` deletes the cached JSON unconditionally.
+    """
+    if force and json_out.exists():
+        print(f"  [force] removing cached {json_out.name}", file=sys.stderr)
+        json_out.unlink()
     if json_out.exists():
-        return json.loads(json_out.read_text())
+        cached = json.loads(json_out.read_text())
+        cached_spec = cached[0].get("spec") if cached else None
+        if cached_spec == str(tokenizer_dir):
+            return cached
+        print(
+            f"  [stale] {json_out.name}: spec {cached_spec!r} != expected "
+            f"{str(tokenizer_dir)!r}; re-running eval",
+            file=sys.stderr,
+        )
+        json_out.unlink()
     res = subprocess.run(
         ["uv", "run", "python", "-m", "tools.eval_tokenizer",
          "--tokenizers", str(tokenizer_dir),
@@ -130,6 +214,9 @@ def main():
     p.add_argument("--results-dir", type=Path,
                    default=Path("results/mined_ablation"),
                    help="Directory for per-K JSON outputs")
+    p.add_argument("--force", action="store_true",
+                   help="Bypass cache: retrain tokenizers + re-run evals "
+                        "even if hash-matched cache files exist")
     args = p.parse_args()
 
     k_values = sorted(int(x) for x in args.k_values.split(","))
@@ -137,9 +224,9 @@ def main():
 
     reports = []
     for k in k_values:
-        td = train_one(k)
-        json_out = args.results_dir / f"eval_k{k}.json"
-        rep = eval_one(td, json_out)
+        td = train_one(k, force=args.force)
+        json_out = args.results_dir / f"eval_k{k}_{_SRC_HASH}.json"
+        rep = eval_one(td, json_out, force=args.force)
         reports.append((k, rep))
 
     diff_runs(reports)

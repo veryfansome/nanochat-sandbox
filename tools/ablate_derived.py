@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -24,15 +25,64 @@ from pathlib import Path
 
 HOME = Path.home()
 
+_REPO = Path(__file__).parent.parent
 
-def train_one(k: int) -> Path:
-    out_dir = HOME / f".cache/nanochat-variants/force_merges_mined_derived_d{k}/tokenizer"
-    if out_dir.exists() and (out_dir / "tokenizer.pkl").exists():
+
+def _upstream_nanochat_fingerprint() -> bytes:
+    """Best-effort fingerprint of upstream nanochat (next to the sandbox).
+    See tools/ablate_mined.py for the full rationale."""
+    upstream = _REPO.parent / "nanochat"
+    try:
+        sha = subprocess.run(
+            ["git", "-C", str(upstream), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True, timeout=5,
+        ).stdout.strip()
+        return f"nanochat@{sha}".encode()
+    except Exception:
+        pass
+    parts = []
+    for rel in ("nanochat/tokenizer.py", "scripts/tok_train.py"):
+        f = upstream / rel
+        if f.exists():
+            parts.append(f.read_bytes())
+    return b"\n".join(parts) if parts else b"<upstream-unavailable>"
+
+
+# Hash of ALL tokenizer-defining inputs for the DERIVED-subset wrapper.
+# Edits to any of these change the hash → variant dirs change →
+# trained-tokenizer and eval-JSON caches both invalidate automatically.
+# (For truly bypassing the cache without changing source — e.g. you suspect
+# stale state from a `.so` rebuilt outside this tree — pass `--force`.)
+_INPUT_FILES = [
+    _REPO / "rustbpe_variants/force_merges/mined/forced_pairs_climbmix_20rg_twopass.py",
+    _REPO / "rustbpe_variants/force_merges/pairs_mined_derived_subset.py",
+    _REPO / "rustbpe_variants/force_merges/pairs.py",
+    _REPO / "wrappers/tok_train_force_merges_mined_derived_subset.py",
+    _REPO / "rustbpe_variants/force_merges/src/lib.rs",
+]
+_SRC_HASH = hashlib.sha1(
+    b"\n".join([p.read_bytes() for p in _INPUT_FILES]
+               + [_upstream_nanochat_fingerprint()])
+).hexdigest()[:8]
+
+
+def variant_dir(k: int) -> Path:
+    return HOME / f".cache/nanochat-variants/force_merges_mined_derived_d{k}_{_SRC_HASH}"
+
+
+def train_one(k: int, force: bool = False) -> Path:
+    base = variant_dir(k)
+    out_dir = base / "tokenizer"
+    if out_dir.exists() and (out_dir / "tokenizer.pkl").exists() and not force:
         print(f"  [skip] DERIVED_TOP_K={k} already trained at {out_dir}",
               file=sys.stderr)
         return out_dir
-    print(f"  [train] DERIVED_TOP_K={k} ...", file=sys.stderr)
-    env = {**os.environ, "DERIVED_TOP_K": str(k)}
+    if force and out_dir.exists():
+        print(f"  [force] removing cached {out_dir}", file=sys.stderr)
+        import shutil
+        shutil.rmtree(base)
+    print(f"  [train] DERIVED_TOP_K={k} (src_hash={_SRC_HASH}) ...", file=sys.stderr)
+    env = {**os.environ, "DERIVED_TOP_K": str(k), "VARIANT_BASE": str(base)}
     res = subprocess.run(
         ["uv", "run", "python", "-m",
          "wrappers.tok_train_force_merges_mined_derived_subset"],
@@ -45,9 +95,24 @@ def train_one(k: int) -> Path:
     return out_dir
 
 
-def eval_one(tokenizer_dir: Path, json_out: Path) -> list:
+def eval_one(tokenizer_dir: Path, json_out: Path, force: bool = False) -> list:
+    """Run eval_tokenizer; invalidate cache if the cached spec doesn't
+    match the expected tokenizer_dir (e.g. wrapper output path renamed).
+    `force=True` deletes the cached JSON unconditionally."""
+    if force and json_out.exists():
+        print(f"  [force] removing cached {json_out.name}", file=sys.stderr)
+        json_out.unlink()
     if json_out.exists():
-        return json.loads(json_out.read_text())
+        cached = json.loads(json_out.read_text())
+        cached_spec = cached[0].get("spec") if cached else None
+        if cached_spec == str(tokenizer_dir):
+            return cached
+        print(
+            f"  [stale] {json_out.name}: spec {cached_spec!r} != expected "
+            f"{str(tokenizer_dir)!r}; re-running eval",
+            file=sys.stderr,
+        )
+        json_out.unlink()
     res = subprocess.run(
         ["uv", "run", "python", "-m", "tools.eval_tokenizer",
          "--tokenizers", str(tokenizer_dir),
@@ -129,6 +194,9 @@ def main():
     p.add_argument("--results-dir", type=Path,
                    default=Path("results/derived_ablation"),
                    help="Directory for per-K JSON outputs")
+    p.add_argument("--force", action="store_true",
+                   help="Bypass cache: retrain tokenizers + re-run evals "
+                        "even if hash-matched cache files exist")
     args = p.parse_args()
 
     k_values = sorted(int(x) for x in args.k_values.split(","))
@@ -136,9 +204,9 @@ def main():
 
     reports = []
     for k in k_values:
-        td = train_one(k)
-        json_out = args.results_dir / f"eval_d{k}.json"
-        rep = eval_one(td, json_out)
+        td = train_one(k, force=args.force)
+        json_out = args.results_dir / f"eval_d{k}_{_SRC_HASH}.json"
+        rep = eval_one(td, json_out, force=args.force)
         reports.append((k, rep))
 
     diff_runs(reports)

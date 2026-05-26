@@ -7,17 +7,27 @@ sample of climbmix prose, trading ~237 rare-content BPE merges for ~237
 high-frequency phrasal merges.
 
 Replaced the original ~70-pair hand-picked list on 2026-05-25 via
-`tools/mine_forced_pairs.py --two-pass` + `tools/ablate_derived.py`. Full
-construction narrative, per-pair attribution table (which 5 of the 20
-mined DERIVED were dropped and why), and the +5/+10/+20 vocab-cost
-bracketing experiment live in [STATUS.md](../../STATUS.md) §force_merges.
+`tools/mine_forced_pairs.py --two-pass` + `tools/ablate_derived.py`. The
+pair tuples below are frozen verbatim from that curation; the mining
+artifacts at `mined/forced_pairs_climbmix_20rg{,_twopass}.py` are kept as
+provenance, not imported. Full construction narrative, per-pair attribution
+table, and the +5/+10/+20 vocab-cost bracketing experiment live in
+[STATUS.md](../../STATUS.md) §force_merges.
 
-To re-curate against a different corpus: regenerate the mining artifacts
-at `mined/`, re-run `ablate_derived`, update `_KEEP_DERIVED_K` below.
+To re-curate against a different corpus:
+  1. regenerate the mining artifacts (`tools/mine_forced_pairs.py --two-pass`),
+  2. re-run `tools/ablate_derived.py` to find the new K cutoff,
+  3. paste the new mined tuples into the `_MINED_FORCED` / `_MINED_DERIVED`
+     literals below (do not re-introduce runtime artifact loading —
+     `pairs.py` is intentionally self-contained so it's grep-able and
+     review-able as a flat list),
+  4. re-validate the `_NUMERIC_DERIVED` hand-adds for the new corpus + probe
+     battery. They were added here because the `currency` Tier-1 probe
+     regressed by 1 token without them; a different corpus may need different
+     numeric concats (or none).
 """
 
 import re
-from pathlib import Path
 
 # BLOCKED_PAIRS guard against "letter + space" fragments that the carve-out
 # makes structurally possible (kept verbatim from the hand-picked list — the
@@ -40,26 +50,132 @@ BLOCKED_PAIRS = [
     ("y", " "),
 ]
 
-# Mined artifact (two-pass): FORCED_PAIRS = 87 pass-1 phrases,
-# DERIVED_PAIRS = 20 pass-2 phrases whose LHS is a pass-1 concatenation.
-_ARTIFACT = Path(__file__).parent / "mined" / "forced_pairs_climbmix_20rg_twopass.py"
-_ns: dict = {}
-exec(compile(_ARTIFACT.read_text(), str(_ARTIFACT), "exec"), _ns)  # noqa: S102
-_MINED_FORCED = [tuple(p) for p in _ns["FORCED_PAIRS"]]
-_MINED_DERIVED_ALL = [tuple(p) for p in _ns["DERIVED_PAIRS"]]
+# Pass-1 mined FORCED pairs (87 entries, ordered by corpus frequency).
+# Regenerate via:
+#   uv run python -m tools.mine_forced_pairs --two-pass --row-groups 20 \
+#       --top-k 150 --min-count 200 --top-k-derived 20 --min-count-derived 100 \
+#       --out-py rustbpe_variants/force_merges/mined/forced_pairs_climbmix_20rg_twopass.py
+# (canonical defaults; ~20 row groups ≈ 60M chars from the climbmix train
+# split; shadow-filtered drops removed by the miner before output).
+_MINED_FORCED = [
+    (' of', ' the'),
+    (',', ' and'),
+    (' in', ' the'),
+    ('.', ' The'),
+    (' to', ' the'),
+    (',', ' the'),
+    (' on', ' the'),
+    (' is', ' a'),
+    (' is', ' the'),
+    (',', ' but'),
+    ('.', ' It'),
+    ('.', ' This'),
+    (' can', ' be'),
+    (' to', ' be'),
+    (',', ' it'),
+    (' for', ' the'),
+    (' in', ' a'),
+    (' of', ' a'),
+    (' from', ' the'),
+    (',', ' which'),
+    (',', ' you'),
+    (' with', ' the'),
+    (' such', ' as'),
+    (',', ' or'),
+    ('.', ' In'),
+    (' with', ' a'),
+    (' at', ' the'),
+    (',', ' a'),
+    (' that', ' the'),
+    ('.', ' If'),
+    ('.', ' They'),
+    ('.', ' I'),
+    (' for', ' a'),
+    (' to', ' a'),
+    (' by', ' the'),
+    (' have', ' a'),
+    (',', ' we'),
+    (' will', ' be'),
+    ('.', ' You'),
+    (',', ' they'),
+    (' is', ' not'),
+    ('.', ' A'),
+    (' into', ' the'),
+    (',', ' I'),
+    (' on', ' a'),
+    (' to', ' make'),
+    ('.', ' These'),
+    (':', ' The'),
+    (' has', ' been'),
+    ('.', ' We'),
+    (' have', ' been'),
+    (' may', ' be'),
+    (' are', ' the'),
+    ('.', ' For'),
+    ('.', ' But'),
+    (' that', ' you'),
+    (' should', ' be'),
+    (' to', ' get'),
+    (' about', ' the'),
+    ('.', ' As'),
+    ('.', ' When'),
+    (' more', ' than'),
+    ('.', ' There'),
+    (' all', ' the'),
+    (' has', ' a'),
+    ('.', ' So'),
+    ('.', ' And'),
+    (' through', ' the'),
+    (' from', ' a'),
+    (' can', ' also'),
+    (' during', ' the'),
+    (' for', ' your'),
+    (' at', ' a'),
+    (' on', ' your'),
+    (' does', ' not'),
+    (' over', ' the'),
+    ('.', ' By'),
+    (' by', ' a'),
+    (' was', ' the'),
+    ('.', ' To'),
+    (' between', ' the'),
+    ('.', ' He'),
+    ('.', ' That'),
+    (' into', ' a'),
+    (' around', ' the'),
+    ('.', ' With'),
+    (' was', ' a'),
+]
 
-# Curation cutoff. Pairs #16-20 each individually displace a borderline
-# BPE merge (`izards`, ` acclim`, `ampton`, `uran`) under the 32K vocab
-# budget — adding any 16th derived pair regresses `english` by 0.088 bpt.
-# See STATUS.md §force_merges for the per-pair attribution table.
-_KEEP_DERIVED_K = 15
-_MINED_DERIVED = _MINED_DERIVED_ALL[:_KEEP_DERIVED_K]
+# Pass-2 mined DERIVED pairs (top-15 of 20). Pairs #16-20 (mined ranks
+# 16-20: `(', but', ' the')`, `('. If', ' the')`, `(', and', ' other')`,
+# `(' can be', ' a')`, `(' to be', ' a')`) each individually displace a
+# borderline BPE merge (`izards`, ` acclim`, `ampton`, `uran`) under the
+# 32K vocab budget — see STATUS.md §force_merges for the per-pair table.
+_MINED_DERIVED = [
+    (', and', ' the'),
+    ('. If', ' you'),
+    ('. It', ' is'),
+    (', it', ' is'),
+    ('. This', ' is'),
+    (', but', ' it'),
+    (', which', ' is'),
+    ('. There', ' are'),
+    (' of the', ' most'),
+    ('. In', ' the'),
+    ('. They', ' are'),
+    (', and', ' it'),
+    (', and', ' a'),
+    ('. In', ' this'),
+    (' of the', ' following'),
+]
 
-# Numeric DERIVED — hand-additions; fail the function-word filter (RHS is
-# numeric) but recover the `currency` task probe (count=20 vs 21 tokens).
-_NUMERIC_DERIVED: list[tuple[str, str]] = [
-    ("00", "0"),
-    (",", "000"),
+# Numeric DERIVED — hand-additions; fail the continuation-whitelist filter
+# by design (RHS is numeric) but recover the `currency` task probe
+# (count=20 vs 21 tokens).
+_NUMERIC_DERIVED = [
+    ('00', '0'),
+    (',', '000'),
 ]
 
 DERIVED_PAIRS = _MINED_DERIVED + _NUMERIC_DERIVED
