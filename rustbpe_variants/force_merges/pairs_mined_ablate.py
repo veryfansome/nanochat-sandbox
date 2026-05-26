@@ -1,7 +1,7 @@
 """
 Arbitrary-subset DERIVED variant for single-pair attribution. Env
 `INCLUDE_INDICES` = comma-separated 0-based indices into the 20 mined
-DERIVED list; only those are included (all 87 mined FORCED + 2 numeric
+DERIVED list; only those are included (all 105 mined FORCED + 2 numeric
 DERIVED always present). Used when cumulative ablation
 (pairs_mined_derived_subset.py) narrows the regressor to a bucket and you
 need to isolate which specific pair(s) within it are responsible.

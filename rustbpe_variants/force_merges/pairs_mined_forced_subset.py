@@ -1,7 +1,9 @@
 """
-FORCED-list subset for ablation. Loads the pass-1 mining artifact and
-truncates to the top-K entries by frequency rank (env `MINED_TOP_K`,
-default: all). Used by `tools/ablate_mined.py`. No DERIVED.
+FORCED-list subset for ablation. Loads the `FORCED_PAIRS` field from the
+canonical two-pass mining artifact (= the post-shadow-fix pass-1 output,
+same source the canonical pairs.py uses) and truncates to top-K via
+env `MINED_TOP_K` (default: all). Used by `tools/ablate_mined.py`. No
+DERIVED — this module ablates the FORCED dimension in isolation.
 """
 
 import os
@@ -11,7 +13,7 @@ from pathlib import Path
 from rustbpe_variants.force_merges.pairs import BLOCKED_PAIRS
 
 _MINED_ARTIFACT = (
-    Path(__file__).parent / "mined" / "forced_pairs_climbmix_20rg.py"
+    Path(__file__).parent / "mined" / "forced_pairs_climbmix_20rg_twopass.py"
 )
 _ns: dict = {}
 exec(compile(_MINED_ARTIFACT.read_text(), str(_MINED_ARTIFACT), "exec"), _ns)  # noqa: S102

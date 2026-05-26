@@ -1,30 +1,40 @@
 """
 FORCED_PAIRS / BLOCKED_PAIRS / DERIVED_PAIRS + derived SPLIT_PATTERN.
 
-87 mined FORCED + 15 mined DERIVED + 2 numeric-hand-add DERIVED = 104
-forced merges, vocab=32768. Compresses **−6.5%** vs baseline on a 15M-char
-sample of climbmix prose, trading ~237 rare-content BPE merges for ~237
-high-frequency phrasal merges.
+105 mined FORCED + 15 mined DERIVED + 2 numeric DERIVED = 122 forced
+merges, vocab=32788 (+20 over nanochat default — bracketed empirically to
+keep the borderline BPE merges that the extra carve-outs would otherwise
+displace; see STATUS.md §force_merges curation details).
 
-Replaced the original ~70-pair hand-picked list on 2026-05-25 via
-`tools/mine_forced_pairs.py --two-pass` + `tools/ablate_derived.py`. The
-pair tuples below are frozen verbatim from that curation; the mining
-artifacts at `mined/forced_pairs_climbmix_20rg{,_twopass}.py` are kept as
-provenance, not imported. Full construction narrative, per-pair attribution
-table, and the +5/+10/+20 vocab-cost bracketing experiment live in
-[STATUS.md](../../STATUS.md) §force_merges.
+## History
+
+- **2026-05-25**: Replaced the ~70-pair hand-picked list (lifted from
+  `veryfansome/nanochat@force_merges_wip`) with a data-driven curation via
+  `tools/mine_forced_pairs.py --two-pass` + `tools/ablate_derived.py`.
+  104 forced merges at vocab=32768. Speedrun result: **CORE +5.81% vs
+  `d24_baseline`, val/bpb tied (slight edge), ChatCORE +0.62%** ($115.76,
+  wandb `7aesostl` vs `qmsi105c`).
+- **2026-05-26**: Re-curated after Codex reviews surfaced two `detect_shadows`
+  bugs (case-2 "regex precedence" overflag + chained false-shadowing).
+  Fixed rule produces +18 pass-1 entries (` one of`, ` that is`, ` have to`,
+  ` However,`, etc.) + 4 swapped pass-2 entries. Vocab-bracketed to +20.
+  Locally Tier-1 parity with the 2026-05-25 version + 0.42% better
+  real-corpus compression. Lambda-pending.
+
+The 122 tuples below are frozen verbatim from the 2026-05-26 curation.
+Provenance: `mined/forced_pairs_climbmix_20rg_twopass.py`. Historical
+lineage preserved at `mined/forced_pairs_climbmix_20rg.py` (single-pass,
+pre-shadow-fix) and `mined/forced_pairs_climbmix_20rg_twopass_pre_shadow_fix.py`
+(2026-05-25's two-pass output, source for the speedrun tokenizer).
 
 To re-curate against a different corpus:
-  1. regenerate the mining artifacts (`tools/mine_forced_pairs.py --two-pass`),
-  2. re-run `tools/ablate_derived.py` to find the new K cutoff,
-  3. paste the new mined tuples into the `_MINED_FORCED` / `_MINED_DERIVED`
-     literals below (do not re-introduce runtime artifact loading —
-     `pairs.py` is intentionally self-contained so it's grep-able and
-     review-able as a flat list),
-  4. re-validate the `_NUMERIC_DERIVED` hand-adds for the new corpus + probe
-     battery. They were added here because the `currency` Tier-1 probe
-     regressed by 1 token without them; a different corpus may need different
-     numeric concats (or none).
+  1. Re-mine (`tools/mine_forced_pairs.py --two-pass`).
+  2. Re-ablate K (`tools/ablate_derived.py`).
+  3. Paste new tuples into `_MINED_FORCED` / `_MINED_DERIVED` below
+     (intentionally a flat literal list, not a runtime loader).
+  4. Re-validate `_NUMERIC_DERIVED` — added for `currency` probe; a
+     different corpus may need different (or no) numeric concats.
+  5. Re-bracket `RECOMMENDED_VOCAB_SIZE` if the new pair set is much larger.
 """
 
 import re
@@ -50,7 +60,7 @@ BLOCKED_PAIRS = [
     ("y", " "),
 ]
 
-# Pass-1 mined FORCED pairs (87 entries, ordered by corpus frequency).
+# Pass-1 mined FORCED pairs (105 entries, ordered by corpus frequency).
 # Regenerate via:
 #   uv run python -m tools.mine_forced_pairs --two-pass --row-groups 20 \
 #       --top-k 150 --min-count 200 --top-k-derived 20 --min-count-derived 100 \
@@ -95,9 +105,11 @@ _MINED_FORCED = [
     (' by', ' the'),
     (' have', ' a'),
     (',', ' we'),
+    (',', ' as'),
     (' will', ' be'),
     ('.', ' You'),
     (',', ' they'),
+    (' one', ' of'),
     (' is', ' not'),
     ('.', ' A'),
     (' into', ' the'),
@@ -106,17 +118,24 @@ _MINED_FORCED = [
     (' to', ' make'),
     ('.', ' These'),
     (':', ' The'),
+    (' that', ' is'),
     (' has', ' been'),
     ('.', ' We'),
     (' have', ' been'),
     (' may', ' be'),
     (' are', ' the'),
+    (' However', ','),
+    ('.', ' However'),
     ('.', ' For'),
     ('.', ' But'),
     (' that', ' you'),
     (' should', ' be'),
+    (' that', ' are'),
     (' to', ' get'),
+    (' in', ' your'),
     (' about', ' the'),
+    (' to', ' do'),
+    (' have', ' to'),
     ('.', ' As'),
     ('.', ' When'),
     (' more', ' than'),
@@ -126,48 +145,57 @@ _MINED_FORCED = [
     ('.', ' So'),
     ('.', ' And'),
     (' through', ' the'),
+    (' would', ' be'),
+    (' in', ' this'),
     (' from', ' a'),
+    (' that', ' it'),
     (' can', ' also'),
     (' during', ' the'),
     (' for', ' your'),
+    (' that', ' they'),
     (' at', ' a'),
     (' on', ' your'),
     (' does', ' not'),
+    (' some', ' of'),
     (' over', ' the'),
     ('.', ' By'),
     (' by', ' a'),
     (' was', ' the'),
+    (' could', ' be'),
+    (' in', ' their'),
     ('.', ' To'),
     (' between', ' the'),
+    (' have', ' the'),
     ('.', ' He'),
     ('.', ' That'),
     (' into', ' a'),
     (' around', ' the'),
     ('.', ' With'),
+    (' in', ' an'),
     (' was', ' a'),
 ]
 
-# Pass-2 mined DERIVED pairs (top-15 of 20). Pairs #16-20 (mined ranks
-# 16-20: `(', but', ' the')`, `('. If', ' the')`, `(', and', ' other')`,
-# `(' can be', ' a')`, `(' to be', ' a')`) each individually displace a
-# borderline BPE merge (`izards`, ` acclim`, `ampton`, `uran`) under the
-# 32K vocab budget — see STATUS.md §force_merges for the per-pair table.
+# Pass-2 mined DERIVED pairs (top-15 of 20 produced by the two-pass miner).
+# Pairs #16-20 from the same mining run (`(', and', ' a')`, `('. In', ' this')`,
+# `(', but', ' the')`, `(' of the', ' following')`, `('. If', ' the')`) each
+# individually push the BPE budget past the `izards`-class borderline — see
+# STATUS.md §force_merges curation details for the per-pair table.
 _MINED_DERIVED = [
+    (' one of', ' the'),
     (', and', ' the'),
     ('. If', ' you'),
     ('. It', ' is'),
     (', it', ' is'),
+    ('. However', ','),
     ('. This', ' is'),
     (', but', ' it'),
     (', which', ' is'),
+    (' some of', ' the'),
     ('. There', ' are'),
-    (' of the', ' most'),
+    (', as', ' well'),
     ('. In', ' the'),
     ('. They', ' are'),
     (', and', ' it'),
-    (', and', ' a'),
-    ('. In', ' this'),
-    (' of the', ' following'),
 ]
 
 # Numeric DERIVED — hand-additions; fail the continuation-whitelist filter
@@ -199,3 +227,9 @@ SPLIT_PATTERN = (
     + r"""|'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+| ?\p{N}{1,2}"""
     r"""| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 )
+
+# Recommended vocab_size when training this tokenizer. Bracketed empirically
+# for the 122-pair set (see STATUS.md §force_merges curation details →
+# §"Re-curation (2026-05-26)" → vocab-cost bracketing).
+# `tok_train_force_merges.py` reads this.
+RECOMMENDED_VOCAB_SIZE = 32788

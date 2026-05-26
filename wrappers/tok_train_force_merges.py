@@ -15,6 +15,7 @@ Usage:
     uv run python -m wrappers.tok_train_force_merges  →  ~/.cache/nanochat-variants/force_merges/tokenizer/
 """
 import runpy
+import sys
 
 from wrappers._tokenizer_variant_common import (
     setup_variant_base,
@@ -127,11 +128,31 @@ def apply_patches():
 def main():
     variant_base = setup_variant_base("force_merges")
     split_pattern, forced, blocked = apply_patches()
+    # Pull the recommended vocab from pairs.py (bracketed empirically for
+    # the current 122-pair set — see pairs.py docstring + STATUS.md).
+    from rustbpe_variants.force_merges.pairs import RECOMMENDED_VOCAB_SIZE
+    # Forward caller's args to scripts.tok_train; inject `--vocab-size` only
+    # if the caller didn't already specify one. This preserves `--help`,
+    # `--max-chars`, `--doc-cap`, an explicit `--vocab-size` override, and
+    # any future tok_train flags.
+    user_args = sys.argv[1:]
+    has_vocab_arg = any(
+        a == "--vocab-size" or a.startswith("--vocab-size=")
+        for a in user_args
+    )
+    if has_vocab_arg:
+        effective_vocab = "caller-supplied (see --vocab-size in args below)"
+    else:
+        user_args = ["--vocab-size", str(RECOMMENDED_VOCAB_SIZE)] + user_args
+        effective_vocab = f"{RECOMMENDED_VOCAB_SIZE} (+{RECOMMENDED_VOCAB_SIZE - 32768} vs nanochat default, from RECOMMENDED_VOCAB_SIZE)"
     print(f"==> variant_base:    {variant_base}")
     print(f"==> rustbpe module:  {__import__('rustbpe').__file__}")
     print(f"==> SPLIT_PATTERN:   patched (FORCED_PAIRS_EXPR + ` ?\\p{{N}}{{1,2}}`)")
     print(f"==> forced pairs:    {len(forced)}")
     print(f"==> blocked pairs:   {len(blocked)}")
+    print(f"==> vocab_size:      {effective_vocab}")
+    print(f"==> tok_train args:  {user_args}")
+    sys.argv = ["tok_train.py"] + user_args
     runpy.run_module("scripts.tok_train", run_name="__main__")
     print_downstream_hint(variant_base)
 

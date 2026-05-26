@@ -1,6 +1,6 @@
 """
 Trainer for the DERIVED-list subset. Reads `DERIVED_TOP_K` (default: all),
-trains with the full 87 mined FORCED + that many top-frequency mined
+trains with the full 105 mined FORCED + that many top-frequency mined
 DERIVED + the 2 numeric DERIVED. Writes to a K-specific dir. Invoked by
 `tools/ablate_derived.py`.
 

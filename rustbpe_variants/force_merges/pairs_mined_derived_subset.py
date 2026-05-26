@@ -1,6 +1,6 @@
 """
 DERIVED-list subset for ablation. Loads the two-pass mining artifact;
-keeps all 87 mined FORCED + 2 numeric DERIVED fixed, truncates the 20
+keeps all 105 mined FORCED + 2 numeric DERIVED fixed, truncates the 20
 mined DERIVED to top-K via env `DERIVED_TOP_K` (default: all). Used by
 `tools/ablate_derived.py`. Walk K = 0, 5, 10, 15, 20 to bracket Tier-1
 regressions.
