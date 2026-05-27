@@ -53,7 +53,7 @@ for reference but no longer the canonical mining path.
 `mined/compositions_climbmix_val_k1750.py` — 1,750 within-chunk
 adjacent-pair compositions mined from 20M chars of ClimbMix val.
 Offline-validated: **−0.630% ClimbMix val tokens (−28,271)** vs baseline
-at +5.3% vocab; 86% of seeds fire (14% dead). K=1750 chosen at the
+at +5.3% vocab; 86% of seeds fire (14% dead). K=1,750 chosen at the
 per-seed marginal-value plateau-end visible in the K-sweep (full
 table + analysis in STATUS.md §seed_tokens). The selection criterion
 is deterministic (count desc, max_id asc, S asc), so re-mining

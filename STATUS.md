@@ -14,7 +14,7 @@ Working state of the project — implementation progress, current focus, sequenc
 | [Online data selection + batch-size tuning](ideas/online-data-selection/README.md) | ✓ | — | — | — |
 | [Adaptive sequence length / batch size](ideas/adaptive-schedule/README.md) | ✓ | — | — | — |
 | [Layer-wise LR / staged maturation](ideas/layerwise-lr/README.md) | ✓ | — | — | — |
-| [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | partial — `tools/eval_tokenizer.py` harness done; pristine `sandbox/rustbpe/` vendored; three variants ported (`space_digits` [Py-only], `force_merges` [Rust, data-driven curated 2026-05-25, re-curated 2026-05-26 with corrected shadow rule], `seed_tokens` [Python overlay, **redesigned 2026-05-26**: within-chunk composition mining + mid-rank insertion; K=1750 canonical]) | ✓ all three (smoke_tok_train_{space_digits,force_merges,seed_tokens}) | **✓ d24/8xA100 — `force_merges` real positive: CORE +5.81%, val/bpb tied (slight edge), ChatCORE +0.62%** (Lambda result on the 2026-05-25 canonical; in-tree canonical promoted 2026-05-26, Lambda-pending); **`seed_tokens` offline positive: −0.63% ClimbMix val tokens** at +5.3% vocab, Lambda-pending |
+| [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | partial — `tools/eval_tokenizer.py` harness done; pristine `sandbox/rustbpe/` vendored; three variants ported (`space_digits` [Py-only], `force_merges` [Rust, data-driven curated 2026-05-25, re-curated 2026-05-26 with corrected shadow rule], `seed_tokens` [Python overlay, **redesigned 2026-05-26**: within-chunk composition mining + mid-rank insertion; K=1,750 canonical]) | ✓ all three (smoke_tok_train_{space_digits,force_merges,seed_tokens}) | **✓ d24/8xA100 — `force_merges` real positive: CORE +5.81%, val/bpb tied (slight edge), ChatCORE +0.62%** (Lambda result on the 2026-05-25 canonical; in-tree canonical promoted 2026-05-26, Lambda-pending); **`seed_tokens` offline positive: −0.63% ClimbMix val tokens** at +5.3% vocab — magnitude too small to predict a clear CORE win, not queued for standalone Lambda |
 | [Non-backprop (DFA → block-local)](ideas/non-backprop/README.md) | ✓ (research track) | — | — | — |
 
 ## d24 trio results (8xA100 40GB, ~$337 wall-clock)
@@ -96,10 +96,10 @@ MTP rescue probes (α=0.1+k=1 first) only happen if a follow-up idea raises a sp
 
 - **`space_digits`** (Python-only) — adds optional leading space before the digit clause in `SPLIT_PATTERN`. Wrapper: `wrappers/tok_train_space_digits.py`. Smoke: `wrappers/smoke_tok_train_space_digits.py`. Uses PyPI rustbpe; no Rust build needed. (Note: the `?` leading-space tweak is also folded into `force_merges`'s `SPLIT_PATTERN`, so running both is redundant.)
 - **`force_merges`** (Rust, **adopted 2026-05-26**) — forced cross-boundary common-phrase merges (` of the`, `, and`, etc.) via regex carve-out. Crate: `rustbpe_variants/force_merges/` (`rustbpe_force_merges` module); canonical pair list at `pairs.py` (105 mined FORCED + 15 mined DERIVED + 2 numeric DERIVED = 122, vocab=32788). Build: `VARIANT=force_merges bash runs/build_rustbpe.sh`. On a 15M-char climbmix sample: **−6.9% total tokens vs baseline** (3.27M → 3.05M), trading ~245 rare-content BPE merges for high-frequency phrasal merges. Lambda speedrun result (on the prior 2026-05-25 canonical of 104 pairs): **CORE +5.81%, val/bpb tied, ChatCORE +0.62%** ($115.76, see §d24 force_merges results). Construction provenance + per-pair attribution + vocab-cost mechanism + reusable infrastructure detailed in the `force_merges curation details` subsection below.
-- **`seed_tokens`** (Python overlay, **redesigned 2026-05-26**) — data-driven seed merges inserted at their natural-firing rank in `mergeable_ranks`. No Rust changes; uses pristine `rustbpe`. Pipeline: `tools/mine_seed_compositions.py` mines within-pre-tok-chunk adjacent-token-pair bigrams from baseline output on the ClimbMix val shard, filters to pairs whose concat isn't in baseline vocab, and emits routes directly (each pair IS the route since `id_L`, `id_R` are baseline-vocab tokens by construction). The wrapper inserts each seed at `max(id_L, id_R) + 1` (mid-training-style; naive append fails because lower-rank natural merges consume the seed's operands first). Canonical: `rustbpe_variants/seed_tokens/routes.py` re-exports 1,750 routes (K=1750 at the plateau-end of the per-seed marginal-value K-sweep; vocab=34518). **Offline result**: −0.63% ClimbMix val tokens vs baseline (Lambda-pending). An earlier morpheme-mining pipeline (`mine_seed_morphemes.py` + `find_seed_routes.py`) was tested and net-negative; preserved in-tree but deprecated for canonical use. Prior YAML-driven Rust crate (`src/lib.rs`, `seed_tokens.yaml`) preserved for history, no longer referenced. See §seed_tokens redesign for details.
+- **`seed_tokens`** (Python overlay, **redesigned 2026-05-26**) — data-driven seed merges inserted at their natural-firing rank in `mergeable_ranks` (rank `max(id_L, id_R) + 1`, where the merge would have minted mid-BPE-training). Two mining iterations tested: morpheme-mining (failed, net-negative) and within-chunk adjacent-token-pair mining from baseline output (succeeded, K=1,750 canonical at vocab=34,518 → **−0.63% ClimbMix val tokens** vs baseline). The win is small in magnitude and the predicted CORE delta sits below the per-task noise floor at d24; preserved but not queued for Lambda alone. See §seed_tokens redesign for the full empirical arc and takeaways.
 - **`case_marker`** (designed only, not yet implemented) — lossless casing collapse via input preprocessing: cased words → `<|cap|>` / `<|allcaps|>` marker tokens + lowercased base. Pure-Python (~200-300 LOC); no Rust work. Orthogonal to all merge-producer variants. Catalog entry: `ideas/tokenizer-variants/README.md` variant 13. Now de-gated since `force_merges` validated the data-driven methodology — pursue as a parallel lossless-compression source.
 
-`force_merges` is adopted as the new default tokenizer. `seed_tokens` (the K=1750 composition canonical) is offline-positive vs baseline but Lambda-pending; orthogonal to `force_merges` in gap-targeting (within-chunk vs cross-chunk). `space_digits` is functionally subsumed by `force_merges` (the `?\p{N}{1,2}` tweak is folded in).
+`force_merges` is adopted as the new default tokenizer. `seed_tokens` (the K=1,750 composition canonical) is offline-positive vs baseline (−0.63%) but the magnitude is too small to predict a clear CORE win at d24 — preserved as a reproducible artifact but not queued for a standalone Lambda run. `space_digits` is functionally subsumed by `force_merges` (the `?\p{N}{1,2}` tweak is folded in).
 
 The [non-backprop LLM](ideas/non-backprop/README.md) is a **separate research track**, not part of this capability-tuning sequence. Pursue independently.
 
@@ -179,101 +179,61 @@ Re-curation workflow (when corpus or curation rule changes):
 
 ## seed_tokens redesign (2026-05-26)
 
-Replaced the YAML-driven constructive-merge-chain approach with a data-driven pipeline modeled on `force_merges` curation. **Mining target was the key knob** — the first iteration mined morphemes (failed), the second iteration mined within-chunk baseline-output adjacencies (succeeded). Both shared the same wrapper / insertion mechanics; only the candidate set differed.
+Replaced a YAML-driven constructive-merge-chain approach (from `origin/seed_tokens` prior art) with a data-driven mining pipeline + mid-rank insertion in pure Python. Two mining iterations tested: morpheme-mining (failed, net-negative) and within-chunk composition mining (succeeded, K=1,750 canonical). The successful variant delivers a small offline win but the magnitude doesn't predict a clear downstream gain; canonical is preserved but not queued for Lambda alone.
 
-**No Rust changes.** Pristine `rustbpe` handles normal BPE; route insertion is pure Python. The prior `rustbpe_seed_tokens` crate (`src/lib.rs`, `seed_tokens.yaml`) is preserved in-tree for history.
+### Mechanism: mid-rank insertion
 
-### Mechanics
+Each seed `(L_bytes, R_bytes, S_bytes)` is inserted into the final `mergeable_ranks` at rank `max(id_L, id_R) + 1` — the rank the merge would have had if introduced mid-BPE-training. Natural merges with id ≥ the insertion point shift up by 1 per inserted seed; relative order preserved. Tiktoken applies the merge at encode time via standard rank-based greedy matching whenever L and R are adjacent.
 
-Each seed `(L_bytes, R_bytes, S_bytes)` is inserted into `mergeable_ranks` at rank `max(id_L, id_R) + 1` — the rank the merge would have had if introduced mid-BPE-training. Natural merges with id ≥ the insertion point shift up by 1 per inserted seed; order preserved. Tiktoken applies the merge at encode time via standard rank-based greedy matching whenever L and R are adjacent.
+**Why mid-rank, not append-at-end**: a natural BPE merge that would consume one of a seed's operands has lower rank than an appended seed and fires first, leaving no `(L, R)` adjacent pair to match. Smoke witness during early development: seed `(q, q) → qq` appended at rank ~328 got preempted by a natural ` q` merge at rank ~271 and never fired. Mid-rank insertion places each seed where no preempting natural merge can yet exist (both operands are still bare at that point in the BPE sequence). Each seed consumes exactly one vocab slot (final vocab = baseline + N_seeds). force_merges uses a different vocab-budgeting scheme — reserve one slot per forced pair during phase-1 BPE, then backfill any unused reservations (safe-aliased pairs, etc.) with normal merges in phase 2 — so its vocab bump is set by an unrelated mechanism: the +20 over baseline for 122 pairs is the empirical bracketing needed to recover the ~20 borderline BPE merges that the reservation displaces from the tail of the distribution, not a per-pair slot cost.
 
-**Why mid-rank insertion, not append-at-end**: the naive "append at the highest rank" fails because a natural BPE merge that consumes one of the seed's operands has lower rank and fires first, leaving no `(L, R)` adjacent pair for the seed to match. Smoke witness: seed `(q, q) → qq` appended at rank ~328 got preempted by a natural ` q` merge at rank ~271. Inserting at `max(id_L, id_R) + 1` places the seed where no preempting natural merge can exist yet (both operands are still bare). Same `RECOMMENDED_VOCAB_SIZE = baseline + n_routes` convention `force_merges` uses to budget the extra merges.
+### What we tried
 
-### First mining attempt — morphemes (failed)
+1. **Port the prior-art constructive-merge-chain approach** (YAML morpheme list + Rust merge-chain builder from `origin/seed_tokens`). Smoke passed; first real-data eval was net-negative.
+2. **Diagnose the failure** with a per-token usage-delta tool comparing baseline vs variant firing counts. The seeds were displacing high-utility short baseline morphemes (`ing`, `ation`, `ate`, `ize`, ...) — competing with rather than complementing baseline's natural morphology.
+3. **Substring-blocker filter** as salvage on the morpheme list (drop candidates whose bytes contain a high-firing baseline token as substring). Narrowed damage but never reached parity; the conceptual mismatch was structural.
+4. **Reframe the mining target**: instead of mining linguistic morphemes, mine **within-pre-tok-chunk adjacent-token-pair bigrams from baseline encoding output**. Each pair is, by construction, a composition baseline knows is common but couldn't fit in the 32K budget — every firing replaces 2 tokens with 1, so net-positive at the firing site.
+5. **K-sweep** to find the per-seed-marginal plateau-end → K=1,750 canonical (vocab=34,518, +1,750 over baseline).
+6. **Isolation control**: trained pure-BPE at the same final vocab size with no seeds, to separate vocab-size effects from seed-mechanism effects.
+7. **K_switch sweep**: varied the BPE-vs-seed boundary at fixed final vocab to test whether earlier mining (more seeds, fewer natural BPE merges) would help. It did not.
 
-`tools/mine_seed_morphemes.py` + `tools/find_seed_routes.py` mined substrings of pre-tokenized chunks by distinct-types productivity (4..10 char length, min_types=100), then picked routes through baseline vocab. Produced 469 routes covering English derivational morphology (`cation`, `tation`, `zation`, `lization`, `fication`, `abilit`, `logical`, `struct`, ...).
+### Headline results (ClimbMix val, 20M chars)
 
-**Net-negative on ClimbMix val** (`tools/diag_seed_usage.py` was built for this diagnosis):
+| variant | vocab | tokens | Δ vs baseline | per added slot |
+|---|---:|---:|---:|---:|
+| baseline | 32,768 | 4,489,413 | — | — |
+| morpheme-mining canonical (469 routes) | 33,237 | 4,498,454 | **+9,041 (+0.20% worse)** | — |
+| extended BPE @ same vocab (no seeds) | 34,518 | 4,472,633 | −16,780 (−0.37%) | 9.6 t/slot |
+| **composition-mining canonical (K=1,750)** | **34,518** | **4,461,142** | **−28,271 (−0.63%)** | **16.2 t/slot** |
+| K_switch=20K (earlier mining, more seeds) | 34,510 | 4,537,216 | +47,803 (+1.07% worse) | regression |
+| force_merges (reference, different gap) | 32,788 | 4,179,430 | **−309,983 (−6.91%)** | ~15,500 t/slot |
 
-| | baseline | seed_tokens (469 routes) |
-|---|---:|---:|
-| total tokens | 4,489,413 | 4,498,454 (+9,041, **+0.20% worse**) |
-| dead tokens | 466 | 744 (+278; **59% of seeds dead**) |
+The K-sweep identified K=1,750 as the per-seed-marginal plateau-end. K=1,500–1,750 averaged ~13 tokens/seed (plateau), K=1,750→2,000 declined to 10/seed, K=2,000→2,250 went actively anti-productive at −8.7/seed (51% dead in that cohort; the live seeds collectively cost ~17 tokens each by intercepting longer natural compositions). Larger K eventually beats K=1,750 in absolute terms (K=3,000 saves 36,165) but only by walking through the anti-productive K=2,000–2,250 dip; K=1,750 is the cleaner stop condition.
 
-The diagnostic showed the failure mode clearly: the 469 seeds *displaced* high-utility short baseline morphemes (`ing` lost 594 firings, `ive` 352, `ation` 303, `ist` 302, `ine` 282, `ers` 243, `ent` 209, `ate` 200, ...). The seed mechanism inserted at mid-rank intercepts these short-morpheme paths, fragmenting the encoding even when the seed itself fires productively.
+The K_switch sweep tested whether earlier mining (more seeds, fewer natural BPE merges, same final vocab) would help. Monotonically hurt — at K_switch=20K, swapping ~12,800 natural BPE merges for seeds caused a +47,803-token regression vs the K_switch=32,768 canonical.
 
-**Salvage attempt — substring-blocker filter** (`tools/find_seed_routes.py --max-blocker-firings N`, drops candidates whose bytes contain a high-firing baseline token as substring) narrowed the damage but never reached parity:
+### Takeaways
 
-| threshold | seeds | Δ vs baseline |
-|---:|---:|---:|
-| 250 | 9 | +109 |
-| 500 | 42 | +622 |
-| 1000 | 135 | +1,838 |
-| 2000 | 370 | +6,487 |
-| unfiltered | 469 | +9,041 |
+1. **Mining target dominates over insertion mechanism.** Both morpheme and composition pipelines used identical wrapper + identical mid-rank insertion. One was net-negative, the other net-positive. The candidate set matters more than refining the mechanic.
 
-Conclusion: morpheme-mining was conceptually misdirected. English BPE already captures morphology efficiently at short granularity (`ing`, `ation`, `ize`); longer compositions we mine compete with rather than complement that.
+2. **The seed mechanism does mechanism-specific work, but the magnitude is small.** At the same vocab cost, seeds beat extended BPE by 11,491 tokens — a 1.69× per-slot efficiency gain. Not just vocab growth in disguise. The advantage is mid-rank insertion: seeds at `max(id_L, id_R) + 1` fire reliably; the same compositions at tail rank (extended BPE) get preempted by lower-rank natural merges that consume their operands.
 
-### Second mining attempt — within-chunk compositions (succeeded)
+3. **The seed mechanism is a TAIL-EXTENDER, not a mid-budget REPLACEMENT.** BPE's iterative count-update selection in the middle of its distribution outperforms snapshot mining; the seed mechanism's value materializes specifically at the budget boundary, where BPE's iterative dynamics are weak (low counts, narrow advantages) AND extended-BPE's tail-rank placement is a structural handicap. There's no benefit to mining earlier than where BPE naturally ends.
 
-`tools/mine_seed_compositions.py` reframes the target: encode the corpus with baseline, count adjacent-token-pair occurrences *within pre-tok chunks*, filter to pairs whose concatenated bytes aren't in baseline vocab, rank by count. Each pair is by construction:
+4. **force_merges and seed_tokens target structurally different gaps.** force_merges captures cross-pre-tok-chunk pairs (BPE structurally cannot see them — addressed via regex carve-out). seed_tokens captures within-chunk pairs (BPE saw them but couldn't fit). Per-slot returns differ by ~three orders of magnitude (15,500 vs 16 t/slot). The cross-chunk gap is just much larger than the within-chunk leftover, so within-chunk seeding plays a smaller game on smaller stakes.
 
-1. An adjacent baseline-output pair → fires wherever those adjacencies occur (guaranteed productive).
-2. With concat not in baseline → fills a gap baseline left unfilled (couldn't fit in 32K budget).
-3. Replaces 2 tokens with 1 wherever it fires → net compression strictly positive at firing sites.
+5. **Offline → CORE translation is uncertain at small magnitudes.** Applying force_merges's offline-to-CORE multiplier (−6.9% offline → +5.81% CORE) to seed_tokens predicts ~+0.5% CORE — likely below the per-task variance floor at d24 scale. The result is real but its magnitude doesn't predict a clear downstream win.
 
-The pair IS the route (no route-finder needed — both operands are baseline tokens by construction). **Within-chunk only**: cross-chunk pairs like `(',', ' ')` dominate frequency but tiktoken cannot merge across pre-tok-chunk boundaries (the gap `force_merges` addresses with a regex carve-out — different mechanism).
+6. **Determinism in mining pipelines requires explicit work.** Bugs surfaced during reviews: undefined sort tiebreaks (`Counter.most_common()` first-seen order leaking into vocab rank), top-K slicing through same-count buckets, firings caches reusing across tokenizer rebuilds, per-batch char caps rounding to row-group boundaries. Each was invisible at single-run scale but would have made re-mining non-reproducible. Explicit tiebreaks + content fingerprints + doc-level cap accuracy belong in every mining pipeline from day one.
 
-**K-sweep on ClimbMix val** to find the marginal-return inflection (fine-grained around the knee):
+### Decision
 
-| K | vocab | tokens | Δ vs base | per-bucket marginal |
-|---:|---:|---:|---:|---:|
-| 0 (baseline) | 32,768 | 4,489,413 | — | — |
-| 50 | 32,818 | 4,486,613 | −2,800 (−0.062%) | 56.0 |
-| 200 | 32,968 | 4,482,503 | −6,910 (−0.154%) | 22.6 |
-| 500 | 33,268 | 4,477,194 | −12,219 (−0.272%) | 17.7 |
-| 1,000 | 33,768 | 4,469,564 | −19,849 (−0.442%) | 15.3 |
-| 1,250 | 34,018 | 4,466,364 | −23,049 (−0.513%) | 12.8 |
-| 1,500 | 34,268 | 4,463,082 | −26,331 (−0.586%) | 13.1 |
-| **1,750** | **34,518** | **4,461,142** | **−28,271 (−0.630%)** | **13.3** ← plateau end |
-| 2,000 | 34,768 | 4,457,245 | −32,168 (−0.717%) | 10.0 ← decline |
-| 2,250 | 35,018 | 4,459,412 | −29,999 (−0.668%) | −8.7 ← collapse |
-| 2,500 | 35,268 | 4,458,163 | −31,250 (−0.696%) | 5.0 |
-| 2,750 | 35,518 | 4,455,335 | −34,078 (−0.759%) | 11.3 |
-| 3,000 | 35,768 | 4,453,248 | −36,165 (−0.806%) | 8.4 |
-| 5,000 | 37,768 | 4,435,922 | −53,491 (−1.192%) | (8.7 avg) |
-| 8,000 | 40,768 | 4,418,471 | −70,942 (−1.580%) | (5.8 avg) |
-
-Note: rows other than K=1,750 are from the original sweep, which used `Counter.most_common()` iteration order as an implicit selection tiebreak within same-count clusters; the current K=1,750 row reflects the deterministic-selection canonical (~0.03 percentage-point shift in absolute compression vs the pre-determinism point). The plateau-end shape is robust — only which 91 of 288 same-count seeds at the count=15 boundary make the cut changed.
-
-**K=1750 promoted as canonical** at the plateau-end of the per-seed marginal-value curve. The pre-determinism sweep showed K=1500–1750 averaged 13.1–13.3 tokens/seed (plateau), K=1750→2000 declined to 10.0/seed, and K=2000→2250 went actively anti-productive at −8.7/seed (51% dead in that cohort; live seeds collectively cost +17.6 tokens each by intercepting longer natural compositions). The deterministic-selection K=1750 achieves 16.15 tokens-saved per added vocab slot (vs K=2000's 16.08 in the pre-determinism table) and a 14.0% dead-rate. Larger K eventually beats K=1750 in absolute terms (K=3000 saves 36,165 vs K=1750's 28,271) but only by walking through the anti-productive K=2000–2250 dip; K=1750 is the cleaner stop condition.
-
-### Current canonical (Lambda-pending)
-
-`mined/compositions_climbmix_val_k1750.py` re-exported via `routes.py`. `RECOMMENDED_VOCAB_SIZE = 34518` (+1750 over baseline; embedding cost ~1.4% at d=24).
-
-### For perspective: vs force_merges
-
-Both find "compositions baseline can't form," at different layers. force_merges captures **cross-pre-tok-chunk** pairs (e.g., ` of`+` the`) — a structural gap BPE literally cannot see, so the gap is large. (C) captures **within-chunk** pairs BPE saw at training time but couldn't fit — the gap is small because BPE already merged most frequent within-chunk pairs.
-
-Per-vocab-slot efficiency tells the story:
-  - force_merges: ~15,500 tokens saved per added slot (−6.9% at +20 vocab)
-  - seed_tokens (C, K=1750): ~16 tokens saved per added slot (−0.63% at +1750 vocab)
-
-Three orders of magnitude difference. (C) is real and orthogonal to force_merges (they target different gaps and could plausibly stack), but it plays a much smaller game.
-
-### Reusable infrastructure
-
-- `tools/mine_seed_morphemes.py` — substring-productivity miner. Deprecated for seed selection (failed) but the position-breakdown stats may be useful for other filtering experiments.
-- `tools/mine_seed_compositions.py` — within-chunk adjacent-pair miner. Current canonical mining tool.
-- `tools/find_seed_routes.py` — route-finder against baseline vocab; includes the `--max-blocker-firings` substring filter (still useful when working from a morpheme list).
-- `tools/diag_seed_usage.py` — per-token usage-delta diagnostic for a trained seed_tokens vs baseline. Use when debugging why a candidate set under- or over-performs.
-- `wrappers/tok_train_seed_tokens.py` — mid-rank insertion in pure Python; no Rust changes.
+Canonical (K=1,750, vocab=34,518) is preserved as a complete, reproducible artifact but **not queued for Lambda alone**. At ~$120/run the predicted downstream win sits below the test's resolution. If a future tokenizer variant earns Lambda time, seed_tokens can stack opportunistically for ~zero marginal compute cost — but is not worth running on its own merits.
 
 ### Open questions
 
-- **Stack (C) + force_merges**: untested. They target orthogonal gaps; no obvious interference (force_merges uses regex carve-out, (C) uses rank insertion). Worth an offline A/B before Lambda.
-- **Translate offline to Lambda**: force_merges's −6.9% offline translated to CORE +5.81% / ChatCORE +0.62%. (C)'s −0.63% is much smaller — uncertain whether it crosses the threshold for a real CORE/val-bpb win at d24 scale. The cost-benefit math at $120/run argues for waiting until stacked results, OR until the cheaper d6 probe shows direction.
+- **Stack with force_merges**: untested. They target orthogonal gaps (cross-chunk vs within-chunk), use mechanically independent insertion (regex carve-out vs rank insertion), and have no obvious interference path. Worth an offline A/B if it bundles into another tokenizer experiment cheaply; a standalone test is hard to justify given the small expected magnitude.
+- **Iterative-selection at mid-rank**: extended BPE picks merges by iterative count update (better selection); seed_tokens places at mid-rank (better placement). A hybrid — extended-BPE's merge set placed at natural-firing ranks instead of tail ranks — would isolate which advantage matters more. Untested.
 
 ## Next concrete steps
 
@@ -285,6 +245,6 @@ Three orders of magnitude difference. (C) is real and orthogonal to force_merges
 
 4. **Tokenizer-variants track** — `force_merges` is adopted as default; in-tree canonical promoted to the post-shadow-fix 122-pair list at vocab=32788 (locally validated; Lambda-pending). Next:
    - **Stacked A/B**: `zloss` + new `force_merges` canonical together in one d24 run, vs `d24_baseline + new force_merges` reference. Tests whether the two adopted improvements compound or interfere AND confirms the local +0.42% real-corpus gain of the new canonical translates to a CORE/val_bpb edge. ~$120, decisive.
-   - **`seed_tokens` next**: offline curation done — K=1750 within-chunk-composition canonical lands −0.63% ClimbMix val tokens at +5.3% vocab. Two open paths before a Lambda commit: (a) offline A/B of `seed_tokens` + `force_merges` stacked (untested; they target orthogonal gaps), (b) direct d24 Lambda A/B for `seed_tokens` alone (~$120; uncertain at the small offline magnitude). `space_digits` is subsumed.
+   - **`seed_tokens`**: offline curation done, preserved but not queued for standalone Lambda (−0.63% offline magnitude predicts CORE delta below the per-task noise floor). Could stack opportunistically if another tokenizer variant earns Lambda time. `space_digits` is subsumed.
 
 5. After that: differential attention, then online data selection if the earlier results justify the harness-touching investment.
