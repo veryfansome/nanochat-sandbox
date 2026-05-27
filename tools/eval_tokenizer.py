@@ -29,7 +29,7 @@ Usage:
     uv run python -m tools.eval_tokenizer \\
         --tokenizers ours,gpt2,gpt4,/path/to/tokenizer_v2
 
-    # Tier 1 + Tier 2 (coverage curve; tokenizes a FineWeb val chunk)
+    # Tier 1 + Tier 2 (coverage curve; tokenizes a ClimbMix val chunk)
     uv run python -m tools.eval_tokenizer --full
 
     # Dump full results as JSON for downstream tools
@@ -404,7 +404,7 @@ def compute_task_probes(tok) -> dict:
 def compute_coverage(tok, max_chars: int) -> dict:
     """
     Tier 2: tokenize a held-out corpus chunk, compute token-frequency
-    statistics and cumulative coverage at top-K. Uses FineWeb val (last
+    statistics and cumulative coverage at top-K. Uses ClimbMix val (last
     parquet shard) via nanochat.dataset.
     """
     from nanochat.dataset import parquets_iter_batched
@@ -603,7 +603,7 @@ def print_longest(reports):
 def print_coverage(reports):
     if not any(r.coverage for r in reports):
         return
-    print(f"\n{BOLD}-- Coverage curve (Tier 2; FineWeb val) --{RESET}")
+    print(f"\n{BOLD}-- Coverage curve (Tier 2; ClimbMix val) --{RESET}")
     for r in reports:
         if not r.coverage:
             continue
@@ -736,7 +736,7 @@ def parse_args():
     p.add_argument(
         "--full",
         action="store_true",
-        help="Include Tier 2 (coverage curve over FineWeb val; takes ~1-2 min).",
+        help="Include Tier 2 (coverage curve over ClimbMix val; takes ~1-2 min).",
     )
     p.add_argument(
         "--coverage-chars",

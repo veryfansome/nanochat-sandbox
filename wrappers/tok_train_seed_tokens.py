@@ -1,152 +1,179 @@
 """
-Tokenizer variant: morpheme-seeded BPE.
+Tokenizer variant: data-driven seed tokens via natural-route rank insertion.
 
-Lifted from veryfansome/nanochat@seed_tokens. The Rust crate
-`rustbpe_seed_tokens` (built via `VARIANT=seed_tokens bash runs/build_rustbpe.sh`)
-adds a `seed_tokens=` kwarg to `train_from_iterator` and a constructive
-merge-chain builder that ensures each seed token is achievable in the BPE merge
-DAG (priority over frequency-driven merges).
+Loads `(L_bytes, R_bytes, S_bytes)` routes from
+`rustbpe_variants/seed_tokens/routes.py` (mined and curated separately —
+see that module's docstring for the current pipeline) and inserts each
+seed into `mergeable_ranks` at its **natural-firing rank**: the rank
+`max(id_L, id_R) + 1` it would have had if introduced mid-BPE-training.
+Natural merges with id ≥ the insertion point shift up by 1 per inserted
+seed, preserving order. Tiktoken applies the merges at encode time via
+standard rank-based greedy matching.
 
-The Python wrapper loads the morpheme YAML, generates the position-aware
-variant set (leading-space / leading-space-capitalized / no-space), and shims
-train_from_iterator to thread `seed_tokens=` through to the Rust trainer.
+Why mid-rank insertion (not append-at-end): natural BPE merges that
+consume one of a seed's operands have lower rank than an appended seed
+and fire first, leaving no `(L, R)` adjacent pair to match. Smoke
+witness: seed `(q, q) → qq` appended at rank ~328 got preempted by a
+natural ` q` merge at rank ~271. Mid-rank insertion places each seed
+where no preempting natural merge can exist yet (both operands still
+bare at that point in the BPE merge sequence).
 
-See ../rustbpe_variants/seed_tokens/seed_tokens.yaml for the ~200-morpheme
-curated list (Greek/Latin roots, English prefixes, suffixes — etymology
-commented per entry).
+No Rust changes needed. Uses pristine `rustbpe` (sandbox/rustbpe via
+runs/build_rustbpe.sh) for normal BPE; seed insertion is pure Python.
+The previous YAML-driven Rust crate (constructive merge-chain builder
+paying `len(seed) - 1` slots per seed) is preserved in-tree for history
+but no longer referenced — data-driven routes use 1 slot per seed.
 
 Usage:
-    # Build the rustbpe variant once (and after any Rust edit):
-    VARIANT=seed_tokens bash runs/build_rustbpe.sh
-
-    # Then train:
     uv run python -m wrappers.tok_train_seed_tokens
-
-Output:
-    ~/.cache/nanochat-variants/seed_tokens/tokenizer/
+    # → ~/.cache/nanochat-variants/seed_tokens/tokenizer/
 """
-import os
 import runpy
-
-import yaml
+import sys
 
 from wrappers._tokenizer_variant_common import (
     setup_variant_base,
-    alias_rustbpe,
     print_downstream_hint,
 )
 
 
-def _load_seeds():
-    """Build the seed-token list from the YAML, mirroring sandbox/seed_tokens.py
-    on the seed_tokens branch. Position-aware variants are generated per category:
-      - versatile_morphemes: leading-space, leading-space-capitalized, no-space
-      - prefixes:            leading-space, leading-space-capitalized
-      - inner_morphemes:     no-space
-    """
-    yaml_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..",
-        "rustbpe_variants",
-        "seed_tokens",
-        "seed_tokens.yaml",
-    )
-    with open(yaml_path) as f:
-        cfg = yaml.safe_load(f)
-    seeds = set()
-    for seed in cfg.get("versatile_morphemes", []):
-        seeds.add(f" {seed}")
-        seeds.add(f" {seed.capitalize()}")
-        seeds.add(seed)
-    for seed in cfg.get("prefixes", []):
-        seeds.add(f" {seed}")
-        seeds.add(f" {seed.capitalize()}")
-    for seed in cfg.get("inner_morphemes", []):
-        seeds.add(seed)
-    return sorted(seeds)
-
-
 def apply_patches():
     """
-    Install the rustbpe alias + train_from_iterator shim that threads the seed
-    list through to the Rust trainer.
+    Install the train_from_iterator shim. No rustbpe alias — uses pristine.
 
-    Returns the loaded seed list for inspection / testing. Must be called AFTER
-    setup_variant_base() and BEFORE any nanochat.tokenizer import.
+    The shim looks up SEED_ROUTES *dynamically* from the routes module on
+    each call, so tests can swap in synthetic routes without re-installing.
+    Returns the currently-loaded SEED_ROUTES for inspection.
+
+    Must be called AFTER setup_variant_base() (so NANOCHAT_BASE_DIR is set)
+    and BEFORE any nanochat.tokenizer import (so the patch wins).
     """
-    alias_rustbpe("rustbpe_seed_tokens")
-
     import nanochat.tokenizer as tk
-    seeds = _load_seeds()
+    from rustbpe_variants.seed_tokens import routes as _routes_mod
 
     def _patched_train_classmethod(text_iterator, vocab_size):
-        import rustbpe  # aliased to rustbpe_seed_tokens
+        # `vocab_size` is the TOTAL final vocab including specials (matches
+        # nanochat's --vocab-size semantics). We reserve `len(SEED_ROUTES)`
+        # slots from the natural BPE budget so the final vocab matches the
+        # caller's request when every route applies. If a route can't
+        # apply (operand missing, or S already minted naturally) its slot
+        # stays empty — final vocab will be slightly smaller. We do not
+        # backfill the unused slots; tightness isn't worth the complexity.
+        import rustbpe  # pristine
         import tiktoken
         from nanochat.tokenizer import SPECIAL_TOKENS
 
-        tokenizer = rustbpe.Tokenizer()
+        SEED_ROUTES = _routes_mod.SEED_ROUTES
+        n_routes = len(SEED_ROUTES)
         vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
-        assert vocab_size_no_special >= 256
+        natural_target = vocab_size_no_special - n_routes
+        assert natural_target >= 256, (
+            f"natural_target={natural_target} too small after reserving "
+            f"{n_routes} seed slots from vocab_size_no_special="
+            f"{vocab_size_no_special}"
+        )
+
+        tokenizer = rustbpe.Tokenizer()
         tokenizer.train_from_iterator(
-            text_iterator, vocab_size_no_special,
+            text_iterator, natural_target,
             pattern=tk.SPLIT_PATTERN,
-            seed_tokens=seeds,
         )
         pattern = tokenizer.get_pattern()
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()
-        # Two distinct missing-id regimes, only one of which is benign:
-        #   - **Tail shortfall** (unique ids dense in `[0, n_unique)` but
-        #     `n_unique < vocab_size_no_special`): BPE legitimately stops early
-        #     when the corpus runs out of useful merges (small `--max_chars`,
-        #     smoke/dev runs). Baseline rustbpe does the same. `tokens_offset =
-        #     len(mergeable_ranks)` places special tokens above max_id, no
-        #     collision. Warn and proceed.
-        #   - **Interior hole** (some id in `[0, max_id]` is unallocated): the
-        #     constructive merge-chain builder allocated ids non-contiguously.
-        #     This is a Rust-trainer bug, not a small-corpus condition. Raise
-        #     so the bug surfaces instead of risking a corrupted encoding;
-        #     whether tiktoken catches the eventual overlap depends on its
-        #     version.
-        #
-        # **Discriminator note**: we test against `len(set(ids))`, not raw
-        # `len(ids)`. The Rust trainer can legitimately emit duplicate ids via
-        # alias merges (`ensure_merge_pair` reuses an `existing_id` when seed
-        # construction lands on an already-allocated pair). Raw list length is
-        # inflated by aliases and is not a reliable proxy for ID density — a
-        # hole plus enough aliases can make a list-length check pass while the
-        # underlying ID space is sparse. The unique-id count directly asserts
-        # the invariant downstream consumers need (every id in `[0, max_id]`
-        # is allocated to some token).
+        # Pristine rustbpe emits bytes 0..255 first (ids 0..255), then
+        # merges (ids 256..255+n_merges). natural_ranks contains both.
+        natural_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
+
+        # Defensive: ids should be dense 0..max. A hole would break the
+        # rank-based interleaving below (and indicate a rustbpe regression).
         ids = [v for _, v in mergeable_ranks_list]
-        unique_ids = set(ids)
-        n_unique = len(unique_ids)
-        max_id = max(ids) if ids else -1
-        if max_id >= n_unique:
-            missing = sorted(set(range(max_id + 1)) - unique_ids)
+        n_unique = len(set(ids))
+        max_natural_id = max(ids)
+        if max_natural_id >= n_unique:
+            missing = sorted(set(range(max_natural_id + 1)) - set(ids))
             raise ValueError(
-                f"rustbpe_seed_tokens produced sparse mergeable ids: "
-                f"{n_unique} unique ids allocated but max id is {max_id} "
-                f"(would be {n_unique - 1} if dense). Missing ids in "
-                f"[0, {max_id}]: {missing[:10]}"
-                f"{'...' if len(missing) > 10 else ''}. Indicates a bug in "
-                f"the constructive merge-chain builder, not a small-corpus "
-                f"stop — special tokens at `tokens_offset = "
-                f"len(mergeable_ranks)` would risk colliding with existing "
-                f"mergeable ids above the hole."
+                f"pristine rustbpe emitted sparse ids: {n_unique} unique, "
+                f"max={max_natural_id}. Missing in [0, {max_natural_id}]: "
+                f"{missing[:10]}{'...' if len(missing) > 10 else ''}. "
+                f"Cannot safely interleave seeds when natural ids have holes."
             )
-        if n_unique < vocab_size_no_special:
+        if n_unique < natural_target:
             import warnings
             warnings.warn(
-                f"rustbpe_seed_tokens produced {n_unique}/{vocab_size_no_special} "
-                f"unique merges ({vocab_size_no_special - n_unique} short). "
-                f"Likely cause: training corpus too small to fill the vocab. "
-                f"Ids are dense from 0 — special tokens place safely above "
-                f"max_id. Proceeding with reduced vocab.",
+                f"pristine rustbpe filled only {n_unique}/{natural_target} "
+                f"tokens (256 bytes + {n_unique - 256} merges of "
+                f"{natural_target - 256} target). Likely cause: corpus too "
+                f"small. Seeds will still be inserted at their natural ranks.",
                 stacklevel=2,
             )
-        mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
-        tokens_offset = len(mergeable_ranks)  # safe: dict size >= n_unique > max_id per check above
-        special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
+
+        # Compute mid-training-style insertion points. Each seed's rank in
+        # the final mergeable_ranks should be `max(id_L, id_R) + 1` — where
+        # it would have been minted if introduced mid-BPE. Clamp to 256
+        # because ids 0..255 are reserved for byte tokens.
+        seed_inserts: list[tuple[int, bytes]] = []
+        skipped_no_L = skipped_no_R = skipped_S_exists = 0
+        for L_bytes, R_bytes, S_bytes in SEED_ROUTES:
+            # Tiktoken merges (L, R) at encode time iff a token has bytes
+            # L+R. If S ≠ L+R the seed never fires; guard against corruption.
+            assert L_bytes + R_bytes == S_bytes, (
+                f"seed route bytes inconsistent: {L_bytes!r} + "
+                f"{R_bytes!r} != {S_bytes!r}"
+            )
+            id_L = natural_ranks.get(L_bytes)
+            id_R = natural_ranks.get(R_bytes)
+            if id_L is None:
+                skipped_no_L += 1
+                continue
+            if id_R is None:
+                skipped_no_R += 1
+                continue
+            if S_bytes in natural_ranks:
+                skipped_S_exists += 1
+                continue
+            seed_inserts.append((max(max(id_L, id_R) + 1, 256), S_bytes))
+
+        # Interleave seeds with natural merges by insertion id. Stable sort
+        # keeps SEED_ROUTES order within ties.
+        seed_inserts.sort(key=lambda x: x[0])
+
+        # Build the final dict. Byte tokens keep their identity ranks 0..255
+        # (they're the BPE base alphabet — re-numbering them would break the
+        # standard "byte i → rank i" convention some downstream tools assume).
+        # Merges + seeds occupy 256..256+n_merges+n_applied-1, interleaved by
+        # the seed insertion points and their pre-shift natural ids.
+        mergeable_ranks: dict[bytes, int] = {bytes([i]): i for i in range(256)}
+        merges_only = sorted(
+            ((b, i) for b, i in natural_ranks.items() if i >= 256),
+            key=lambda x: x[1],
+        )
+        out_id = 256
+        seed_iter = iter(seed_inserts)
+        next_seed = next(seed_iter, None)
+        for nat_bytes, nat_orig_id in merges_only:
+            while next_seed is not None and next_seed[0] <= nat_orig_id:
+                mergeable_ranks[next_seed[1]] = out_id
+                out_id += 1
+                next_seed = next(seed_iter, None)
+            mergeable_ranks[nat_bytes] = out_id
+            out_id += 1
+        # Tail: seeds whose insertion point exceeds every natural merge id.
+        while next_seed is not None:
+            mergeable_ranks[next_seed[1]] = out_id
+            out_id += 1
+            next_seed = next(seed_iter, None)
+
+        applied = len(seed_inserts)
+        print(
+            f"==> seed routes applied: {applied}/{n_routes} "
+            f"(skipped: L={skipped_no_L}, R={skipped_no_R}, "
+            f"S-exists={skipped_S_exists})"
+        )
+
+        tokens_offset = len(mergeable_ranks)
+        special_tokens = {
+            name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)
+        }
         enc = tiktoken.Encoding(
             name="rustbpe_seed_tokens",
             pat_str=pattern,
@@ -156,18 +183,38 @@ def apply_patches():
         return tk.RustBPETokenizer(enc, "<|bos|>")
 
     tk.RustBPETokenizer.train_from_iterator = classmethod(
-        lambda cls, text_iterator, vocab_size: _patched_train_classmethod(text_iterator, vocab_size)
+        lambda cls, text_iterator, vocab_size: _patched_train_classmethod(
+            text_iterator, vocab_size
+        )
     )
-    return seeds
+    return _routes_mod.SEED_ROUTES
 
 
 def main():
     variant_base = setup_variant_base("seed_tokens")
-    seeds = apply_patches()
+    seed_routes = apply_patches()
+    from rustbpe_variants.seed_tokens.routes import RECOMMENDED_VOCAB_SIZE
+
+    # Forward caller args; inject --vocab-size only if not already set.
+    user_args = sys.argv[1:]
+    has_vocab_arg = any(
+        a == "--vocab-size" or a.startswith("--vocab-size=")
+        for a in user_args
+    )
+    if has_vocab_arg:
+        effective_vocab = "caller-supplied (see --vocab-size in args below)"
+    else:
+        user_args = ["--vocab-size", str(RECOMMENDED_VOCAB_SIZE)] + user_args
+        effective_vocab = (
+            f"{RECOMMENDED_VOCAB_SIZE} "
+            f"(+{RECOMMENDED_VOCAB_SIZE - 32768} vs nanochat default, "
+            "from RECOMMENDED_VOCAB_SIZE)"
+        )
     print(f"==> variant_base:    {variant_base}")
-    print(f"==> rustbpe module:  {__import__('rustbpe').__file__}")
-    print(f"==> seed tokens:     {len(seeds)}")
-    print(f"==> sample seeds:    {seeds[:8]} ...")
+    print(f"==> seed routes:     {len(seed_routes)}")
+    print(f"==> vocab_size:      {effective_vocab}")
+    print(f"==> tok_train args:  {user_args}")
+    sys.argv = ["tok_train.py"] + user_args
     runpy.run_module("scripts.tok_train", run_name="__main__")
     print_downstream_hint(variant_base)
 
