@@ -19,9 +19,10 @@ Contrast with the two other forced-merge engines:
     mined and it SKIPS a route whose concat already exists. manual_merges instead
     PROMOTES an existing concat to the front (the whole point is priority).
 
-Uses pristine `rustbpe` + nanochat's STANDARD `SPLIT_PATTERN` (no carve-out), so
-pairs must be within-chunk / sub-word compositions. Pure-Python insertion; no
-Rust changes.
+Base BPE runs on the `rustbpe_force_merges` crate (reused for its `blocked_pairs=`
+support; `forced_pairs` stays empty — seeds go in via pure-Python insertion).
+BLOCKED_PAIRS forbid specific merges during training. Standard `SPLIT_PATTERN`
+(no carve-out), so pairs must be within-chunk / sub-word compositions.
 
 Usage:
     uv run python -m wrappers.tok_train_manual_merges
@@ -32,24 +33,29 @@ import sys
 
 from wrappers._tokenizer_variant_common import (
     setup_variant_base,
+    alias_rustbpe,
     print_downstream_hint,
 )
 
 
 def apply_patches():
-    """Install the train_from_iterator shim (pristine rustbpe + pure-Python
-    front/mid rank-insertion of MANUAL_PAIRS). Returns MANUAL_PAIRS.
+    """Install the train_from_iterator shim. Base BPE runs on the
+    `rustbpe_force_merges` crate (for `blocked_pairs=` support; `forced_pairs`
+    stays empty since seeds go in via pure-Python front-insertion). MANUAL_PAIRS
+    are inserted at their natural rank; BLOCKED_PAIRS are forbidden during
+    training. Returns MANUAL_PAIRS. No SPLIT_PATTERN patch — standard regex."""
+    alias_rustbpe("rustbpe_force_merges")
 
-    No rustbpe alias — uses pristine. No SPLIT_PATTERN patch — standard regex."""
     import nanochat.tokenizer as tk
     from rustbpe_variants.manual_merges import pairs as _pairs_mod
 
     def _patched_train_classmethod(text_iterator, vocab_size):
-        import rustbpe  # pristine
+        import rustbpe  # aliased to rustbpe_force_merges (for blocked_pairs)
         import tiktoken
         from nanochat.tokenizer import SPECIAL_TOKENS
 
         MANUAL_PAIRS = _pairs_mod.MANUAL_PAIRS
+        BLOCKED_PAIRS = _pairs_mod.BLOCKED_PAIRS
         # routes: (L_bytes, R_bytes, S_bytes)
         routes = [(L.encode("utf-8"), R.encode("utf-8"), (L + R).encode("utf-8"))
                   for (L, R) in MANUAL_PAIRS]
@@ -66,6 +72,8 @@ def apply_patches():
         tokenizer = rustbpe.Tokenizer()
         tokenizer.train_from_iterator(
             text_iterator, natural_target, pattern=tk.SPLIT_PATTERN,
+            forced_pairs=[],                # seeds inserted in Python, not here
+            blocked_pairs=BLOCKED_PAIRS,     # forbid these merges during training
         )
         pattern = tokenizer.get_pattern()
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()
@@ -171,10 +179,12 @@ def main():
     else:
         user_args = ["--vocab-size", str(RECOMMENDED_VOCAB_SIZE)] + user_args
         effective_vocab = f"{RECOMMENDED_VOCAB_SIZE}"
+    from rustbpe_variants.manual_merges.pairs import BLOCKED_PAIRS
     print(f"==> variant_base:    {variant_base}")
-    print(f"==> rustbpe module:  pristine ({__import__('rustbpe').__file__})")
+    print(f"==> rustbpe module:  {__import__('rustbpe').__file__}")
     print(f"==> SPLIT_PATTERN:   standard (no carve-out)")
-    print(f"==> manual pairs:    {len(manual)} (inserted at max(id_L,id_R)+1, byte-bigrams → rank 256)")
+    print(f"==> manual pairs:    {len(manual)} (seeds @ max(id_L,id_R)+1, byte-bigrams → rank 256)")
+    print(f"==> blocked pairs:   {len(BLOCKED_PAIRS)}")
     print(f"==> vocab_size:      {effective_vocab}")
     print(f"==> tok_train args:  {user_args}")
     sys.argv = ["tok_train.py"] + user_args

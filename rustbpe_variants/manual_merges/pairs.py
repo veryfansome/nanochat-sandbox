@@ -29,10 +29,26 @@ Fill `MANUAL_PAIRS` below.
 MANUAL_PAIRS: list[tuple[str, str]] = [
     # (L, R) pairs to force-merge — within-chunk / sub-word only.
     # e.g. ("educ", "ation"), ("un", "happy"), ...
-    ("e", "i"),
-    ("i", "e"),
-    ("n", "g"),
-    ("q", "u"),
+]
+
+# BLOCKED_PAIRS — pairs that must NOT be merged during BPE training. Same
+# mechanism as blocked_morphemes / force_merges (rustbpe_force_merges'
+# `blocked_pairs=`): the trainer drops any merge candidate (L, R) listed here.
+# Use to forbid specific (non-morphemic) merges while the MANUAL_PAIRS seeds
+# above force the desired ones. Empty = no blocking (pristine-equivalent base).
+BLOCKED_PAIRS: list[tuple[str, str]] = [
+    # (L, R) pairs to forbid, e.g. ("at", "ion").
+    ("c", "ial"),
+    ("r", "ial"),
+    ("t", "ial"),
+    ("ent", "ial"),
+
+    ("t", "ion"),
+    ("at", "ion"),
+    ("ct", "ion"),
+    ("it", "ion"),
+    ("ut", "ion"),
+    ("est", "ion"),
 ]
 
 # Slot reservation is disabled (see tok_train_manual_merges.py): natural BPE
