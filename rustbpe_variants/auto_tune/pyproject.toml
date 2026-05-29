@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rustbpe_auto_tune"
+version = "0.1.0"
+description = "auto_tune blocking-BPE trainer (fork of force_merges) with corpus caching for the block-list audit"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+module-name = "rustbpe_auto_tune"
+features = ["pyo3/extension-module"]

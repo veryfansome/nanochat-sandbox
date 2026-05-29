@@ -1,0 +1,26 @@
+# auto_tune trainer: a blocking-BPE crate forked verbatim from the sibling
+# force_merges crate (same merge logic + blocked_pairs=), plus load_corpus() /
+# train_from_cached() — so the block-list audit can sweep many block-lists over
+# ONE cached corpus without re-reading/re-tokenizing it each time (the dominant
+# cost). Kept separate so force_merges (the adopted default) stays pristine.
+# See ../README.md for the parallel-crate pattern; this crate's role: ./README.md.
+
+[package]
+name = "rustbpe_auto_tune"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rustbpe_auto_tune"
+crate-type = ["cdylib"]
+
+[dependencies]
+dary_heap = "0.3"
+indexmap = "2.2"
+fancy-regex = "0.16.1"
+log = "0.4.28"
+pyo3 = { version = "0.23.3", features = ["extension-module"] }
+pyo3-log = "0.12.4"
+ahash = "0.8.12"
+rayon = "1.11.0"
+compact_str = "0.9.0"

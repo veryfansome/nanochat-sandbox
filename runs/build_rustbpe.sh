@@ -3,7 +3,7 @@
 #
 # Usage:
 #     bash runs/build_rustbpe.sh                    # build pristine sandbox/rustbpe/
-#     VARIANT=seed_tokens bash runs/build_rustbpe.sh
+#     VARIANT=auto_tune RELEASE=1 bash runs/build_rustbpe.sh
 #     VARIANT=force_merges RELEASE=1 bash runs/build_rustbpe.sh
 #
 # Env vars:

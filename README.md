@@ -17,6 +17,7 @@ Every experiment is a small overlay: a `GPT` subclass plus a wrapper that monkey
 | Pick what to work on; browse the idea catalog | [`ideas/README.md`](ideas/README.md) |
 | Read the design for a specific idea | `ideas/<idea>/README.md` |
 | See an implemented overlay's pattern | [`overlay/zloss.py`](overlay/zloss.py), [`wrappers/train_zloss.py`](wrappers/train_zloss.py), [`wrappers/smoke_zloss.py`](wrappers/smoke_zloss.py) |
+| Evaluate a (re)trained tokenizer variant offline | STATUS.md "Evaluating a (re)trained tokenizer variant" — `tools/eval_tokenizer.py` (Tier-1 filter) → `tools/pass_metrics.py` (corpus deltas vs baseline) → `tools/dump_vocab.py` (vocab inspection) |
 
 ## Layout
 
@@ -28,7 +29,7 @@ ideas/           # design docs, one folder per experiment (+ index)
 overlay/         # model subclasses (one .py per implemented idea)
 wrappers/        # Python entrypoints: patch nanochat.gpt + runpy base_train
 runs/            # shell pipelines: setup.sh, speedrun.sh, runcpu.sh, lambda.sh
-tools/           # analysis utilities: compare_runs.py (wandb A/B), ...
+tools/           # analysis utilities: compare_runs.py (wandb A/B); tokenizer eval trio eval_tokenizer/pass_metrics/dump_vocab; ...
 results/         # per-run logs / metadata (gitignored)
 pyproject.toml   # nanochat-sandbox project (nanochat NOT installed as a pkg)
 ```

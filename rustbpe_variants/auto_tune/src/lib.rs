@@ -23,6 +23,25 @@ pub struct Tokenizer {
     pub pattern: String,
     /// Compiled regex for efficiency
     compiled_pattern: Regex,
+    /// Materialized corpus (unique words + counts) cached by `load_corpus`, so
+    /// `train_from_cached` can run the merge loop repeatedly while only the
+    /// `blocked_pairs` vary — without re-reading/re-tokenizing the corpus (the
+    /// dominant cost). None until `load_corpus`. Cloned per train (the merge loop
+    /// consumes/mutates its inputs), so the cache stays pristine across trains.
+    cached_words: Option<Vec<Word>>,
+    cached_counts: Option<Vec<i32>>,
+    /// Held-out shards staged by `add_holdout_shard` (name, unique chunks, counts),
+    /// consumed by `finalize_holdout` into the global-dedup form below.
+    holdout_raw: Vec<(String, Vec<Word>, Vec<i32>)>,
+    /// Held-out corpus as GLOBAL unique chunks (deduped across all shards) so each
+    /// candidate encodes every distinct chunk once, plus per-shard sparse counts
+    /// `(global_chunk_index, count)`. Lets `evaluate_many` compute per-shard
+    /// compression + dead in Rust without re-encoding repeats. None until finalize.
+    holdout_chunks: Option<Vec<Word>>,
+    holdout_shard_counts: Option<Vec<Vec<(u32, i32)>>>,
+    holdout_names: Option<Vec<String>>,
+    /// Lowercased dictionary wordlist for the in-Rust whole-word coverage scan.
+    wordlist: Option<AHashSet<String>>,
 }
 
 // ------------------------ internal helpers ------------------------
@@ -405,9 +424,198 @@ fn build_token_bytes_and_map(
     (token_bytes, bytes_to_id)
 }
 
+/// Encode one pre-split chunk (bytes as u32 ids) with the learned `merges`,
+/// applying the lowest-rank (= lowest new_id) mergeable adjacent pair repeatedly.
+/// This is the per-chunk core of `Tokenizer::encode` without the regex split —
+/// the chunk is already a regex piece. Matches tiktoken's canonical BPE encode of
+/// the same chunk with the same ranks, so corpus token counts are identical.
+fn encode_word(merges: &StdHashMap<Pair, u32>, bytes: &[u32]) -> Vec<u32> {
+    let mut ids: Vec<u32> = bytes.to_vec();
+    while ids.len() >= 2 {
+        let mut best: Option<(usize, u32)> = None; // (index, new_id/rank)
+        for i in 0..ids.len() - 1 {
+            if let Some(&new_id) = merges.get(&(ids[i], ids[i + 1])) {
+                if best.map_or(true, |(_, b)| new_id < b) {
+                    best = Some((i, new_id));
+                }
+            }
+        }
+        match best {
+            Some((idx, new_id)) => {
+                ids[idx] = new_id;
+                ids.remove(idx + 1);
+            }
+            None => break,
+        }
+    }
+    ids
+}
+
+/// Reconstruct token_id -> bytes for every token in [0, 256 + merges.len()).
+/// Lighter than `build_token_bytes_and_map` (no reverse map); used per candidate
+/// in `evaluate_many` for the coverage scan.
+fn build_token_bytes(merges: &StdHashMap<Pair, u32>) -> Vec<Vec<u8>> {
+    let n = 256 + merges.len();
+    let mut tb: Vec<Vec<u8>> = vec![Vec::new(); n];
+    for i in 0..256usize {
+        tb[i] = vec![i as u8];
+    }
+    let mut sorted: Vec<(&Pair, &u32)> = merges.iter().collect();
+    sorted.sort_by_key(|&(_, &id)| id);
+    for (&(l, r), &id) in sorted {
+        let mut b = tb[l as usize].clone();
+        let right = tb[r as usize].clone();
+        b.extend_from_slice(&right);
+        tb[id as usize] = b;
+    }
+    tb
+}
+
+/// Mirror of `tools.blocked_pairs_report._is_word`'s inflection branch: `text`
+/// (already lowercased, and already known NOT to be a direct dict hit) counts as a
+/// whole word if a light inflectional strip of it is in `words`
+/// (governments->government, runs->run, cities->city). Suffix bytes are ASCII, so
+/// the byte slicing stays on char boundaries.
+fn is_inflected_word(text: &str, words: &AHashSet<String>) -> bool {
+    for suf in ["s", "es", "ed", "ing", "d"] {
+        if text.len() > suf.len() + 1 && text.ends_with(suf) && words.contains(&text[..text.len() - suf.len()]) {
+            return true;
+        }
+    }
+    if text.len() > 4 && text.ends_with("ies") {
+        let mut stem = text[..text.len() - 3].to_string();
+        stem.push('y');
+        if words.contains(&stem) {
+            return true;
+        }
+    }
+    false
+}
+
 // ------------------------ END helpers ------------------------
 
 impl Tokenizer {
+
+    /// Read a corpus from a Python string-iterator, split it with the pattern,
+    /// and count unique chunks — returning the materialized (words, counts).
+    /// This is the read/tokenize/count pass shared by `train_from_iterator`
+    /// (one-shot) and `load_corpus` (cache for repeated `train_from_cached`).
+    /// It is the dominant cost of a train (~85% of wall time on a real corpus),
+    /// and is independent of `blocked_pairs` — hence worth caching. Sets
+    /// `self.pattern` / `self.compiled_pattern` as a side effect.
+    fn ingest_corpus(
+        &mut self,
+        py: pyo3::Python<'_>,
+        iterator: &pyo3::Bound<'_, pyo3::PyAny>,
+        pattern: Option<String>,
+        buffer_size: usize,
+    ) -> PyResult<(Vec<Word>, Vec<i32>)> {
+        // Use provided pattern or default to GPT-4 pattern
+        let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
+
+        // Update the stored pattern and compile it
+        self.pattern = pattern_str.clone();
+        self.compiled_pattern = Regex::new(&pattern_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid regex pattern: {}", e)))?;
+
+        // Prepare a true Python iterator object
+        let py_iter: pyo3::Py<pyo3::PyAny> = unsafe {
+            pyo3::Py::from_owned_ptr_or_err(py, pyo3::ffi::PyObject_GetIter(iterator.as_ptr()))?
+        };
+
+        // Global chunk counts
+        let mut counts: AHashMap<CompactString, i32> = AHashMap::new();
+
+        // Temporary buffer we refill under the GIL
+        let mut buf: Vec<String> = Vec::with_capacity(buffer_size);
+
+        log::info!("Processing sequences from iterator (buffer_size: {})", buffer_size);
+        let mut total_sequences = 0u64;
+
+        // Helper: refill `buf` with up to `buffer_size` strings from the Python iterator.
+        // Returns Ok(true) if the iterator is exhausted, Ok(false) otherwise.
+        let refill = |buf: &mut Vec<String>| -> PyResult<bool> {
+            pyo3::Python::with_gil(|py| {
+                buf.clear();
+                let it = py_iter.bind(py);
+                loop {
+                    if buf.len() >= buffer_size {
+                        return Ok(false);
+                    }
+                    // next(it)
+                    let next_obj = unsafe {
+                        pyo3::Bound::from_owned_ptr_or_opt(py, pyo3::ffi::PyIter_Next(it.as_ptr()))
+                    };
+                    match next_obj {
+                        Some(obj) => {
+                            let s: String = obj.extract()?;
+                            buf.push(s);
+                        }
+                        None => {
+                            if pyo3::PyErr::occurred(py) {
+                                return Err(pyo3::PyErr::fetch(py));
+                            } else {
+                                return Ok(true); // exhausted
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        // Stream ingestion loop: refill under GIL, process without GIL (parallel)
+        loop {
+            let exhausted = refill(&mut buf)?;
+            if buf.is_empty() && exhausted {
+                break;
+            }
+
+            total_sequences += buf.len() as u64;
+
+            let pattern = self.compiled_pattern.clone();
+            let local: AHashMap<CompactString, i32> = py.allow_threads(|| {
+                buf.par_iter()
+                    .fold(
+                        || AHashMap::<CompactString, i32>::new(),
+                        |mut m: AHashMap<CompactString, i32>, s| {
+                            for mat in pattern.find_iter(s) {
+                                let piece = mat.expect("regex match failed").as_str();
+                                increment_chunk_count(&mut m, piece);
+                            }
+                            m
+                        },
+                    )
+                    .reduce(
+                        || AHashMap::<CompactString, i32>::new(),
+                        |mut a, b| {
+                            for (k, v) in b {
+                                *a.entry(k).or_default() += v;
+                            }
+                            a
+                        },
+                    )
+            });
+
+            // Merge local into global (single-threaded)
+            for (k, v) in local {
+                *counts.entry(k).or_default() += v;
+            }
+
+            if exhausted {
+                break;
+            }
+        }
+        log::info!("Processed {} sequences total, {} unique", total_sequences, counts.len());
+
+        // Materialize words & counts
+        let mut words = Vec::with_capacity(counts.len());
+        let mut cvec = Vec::with_capacity(counts.len());
+        for (chunk, c) in counts.into_iter() {
+            words.push(Word::new(chunk.as_bytes().iter().map(|&b| b as u32).collect()));
+            cvec.push(c);
+        }
+        Ok((words, cvec))
+    }
 
     /// Core incremental BPE training given unique words and their counts.
     /// `words`: one entry per unique chunk (Vec<u32> of token-ids/bytes).
@@ -712,6 +920,13 @@ impl Tokenizer {
             merges: StdHashMap::new(),
             pattern: String::new(),
             compiled_pattern: Regex::new("").expect("Empty regex should be valid"),
+            cached_words: None,
+            cached_counts: None,
+            holdout_raw: Vec::new(),
+            holdout_chunks: None,
+            holdout_shard_counts: None,
+            holdout_names: None,
+            wordlist: None,
         }
     }
 
@@ -730,113 +945,271 @@ impl Tokenizer {
         blocked_pairs: Option<Vec<(String, String)>>,
         forced_pairs: Option<Vec<(String, String)>>,
     ) -> PyResult<()> {
-        // Use provided pattern or default to GPT-4 pattern
-        let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
-
-        // Update the stored pattern and compile it
-        self.pattern = pattern_str.clone();
-        self.compiled_pattern = Regex::new(&pattern_str)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid regex pattern: {}", e)))?;
-
-        // Prepare a true Python iterator object
-        let py_iter: pyo3::Py<pyo3::PyAny> = unsafe {
-            pyo3::Py::from_owned_ptr_or_err(py, pyo3::ffi::PyObject_GetIter(iterator.as_ptr()))?
-        };
-
-        // Global chunk counts
-        let mut counts: AHashMap<CompactString, i32> = AHashMap::new();
-
-        // Temporary buffer we refill under the GIL
-        let mut buf: Vec<String> = Vec::with_capacity(buffer_size);
-
-        log::info!("Processing sequences from iterator (buffer_size: {})", buffer_size);
-        let mut total_sequences = 0u64;
-
-        // Helper: refill `buf` with up to `buffer_size` strings from the Python iterator.
-        // Returns Ok(true) if the iterator is exhausted, Ok(false) otherwise.
-        let refill = |buf: &mut Vec<String>| -> PyResult<bool> {
-            pyo3::Python::with_gil(|py| {
-                buf.clear();
-                let it = py_iter.bind(py);
-                loop {
-                    if buf.len() >= buffer_size {
-                        return Ok(false);
-                    }
-                    // next(it)
-                    let next_obj = unsafe {
-                        pyo3::Bound::from_owned_ptr_or_opt(py, pyo3::ffi::PyIter_Next(it.as_ptr()))
-                    };
-                    match next_obj {
-                        Some(obj) => {
-                            let s: String = obj.extract()?;
-                            buf.push(s);
-                        }
-                        None => {
-                            if pyo3::PyErr::occurred(py) {
-                                return Err(pyo3::PyErr::fetch(py));
-                            } else {
-                                return Ok(true); // exhausted
-                            }
-                        }
-                    }
-                }
-            })
-        };
-
-        // Stream ingestion loop: refill under GIL, process without GIL (parallel)
-        loop {
-            let exhausted = refill(&mut buf)?;
-            if buf.is_empty() && exhausted {
-                break;
-            }
-
-            total_sequences += buf.len() as u64;
-
-            let pattern = self.compiled_pattern.clone();
-            let local: AHashMap<CompactString, i32> = py.allow_threads(|| {
-                buf.par_iter()
-                    .fold(
-                        || AHashMap::<CompactString, i32>::new(),
-                        |mut m: AHashMap<CompactString, i32>, s| {
-                            for mat in pattern.find_iter(s) {
-                                let piece = mat.expect("regex match failed").as_str();
-                                increment_chunk_count(&mut m, piece);
-                            }
-                            m
-                        },
-                    )
-                    .reduce(
-                        || AHashMap::<CompactString, i32>::new(),
-                        |mut a, b| {
-                            for (k, v) in b {
-                                *a.entry(k).or_default() += v;
-                            }
-                            a
-                        },
-                    )
-            });
-
-            // Merge local into global (single-threaded)
-            for (k, v) in local {
-                *counts.entry(k).or_default() += v;
-            }
-
-            if exhausted {
-                break;
-            }
-        }
-        log::info!("Processed {} sequences total, {} unique", total_sequences, counts.len());
-
-        // Materialize words & counts
-        let mut words = Vec::with_capacity(counts.len());
-        let mut cvec = Vec::with_capacity(counts.len());
-        for (chunk, c) in counts.into_iter() {
-            words.push(Word::new(chunk.as_bytes().iter().map(|&b| b as u32).collect()));
-            cvec.push(c);
-        }
-
+        let (words, cvec) = self.ingest_corpus(py, iterator, pattern, buffer_size)?;
         self.train_core_incremental(words, cvec, vocab_size, blocked_pairs, forced_pairs);
         Ok(())
+    }
+
+    /// Read + split + count a corpus once and CACHE the result (unique words +
+    /// counts) on the tokenizer, so `train_from_cached` can run the merge loop
+    /// repeatedly while only `blocked_pairs` vary — skipping the dominant
+    /// read/tokenize cost on every subsequent train. Overwrites any prior cache.
+    #[pyo3(signature = (iterator, buffer_size=8192, pattern=None))]
+    #[pyo3(text_signature = "(self, iterator, buffer_size=8192, pattern=None)")]
+    pub fn load_corpus(
+        &mut self,
+        py: pyo3::Python<'_>,
+        iterator: &pyo3::Bound<'_, pyo3::PyAny>,
+        buffer_size: usize,
+        pattern: Option<String>,
+    ) -> PyResult<()> {
+        let (words, cvec) = self.ingest_corpus(py, iterator, pattern, buffer_size)?;
+        log::info!("Cached corpus: {} unique words", words.len());
+        self.cached_words = Some(words);
+        self.cached_counts = Some(cvec);
+        Ok(())
+    }
+
+    /// Train the merge loop against the corpus cached by `load_corpus`, with the
+    /// given `blocked_pairs`/`forced_pairs`. Clones the cache (the merge loop
+    /// consumes its inputs) so it stays reusable. Bit-identical to a
+    /// `train_from_iterator` call with the same corpus + args. Errors if no
+    /// corpus has been cached.
+    #[pyo3(signature = (vocab_size, blocked_pairs=None, forced_pairs=None))]
+    #[pyo3(text_signature = "(self, vocab_size, blocked_pairs=None, forced_pairs=None)")]
+    pub fn train_from_cached(
+        &mut self,
+        vocab_size: u32,
+        blocked_pairs: Option<Vec<(String, String)>>,
+        forced_pairs: Option<Vec<(String, String)>>,
+    ) -> PyResult<()> {
+        let words = self.cached_words.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
+        })?;
+        let counts = self.cached_counts.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
+        })?;
+        self.train_core_incremental(words, counts, vocab_size, blocked_pairs, forced_pairs);
+        Ok(())
+    }
+
+    /// Train MANY candidates against the cached corpus in PARALLEL, sharing it
+    /// read-only (each candidate clones the words its own merge loop mutates).
+    /// Returns one mergeable-ranks list per candidate, in input order — each
+    /// bit-identical to the matching `train_from_cached`. The merge loop is
+    /// serial per candidate (see `train_core_incremental`), so N candidates run
+    /// on ~N cores; this recovers the throughput the serial `train_from_cached`
+    /// leaves on the table. `num_threads` caps the rayon pool (None = all cores)
+    /// so callers can sweep concurrency to find where throughput saturates.
+    /// Releases the GIL for the whole parallel section.
+    #[pyo3(signature = (vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None))]
+    #[pyo3(text_signature = "(self, vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None)")]
+    pub fn train_many(
+        &self,
+        py: pyo3::Python<'_>,
+        vocab_size: u32,
+        blocked_pairs_batch: Vec<Vec<(String, String)>>,
+        num_threads: Option<usize>,
+        forced_pairs: Option<Vec<(String, String)>>,
+    ) -> PyResult<Vec<Vec<(Vec<u8>, u32)>>> {
+        let words = self.cached_words.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
+        })?;
+        let counts = self.cached_counts.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
+        })?;
+        let run = || {
+            blocked_pairs_batch
+                .par_iter()
+                .map(|blocked| {
+                    let mut t = Tokenizer::new();
+                    t.train_core_incremental(
+                        words.clone(),
+                        counts.clone(),
+                        vocab_size,
+                        Some(blocked.clone()),
+                        forced_pairs.clone(),
+                    );
+                    t.get_mergeable_ranks()
+                })
+                .collect::<Vec<_>>()
+        };
+        let results = py.allow_threads(|| match num_threads {
+            Some(p) => rayon::ThreadPoolBuilder::new()
+                .num_threads(p)
+                .build()
+                .expect("failed to build rayon pool")
+                .install(run),
+            None => run(),
+        });
+        Ok(results)
+    }
+
+    /// Cache the lowercased dictionary wordlist for the in-Rust coverage scan.
+    pub fn set_wordlist(&mut self, words: Vec<String>) {
+        self.wordlist = Some(words.into_iter().map(|w| w.to_lowercase()).collect());
+    }
+
+    /// Drop any staged/finalized held-out corpus.
+    pub fn clear_holdout(&mut self) {
+        self.holdout_raw.clear();
+        self.holdout_chunks = None;
+        self.holdout_shard_counts = None;
+        self.holdout_names = None;
+    }
+
+    /// Stage one held-out shard: read + split + count it (same path/pattern as the
+    /// training corpus), keeping its unique chunks + counts for `finalize_holdout`.
+    #[pyo3(signature = (name, iterator, buffer_size=8192, pattern=None))]
+    #[pyo3(text_signature = "(self, name, iterator, buffer_size=8192, pattern=None)")]
+    pub fn add_holdout_shard(
+        &mut self,
+        py: pyo3::Python<'_>,
+        name: String,
+        iterator: &pyo3::Bound<'_, pyo3::PyAny>,
+        buffer_size: usize,
+        pattern: Option<String>,
+    ) -> PyResult<()> {
+        let (words, counts) = self.ingest_corpus(py, iterator, pattern, buffer_size)?;
+        self.holdout_raw.push((name, words, counts));
+        Ok(())
+    }
+
+    /// Collapse the staged shards into the global-dedup form: one shared list of
+    /// distinct chunks across all shards + per-shard `(chunk_index, count)` lists,
+    /// so each candidate encodes every distinct chunk exactly once.
+    pub fn finalize_holdout(&mut self) {
+        let mut index: AHashMap<Vec<u32>, u32> = AHashMap::new();
+        let mut chunks: Vec<Word> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut shard_counts: Vec<Vec<(u32, i32)>> = Vec::new();
+        for (name, words, counts) in self.holdout_raw.drain(..) {
+            names.push(name);
+            let mut sc: Vec<(u32, i32)> = Vec::with_capacity(words.len());
+            for (w, c) in words.into_iter().zip(counts.into_iter()) {
+                let idx = match index.get(&w.ids) {
+                    Some(&i) => i,
+                    None => {
+                        let i = chunks.len() as u32;
+                        index.insert(w.ids.clone(), i);
+                        chunks.push(w);
+                        i
+                    }
+                };
+                sc.push((idx, c));
+            }
+            shard_counts.push(sc);
+        }
+        self.holdout_chunks = Some(chunks);
+        self.holdout_shard_counts = Some(shard_counts);
+        self.holdout_names = Some(names);
+    }
+
+    /// Held-out shard names, in the order `evaluate_many` returns per-shard metrics.
+    pub fn get_holdout_names(&self) -> Vec<String> {
+        self.holdout_names.clone().unwrap_or_default()
+    }
+
+    /// FUSED train + measure for MANY candidates in PARALLEL. For each candidate:
+    /// train the merge loop (cached training corpus), then measure against the
+    /// finalized held-out corpus + wordlist — all in Rust, GIL released, rayon
+    /// across candidates (`num_threads` caps the pool). Returns one
+    /// `(coverage_base, coverage_inflected, [(tokens, dead) per shard])` per
+    /// candidate (per-shard order = `get_holdout_names`). Bit-identical to the
+    /// Python `build_tok` + `measure` path, so callers can drop the per-candidate
+    /// tiktoken round-trip entirely. Requires `load_corpus`, `finalize_holdout`,
+    /// and `set_wordlist` first.
+    #[pyo3(signature = (vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None))]
+    #[pyo3(text_signature = "(self, vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None)")]
+    pub fn evaluate_many(
+        &self,
+        py: pyo3::Python<'_>,
+        vocab_size: u32,
+        blocked_pairs_batch: Vec<Vec<(String, String)>>,
+        num_threads: Option<usize>,
+        forced_pairs: Option<Vec<(String, String)>>,
+    ) -> PyResult<Vec<(usize, usize, Vec<(u64, usize)>)>> {
+        let words = self.cached_words.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
+        })?;
+        let counts = self.cached_counts.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
+        })?;
+        let chunks = self.holdout_chunks.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("no held-out; call finalize_holdout() first")
+        })?;
+        let shard_counts = self.holdout_shard_counts.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("no held-out; call finalize_holdout() first")
+        })?;
+        let wordlist = self.wordlist.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("no wordlist; call set_wordlist() first")
+        })?;
+
+        let run = || {
+            blocked_pairs_batch
+                .par_iter()
+                .map(|blocked| {
+                    // --- train ---
+                    let mut t = Tokenizer::new();
+                    t.train_core_incremental(
+                        words.clone(),
+                        counts.clone(),
+                        vocab_size,
+                        Some(blocked.clone()),
+                        forced_pairs.clone(),
+                    );
+                    let n_merge = 256 + t.merges.len();
+
+                    // --- coverage (whole-word vocab tokens) ---
+                    let token_bytes = build_token_bytes(&t.merges);
+                    let mut base = 0usize;
+                    let mut infl = 0usize;
+                    for b in token_bytes.iter().take(n_merge) {
+                        if let Ok(s) = std::str::from_utf8(b) {
+                            if let Some(rest) = s.strip_prefix(' ') {
+                                let w = rest.to_lowercase();
+                                if wordlist.contains(&w) {
+                                    base += 1;
+                                } else if is_inflected_word(&w, wordlist) {
+                                    infl += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    // --- compression + dead per shard (encode each chunk once) ---
+                    let encoded: Vec<Vec<u32>> =
+                        chunks.iter().map(|c| encode_word(&t.merges, &c.ids)).collect();
+                    let per_shard: Vec<(u64, usize)> = shard_counts
+                        .iter()
+                        .map(|sc| {
+                            let mut fired = vec![false; n_merge];
+                            let mut tokens: u64 = 0;
+                            for &(cidx, cnt) in sc {
+                                let ids = &encoded[cidx as usize];
+                                tokens += ids.len() as u64 * cnt as u64;
+                                for &id in ids {
+                                    fired[id as usize] = true;
+                                }
+                            }
+                            let dead = fired.iter().filter(|&&f| !f).count();
+                            (tokens, dead)
+                        })
+                        .collect();
+
+                    (base, infl, per_shard)
+                })
+                .collect::<Vec<_>>()
+        };
+        let results = py.allow_threads(|| match num_threads {
+            Some(p) => rayon::ThreadPoolBuilder::new()
+                .num_threads(p)
+                .build()
+                .expect("failed to build rayon pool")
+                .install(run),
+            None => run(),
+        });
+        Ok(results)
     }
 
     /// Return the regex pattern
@@ -918,7 +1291,7 @@ impl Tokenizer {
 }
 
 #[pymodule]
-fn rustbpe_force_merges(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn rustbpe_auto_tune(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_log::init(); // forwards Rust `log` to Python's `logging`
     m.add_class::<Tokenizer>()?;
     Ok(())

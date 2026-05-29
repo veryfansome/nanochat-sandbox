@@ -1,7 +1,10 @@
 """
-Per-pass metrics for the blocked_morphemes tokenizer (or any variant vs
-baseline). Run after each blocking pass to track whether the cascade is
-converging and whether firing mass is concentrating toward common tokens.
+Corpus-delta metrics for ANY tokenizer variant vs baseline, on a fixed
+held-out corpus. Generic — `--variant` takes any tokenizer dir. (Originally
+written for blocked_morphemes' blocking cascade, hence the convergence framing
+below: re-run after each curation pass to track whether the cascade converges
+and whether firing mass concentrates toward common tokens; the same four
+metrics read meaningfully for force/seed/manual variants too.)
 
 Reports, baseline vs variant, on a fixed held-out corpus (ClimbMix val):
 
@@ -23,7 +26,7 @@ word-start counts come from the same per-chunk encoding).
 
 Usage:
     uv run python -m tools.pass_metrics \\
-        --variant ~/.cache/nanochat-variants/blocked_morphemes/tokenizer
+        --variant ~/.cache/nanochat-variants/auto_tune/tokenizer
     # add --no-mangled to skip the (slower) mangled-token detection.
 """
 
@@ -67,6 +70,31 @@ def encode_corpus(tok, corpus) -> tuple[Counter, Counter, int]:
 def mergeable_vocab_size(tok) -> int:
     """Vocab size excluding special tokens (the dead-token denominator)."""
     return tok.get_vocab_size() - len(tok.get_special_tokens())
+
+
+def fire_counts(tok, corpus) -> Counter:
+    """Per-token firing counts over a corpus, via a single doc-level
+    encode_ordinary pass (tiktoken's Rust regex; no Python chunking). Fast."""
+    fire: Counter = Counter()
+    for docs in corpus:
+        for ids in tok.enc.encode_ordinary_batch(docs, num_threads=8):
+            fire.update(ids)
+    return fire
+
+
+def compute_fast_metrics(tok, corpus) -> dict:
+    """Fast corpus metrics: total_tokens (compression) + dead, from a single
+    doc-level encode_ordinary pass. Skips the Python regex chunking + word-start
+    tracking that dominate encode_corpus (~10x faster), at the cost of NOT
+    computing mangled (which needs word-start probs). total_tokens and dead are
+    identical to the full path (encode_ordinary is per-chunk internally). For
+    cheap held-out compression/dead vetting at scale."""
+    fire = fire_counts(tok, corpus)
+    n_merge = mergeable_vocab_size(tok)
+    return {
+        "total_tokens": sum(fire.values()),
+        "dead": sum(1 for tid in range(n_merge) if fire.get(tid, 0) == 0),
+    }
 
 
 def compute_metrics(tok, corpus, count_mangled: bool, bound_threshold: float):

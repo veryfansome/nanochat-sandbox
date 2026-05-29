@@ -81,7 +81,6 @@ def apply_patches():
         # bug that creates both an interior hole and an alias duplicate in
         # the same export could slip past a list-length check. Unique-id
         # count directly asserts the property downstream consumers need.
-        # See wrappers/tok_train_seed_tokens.py for the deeper discussion.
         ids = [v for _, v in mergeable_ranks_list]
         unique_ids = set(ids)
         n_unique = len(unique_ids)

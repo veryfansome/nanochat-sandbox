@@ -1,6 +1,6 @@
 # BPE-dropout (subword-segmentation regularization)
 
-Status: **design — not started.** Candidate training-dynamics lever for sample efficiency under fixed scale & data. Emerged from the `blocked_morphemes` tokenizer exploration (see [`../tokenizer-variants/README.md`](../tokenizer-variants/README.md) + STATUS.md) as a cleaner attack on the same target: undertrained subword atoms in a small model.
+Status: **design — not started.** Candidate training-dynamics lever for sample efficiency under fixed scale & data. Emerged from the `blocked_morphemes` tokenizer exploration (see [`../tokenizer-variants/README.md`](../tokenizer-variants/README.md) + STATUS.md) as a cleaner attack on the same target: undertrained subword atoms in a small model. (`blocked_morphemes` itself was removed 2026-06-05; its block-the-mangled-merge mechanism continues as the `auto_tune` variant. The conceptual comparisons below still hold — read `blocked_morphemes` as "the block-list approach.")
 
 Target repo: `nanochat` (Karpathy) — kept **pristine**, never edited.
 

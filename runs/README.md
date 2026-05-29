@@ -77,6 +77,20 @@ tmux new -d -s sr2 'until uv run --directory ~/sandbox python -c "import sys, wa
     USE_FP8=0 WINDOW_PATTERN=L DEVICE_BATCH_SIZE=4 OVERLAY=mtp   WANDB_RUN=d24_mtp   bash runs/speedrun.sh 2>&1 | tee runs/d24_mtp.log'
 ```
 
+**Tokenizer-variant arm** (`auto_tune`, `force_merges`): these swap the *tokenizer*, not the model — there is **no `train_<variant>` module**, so `OVERLAY` stays **empty** and the variant enters via a pre-built tokenizer at `$VBASE/tokenizer/`. Run it in its own base dir so it doesn't clobber the baseline tokenizer, and **let speedrun download data + eval_bundle into `$VBASE` itself** — do NOT pre-symlink them to the main cache on a fresh host (see the dangling-symlink lesson below):
+
+```bash
+# get the tokenizer into $VBASE/tokenizer/ first: either bake on the host
+#   ( wrappers.tok_train_<variant>, which also sets up the data symlink safely ),
+#   or rsync a locally-baked tokenizer dir up (md5-verify after).
+VBASE=$HOME/.cache/nanochat-variants/<variant>
+tmux new -d -s sr "set -o pipefail; cd ~/sandbox && export PATH=\$HOME/.local/bin:\$PATH && \
+  NANOCHAT_BASE_DIR=$VBASE USE_FP8=0 WINDOW_PATTERN=L DEVICE_BATCH_SIZE=8 \
+    MODEL_TAG=d24_<variant> WANDB_RUN=d24_<variant> bash runs/speedrun.sh 2>&1 | tee runs/d24_<variant>.log" && tmux attach -t sr
+```
+
+The tokenizer is the only thing that must be in `$VBASE` ahead of time; the run self-provisions everything else. (Pinning the block/merge list into the variant's `pairs.py` + committing is the cleaner alternative to rsyncing a baked tokenizer — then the host bake is reproducible from code. See `rustbpe_variants/<variant>/README.md`.)
+
 ## Cost expectations
 
 One d24 base-only speedrun (`USE_SFT=0`). Trio = baseline + zloss + mtp sequential. Per-run hours include `base_train` + `base_eval` (CORE on full per-task budget takes ~45 min on 8xA100). Trio cost includes ~$18 recurring overhead (bootstrap + inspection). Probe with a single run first; prices fluctuate.
@@ -95,6 +109,8 @@ One d24 base-only speedrun (`USE_SFT=0`). Trio = baseline + zloss + mtp sequenti
 ## Operational lessons
 
 - **wandb auth must be on the host before training.** A `wandb.init()` failure 5 min in wastes bootstrap + tokenizer cost. `lambda.sh bootstrap` hard-fails if `WANDB_API_KEY` isn't set locally; pass `SKIP_WANDB=1` if you'll `wandb login` manually on the host.
+
+- **A fresh instance has NO training data until a run downloads it.** A just-bootstrapped host holds only `sandbox/` (rsync'd) + anything you pushed; the 170 shards and `eval_bundle` are fetched on first run. Result/checkpoint archives from past runs (`results/d24_*`, wandb) live elsewhere — your local machine or the cloud — and do **not** mean the dataset is present on *this* host. So don't assume a variant's separate base dir can borrow data from `~/.cache/nanochat`: on a fresh host that cache is empty. Concrete failure mode: a tokenizer-variant arm run in its own `NANOCHAT_BASE_DIR=$VBASE` with `$VBASE/base_data_climbmix` symlinked to `~/.cache/nanochat/base_data_climbmix` — but that target doesn't exist on a fresh host, so the symlink dangles and `nanochat.dataset`'s `os.makedirs(DATA_DIR, exist_ok=True)` throws `FileExistsError` (`makedirs` tolerates a symlink only if it resolves to a real dir; for a dangling link `os.path.isdir()` is False, so `exist_ok=True` re-raises). **Rule:** for a standalone variant arm, don't pre-symlink data/eval_bundle — let the run download them into `$VBASE`. Only symlink after a prior arm on the *same host* populated `~/.cache/nanochat`, and guard it the way `setup_variant_base` does (`os.path.exists(src) and not os.path.lexists(dst)`), never a bare `ln -sfn` to a maybe-missing target.
 
 - **OOM diagnosis: batch size first, then look for bugs.** Most OOMs we've hit have been the memory ceiling — `DEVICE_BATCH_SIZE=16` is for H100 80GB, 8 fits 40GB HBM at baseline, `mtp` at k=3 needs 4 on 40GB. Halving roughly doubles grad-accum but only adds ~12% wall-clock (sub-linear, not 2×). But OOM can also come from overlay code (tensors retained across iterations, autograd Function reference leaks, KV cache growth) or upstream changes that altered the activation graph. If halving doesn't fit and you've added overlay code recently, skim recent diffs before re-launching on bigger hardware.
 

@@ -32,7 +32,7 @@ Notes from a literature exploration on 2026-05-28 covering four papers on tokeni
 
 **Critical disconnect from production BPE**: The objective they prove the bound for is *compression utility* (symbols eliminated). Real BPE picks merges by *per-step pair frequency*, which is a different (myopic) objective. The paper assumes they align via submodularity but doesn't prove the practical gap matters.
 
-**Relevance to our project**: Sets a theoretical floor for "how much could you beat greedy BPE on compression." Floor is ~0.37–0.52 — i.e., greedy is guaranteed to achieve at least 37–52% of optimal compression utility in the worst case (so worst-case optimal could be up to ~2.7× greedy at the 0.37 bound, ~2.3× at the 0.43 bound). The bound is over total compression of a length-M merge sequence, not per-step. The actual practical greedy-vs-optimal gap on real corpora is unmeasured at scale. **But** they make no claim about downstream LM quality, only compression. Useful as a "yes greedy is provably suboptimal in this specific sense" reference; less useful for picking a next experiment.
+**Relevance to our project**: Sets a theoretical floor for "how much could you beat greedy BPE on compression." Floor is ~0.37–0.52 — i.e., greedy is guaranteed to achieve at least 37–52% of optimal compression utility in the worst case (the bound implies a worst-case *ceiling* of ~2.3–2.7× greedy, but that's bound-implied, not an observed or achievable gap). The bound is over total compression of a length-M merge sequence, not per-step. The actual practical greedy-vs-optimal gap on real corpora is unmeasured at scale. **But** they make no claim about downstream LM quality, only compression. Useful as a "yes greedy is provably suboptimal in this specific sense" reference; less useful for picking a next experiment.
 
 ## 2. Schmidt et al. 2024 — PathPiece / *Tokenization Is More Than Compression*
 
@@ -100,15 +100,7 @@ Notes from a literature exploration on 2026-05-28 covering four papers on tokeni
 - No formal proof of approximation guarantee (empirical ≈0.9(1−1/e)).
 - Memory cost: 160GB RAM for the largest run (14.3M words → 251M candidate substrings).
 
-**Code review** (from `github.com/PreferredAI/pcatt` — repo uses "GreedTok" / `GreedyPCOTokenizer`):
-- `pcatt/max_cover.cpp` (the original / reference impl) has a likely **index-mixing bug** in `get_score_helper` — `start = ws + i < prev_end ? prev_end : i` mixes absolute (`prev_end`) and substring-relative (`i`) indices, then uses `T_arr[ws + k]`. Unclear if the paper's reported numbers came from this file; production library (`pco_tokenizer.cpp`) doesn't have the bug.
-- The production library's **`candidate_tokens` constructor parameter appears non-functional** — `initialize_graph` enumerates all substrings from `word_counts` and never filters against `candidate_tokens`. So pre-filtering the candidate set via the public API doesn't work; you'd have to fork the C++ to do that.
-- **Lazy-greedy** is used in `pco_tokenizer.cpp` for efficiency (heap-based, CELF-style), but the paper proves the objective is non-submodular. The lazy-greedy correctness guarantee requires submodularity. The library has no exhaustive-greedy fallback to compare against. May silently diverge from naive-greedy on adversarial inputs.
-- No **substring-level frequency pruning**. Every substring of length ≥2 in every word is materialized. The only filters are `max_token_length` and `min_word_count` (word-level). At the scale of their 14.3M-word run, this drives the 160GB RAM cost; substring-level frequency filtering would cut memory by 10×+ for negligible quality loss.
-- `SubstringPos` is a 32-byte struct (two `long unsigned` + two `unsigned int` with padding). 251M of them = 8 GB just for position records. Could be packed to 8 bytes ((u32, u8, u8) tuple in a flat array) with no loss of fidelity.
-- Persisted state via pickle only stores `word_counts` and `candidate_tokens`; not heap, T_arr, D_arr, or `ranks`. Resuming a partial training to a larger vocab requires restart from scratch.
-
-**Reproducibility gap**: paper text doesn't specify the exact `max_token_length` and `min_word_count` used per experiment. Default in the README example is `max_token_length=5, min_word_count=1`, but actual paper experiments must use larger values (since longer tokens appear in published vocabs). Notebooks (`eval_hf.ipynb`, `eval_notebook.ipynb`) likely contain the values; we haven't extracted them.
+**Code review** (`github.com/PreferredAI/pcatt`, spot-checked — **not pursued**, kept as caveats): a likely index-mixing bug in the reference `max_cover.cpp` (`get_score_helper`; the production `pco_tokenizer.cpp` is clean); the production lib's `candidate_tokens` filter appears **non-functional** (all substrings are materialized regardless, so candidate-set pre-filtering needs a C++ fork); and lazy-greedy is used despite the objective being non-submodular (no exhaustive-greedy fallback to check divergence). The practical blocker is memory — no substring-level frequency pruning drives the 160GB-RAM run. The paper also under-specifies `max_token_length` / `min_word_count` per experiment (defaults are too small to reproduce the published vocabs).
 
 **Relevance to our project**:
 - Closest paper to the "learn a non-greedy construction" pivot we considered.
@@ -160,13 +152,13 @@ Notes from a literature exploration on 2026-05-28 covering four papers on tokeni
 
 **On compression vs downstream**:
 
-PathPiece is the load-bearing paper here. At 350M / 200B tokens (closest scale to nanochat d24), they find compression weakly predicts downstream (Pearson 0.241). At 32K vocab the top-5 tokenizers span ~0.9pp (49.2 → 48.3) and the top-6 spans ~1.3pp (49.2 → 47.9), with all six statistically indistinguishable (pairwise p > 0.05 within the top-5; rank-6 SaGe-BPE at p ≈ 0.047). **Conclusion**: compression delta alone shouldn't drive tokenizer selection at our scale.
+PathPiece is the load-bearing paper here. At 350M / 200B tokens (closest scale to nanochat d24), they find compression weakly predicts downstream (Pearson 0.241), and the top tokenizers at 32K vocab span ~0.9pp (49.2 → 48.3) yet are statistically indistinguishable (top-6 all pairwise p > 0.05; see §2). **Conclusion**: compression delta alone shouldn't drive tokenizer selection at our scale. (These are imported priors from a different architecture + optimizer — unverified in our setup; they gate which experiments are worth a GPU A/B, not the selection itself.)
 
 Zouhar and GreedTok both focus on the compression objective. Zouhar proves greedy BPE is suboptimal *at compression*; GreedTok reports +2.88% compression vs BPE and a modest downstream gain at 1B params (+1.2pp benchmark average accuracy, GTET 63.2 vs BPEM 62.0). PathPiece's framing predicts the compression delta would weakly transfer to downstream — and GreedTok's modest downstream gain is consistent with that prediction.
 
 **On segmentation-side vs construction-side**:
 
-PathPiece's data shows the **inference algorithm matters as much as the vocab constructor** at fixed vocab. Native merge replay (BPE+Merge) is competitive; PathPieceL shortest-path on a BPE vocab is *worse* (overall rank 13 vs BPE+Greedy's rank 4 and BPE+Merge's rank 3; pairwise p ≈ 4.4e-5 against rank 3 and 8.8e-6 against rank 4, per the paper's Appendix E.1). Train-It contradicts this on a different setup (left-to-right greedy on Qwen-2 BPE-vocab beats merge replay by 4.9pp on MMLU).
+PathPiece's data shows the **inference algorithm matters as much as the vocab constructor** at fixed vocab. Native merge replay (BPE+Merge) is competitive; PathPieceL shortest-path on a BPE vocab is *worse* (overall rank 13 vs BPE+Greedy's rank 4 and BPE+Merge's rank 3; pairwise p ≈ 4.4e-5 against rank 3 and 8.8e-6 against rank 4, per the paper's Appendix E.1). Train-It appears to cut the other way on a different setup (left-to-right greedy on Qwen-2 BPE-vocab beats merge replay by 4.9pp on MMLU).
 
 The reconciliation: PathPiece evaluates **train-from-scratch** with each segmentation; Train-It evaluates **post-hoc swap on a pretrained model**. Different experimental designs measure different things. For our nanochat d24 use case (train from scratch), PathPiece is the more relevant precedent — and it suggests native BPE inference is hard to beat by changing segmentation alone.
 
@@ -183,11 +175,10 @@ UnigramTrainer's `max_piece_length` (default 16) demonstrably truncates competit
 | Zouhar (toy theory) | None — no LM | Low |
 | Train-It pretrained-7B / post-hoc swap | Low — different experimental design | Low |
 
-## Recommended next reads (not done today)
+## Recommended next reads (not read — backlog)
 
-- **SuperBPE** ([2503.13423](https://arxiv.org/html/2503.13423v1)) — relaxes whitespace pre-tokenization. Directly adjacent to our `force_merges` work.
-- **BlockBPE** ([2507.11941](https://arxiv.org/html/2507.11941v1)) — parallel BPE inference; could be relevant if inference becomes a bottleneck.
-- **MANTa** ([2212.07284](https://arxiv.org/abs/2212.07284)) — differentiable / gradient-based tokenization. Earliest example of fully-learned tokenization at LM-scale.
-- **Charformer / GBST** ([2106.12672](https://arxiv.org/abs/2106.12672)) — earlier learned-tokenization work, byte-level.
-- **Frequency-Ordered Tokenization** ([2602.22958](https://arxiv.org/html/2602.22958)) — claimed by search summaries to improve compression; not validated.
-- **"Greed is All You Need"** ([2403.01289](https://arxiv.org/html/2403.01289v1)) — evaluation of tokenizer inference methods; would complement PathPiece's findings.
+- **SuperBPE** ([2503.13423](https://arxiv.org/html/2503.13423v1)) — relaxes whitespace pre-tokenization; most adjacent to our `force_merges` work.
+- **"Greed is All You Need"** ([2403.01289](https://arxiv.org/html/2403.01289v1)) — evaluation of tokenizer inference methods; complements PathPiece.
+- Lower priority: **MANTa** ([2212.07284](https://arxiv.org/abs/2212.07284)) and **Charformer / GBST** ([2106.12672](https://arxiv.org/abs/2106.12672)) — learned / byte-level tokenization; **BlockBPE** ([2507.11941](https://arxiv.org/html/2507.11941v1)) — parallel BPE inference, only if inference becomes a bottleneck.
+
+(Dropped a search-summary-only "Frequency-Ordered Tokenization" hit — unvalidated, arXiv id unconfirmed.)

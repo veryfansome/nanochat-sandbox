@@ -14,7 +14,7 @@ Working state of the project — implementation progress, current focus, sequenc
 | [Online data selection + batch-size tuning](ideas/online-data-selection/README.md) | ✓ | — | — | — |
 | [Adaptive sequence length / batch size](ideas/adaptive-schedule/README.md) | ✓ | — | — | — |
 | [Layer-wise LR / staged maturation](ideas/layerwise-lr/README.md) | ✓ | — | — | — |
-| [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | partial — `tools/eval_tokenizer.py` harness done; pristine `sandbox/rustbpe/` vendored; three variants ported (`space_digits` [Py-only], `force_merges` [Rust, data-driven curated 2026-05-25, re-curated 2026-05-26 with corrected shadow rule], `seed_tokens` [Python overlay, **redesigned 2026-05-26**: within-chunk composition mining + mid-rank insertion; K=1,750 canonical]) | ✓ all three (smoke_tok_train_{space_digits,force_merges,seed_tokens}) | **✓ d24/8xA100 — `force_merges` real positive: CORE +5.81%, val/bpb tied (slight edge), ChatCORE +0.62%** (Lambda result on the 2026-05-25 canonical; in-tree canonical promoted 2026-05-26, Lambda-pending); **`seed_tokens` offline positive: −0.63% ClimbMix val tokens** at +5.3% vocab — magnitude too small to predict a clear CORE win, not queued for standalone Lambda |
+| [Tokenizer variants](ideas/tokenizer-variants/README.md) | ✓ | `tools/eval_tokenizer.py` harness + pristine `sandbox/rustbpe/` vendored. **Two live variants, each its own crate:** `force_merges` (data-driven curated, adopted default) and `auto_tune` (`rustbpe_auto_tune`; blocking-only under the pristine regex + corpus-cached held-out-Pareto block-list audit — **fixpoint converged (r194, 129 blocked pairs); d24 A/B: CORE +5.59%, val/bpb tied (single seed, borderline)**). Earlier probes (`space_digits`, `seed_tokens`, `blocked_morphemes`, `manual_merges`, `unigram`) removed 2026-06-05 as dead directions — findings retained in the sections below + git history. | ✓ (smoke_tok_train_{force_merges,auto_tune}) | **✓ d24/8xA100 — `force_merges` real positive: CORE +5.81%, val/bpb tied (slight edge), ChatCORE +0.62%; `auto_tune` r194: CORE +5.59%, val/bpb tied — single seed, sign-test p≈0.095, needs 2nd seed**; `seed_tokens` was offline-only (−0.63% ClimbMix val tokens at +5.3% vocab; too small to queue for Lambda), since removed |
 | [Non-backprop (DFA → block-local)](ideas/non-backprop/README.md) | ✓ (research track) | — | — | — |
 
 ## d24 trio results (8xA100 40GB, ~$337 wall-clock)
@@ -38,7 +38,9 @@ Sequential trio on a single Lambda instance; baseline included SFT (subsequently
 
 - **MTP at our k=3, α=0.3, shared-unembedding config is a net loss at d24.** val/bpb regression got *worse* at scale (+4.17% at d6 → +8.78% at d24), not better as Gloeckle et al. predict. CORE "+3.25%" is essentially one task (boolq +0.111; excluding it, mean Δ across 21 tasks is +0.003 — pure noise). Sign test p ≈ 0.19, not significant. Compute cost +12%. Three rescue paths exist (α=0.1 + k=1 single-aux-head, DeepSeek-MTP architecture, scale to d30+) but none are next-up.
 
-- **`force_merges` (data-driven curated tokenizer) is a real positive result and is adopted.** Lambda speedrun (2026-05-25 canonical, 104 forced merges at vocab=32768): CORE **+5.81%** (15W / 6L / 1T across 22 tasks, sign-test p ≈ 0.039), val/bpb tied with a slight persistent edge, ChatCORE **+0.62%** post-SFT, zero compute cost. Caveat: 83% of the CORE delta is from boolq (excluding it, mean Δ = +0.0026 across 21 tasks). Unlike MTP, val/bpb is favorable and the sign test is significant, so this isn't a single-task fluke. **In-tree canonical promoted 2026-05-26** to a re-curated 122-pair list at vocab=32788 (fixes two `detect_shadows` bugs; locally Tier-1 parity + 0.42% better real-corpus compression vs the speedrun version); Lambda-pending. Full details in §d24 force_merges results + §force_merges curation details below.
+- **`force_merges` (data-driven curated tokenizer) is a real positive result and is adopted.** CORE +5.81% / val/bpb tied (slight persistent edge) / ChatCORE +0.62%, zero compute cost. Unlike MTP, the sign test is significant (p ≈ 0.039) and val/bpb is favorable, so it isn't a single-task fluke despite boolq carrying 83% of the CORE delta. Full breakdown, and the 2026-05-25 speedrun (104 pairs @ 32768) vs in-tree (122 pairs @ 32788, Lambda-pending) canonical distinction, in §d24 force_merges results + §force_merges curation details below.
+
+- **`auto_tune` (held-out-Pareto block-list tokenizer, r194) is a strong-but-borderline positive on a single-seed d24 A/B.** CORE +5.59% / val/bpb tied (slight persistent edge −0.0002) / zero compute cost, against the *same* baseline as force_merges and nearly matching it (+5.81%) — while keeping the **pristine** regex (0/48706 boundary-crossing ⇒ bpb exactly comparable, no prefix caveat). The catch vs force_merges: the sign test is **not** significant (14/7/1, p ≈ 0.095) and ~79% of the CORE delta is boolq + agi_lsat. A second seed is the cheap next step before adopt/reject. Full breakdown in §d24 auto_tune results below.
 
 ### Eval-path bug in zloss (now fixed)
 
@@ -81,6 +83,25 @@ Single-instance run on 2026-05-26 with the **2026-05-25 canonical** (87 mined FO
 
 Reproduce: `uv run python -m tools.compare_runs d24_baseline force_merges`
 
+## d24 auto_tune (r194) results (8xA100 40GB, base-only single run, ~5.5 h)
+
+Single-instance run 2026-06-14 with the **r194 block list** (129 mangled stem+suffix pairs from the held-out-Pareto fixpoint; vocab=32768 — **no** bump, pristine `SPLIT_PATTERN`). Same nanochat commit (`dc54a1a`), seed, depth=24, and hardware envvars (USE_FP8=0, WINDOW_PATTERN=L, DEVICE_BATCH_SIZE=8) as **the same baseline** (`d24_baseline`, CORE 0.250488) that force_merges used — so the two tokenizer variants are directly comparable. Differs from baseline in exactly one thing: the tokenizer (USE_SFT=0, base-model only — no ChatCORE this run).
+
+| | baseline (`d24_baseline`) | auto_tune r194 (`d24_autotune_r194`) | Δ |
+|---|---:|---:|---:|
+| val/bpb (final) | 0.7161 | 0.7159 | **−0.0002** (slight edge, persistent) |
+| **CORE (`base_eval`, full)** | 0.250488 | **0.2645** | **+0.0140 (+5.59%)** |
+| compute | — | — | tied — vocab=32768 (no bump) ⇒ byte-identical model, zero throughput cost |
+| LM boundary-crossing % | — | **0.0% (0/48706)** | pristine regex ⇒ bpb is exactly prefix-comparable (no caveat, unlike force_merges' 0.82%) |
+
+**Headline (+5.59% CORE, bpb tied) nearly matches force_merges (+5.81%)** — two independent tokenizer interventions, same shape (CORE up, bpb flat: the win is downstream-task, not per-byte prediction). **But the significance is weaker than force_merges and should be stated plainly:**
+- **Sign test**: 14 wins / 7 losses / 1 tie → p ≈ **0.095** — *not* significant at 0.05 (force_merges was 0.039).
+- **Concentration**: boolq carries **49%** of the CORE delta, agi_eval_lsat_ar (small-N LSAT) another ~30% — ~79% from two noisy tasks. Excluding boolq, mean centered Δ over 21 tasks is **+0.0003** (~the same small residual as force_merges).
+- **Direction is right on the robust high-N tasks** (all small but positive: arc_challenge, piqa, winograd, arc_easy, hellaswag_zeroshot, lambada, winogrande); the main loss is copa −0.05 (100-example, noise-scale).
+- **Single seed.** A second seed is the cheap next step to move this from "strong-but-borderline" to adopt/reject. Worth the confirmation: the persistent bpb edge + pristine-regex cleanliness + the headline matching force_merges all point positive.
+
+Reproduce: `uv run python -m tools.compare_runs d24_baseline d24_autotune_r194`
+
 ## Suggested sequencing (updated post-d24)
 
 1. **z-loss and `force_merges` are both adopted — stack them as the default for future speedruns.** No model-side interaction (z-loss is a loss-term overlay, force_merges is a tokenizer artifact), both are essentially-free wins (~zero compute cost), so the next default speedrun runs `OVERLAY=zloss` *with* the canonical `force_merges` tokenizer in place. Single open question worth ablating: turn off the existing logit-softcap (`gpt.py:472`) with z-loss on; the hard cap may now be unnecessary. Cheap d24 ablation, ~$100.
@@ -92,14 +113,37 @@ Reproduce: `uv run python -m tools.compare_runs d24_baseline force_merges`
 
 MTP rescue probes (α=0.1+k=1 first) only happen if a follow-up idea raises a specific question that an MTP variant can answer. Don't revisit MTP for its own sake at d24.
 
-**[Tokenizer variants](ideas/tokenizer-variants/README.md)** is a **parallel track**. Infrastructure is now end-to-end ready: `tools/eval_tokenizer.py` harness validated; pristine rustbpe vendored at `sandbox/rustbpe/` (Karpathy@9467d83) with `runs/build_rustbpe.sh` for local builds; parallel-crate variants pattern in `sandbox/rustbpe_variants/`. **Three variants ported** from `veryfansome/nanochat` prior art:
+**[Tokenizer variants](ideas/tokenizer-variants/README.md)** is a **parallel track**. Infrastructure is now end-to-end ready: `tools/eval_tokenizer.py` harness validated; pristine rustbpe vendored at `sandbox/rustbpe/` (Karpathy@9467d83) with `runs/build_rustbpe.sh` for local builds; parallel-crate variants pattern in `sandbox/rustbpe_variants/`.
 
-- **`space_digits`** (Python-only) — adds optional leading space before the digit clause in `SPLIT_PATTERN`. Wrapper: `wrappers/tok_train_space_digits.py`. Smoke: `wrappers/smoke_tok_train_space_digits.py`. Uses PyPI rustbpe; no Rust build needed. (Note: the `?` leading-space tweak is also folded into `force_merges`'s `SPLIT_PATTERN`, so running both is redundant.)
-- **`force_merges`** (Rust, **adopted 2026-05-26**) — forced cross-boundary common-phrase merges (` of the`, `, and`, etc.) via regex carve-out. Crate: `rustbpe_variants/force_merges/` (`rustbpe_force_merges` module); canonical pair list at `pairs.py` (105 mined FORCED + 15 mined DERIVED + 2 numeric DERIVED = 122, vocab=32788). Build: `VARIANT=force_merges bash runs/build_rustbpe.sh`. On a 15M-char climbmix sample: **−6.9% total tokens vs baseline** (3.27M → 3.05M), trading ~245 rare-content BPE merges for high-frequency phrasal merges. Lambda speedrun result (on the prior 2026-05-25 canonical of 104 pairs): **CORE +5.81%, val/bpb tied, ChatCORE +0.62%** ($115.76, see §d24 force_merges results). Construction provenance + per-pair attribution + vocab-cost mechanism + reusable infrastructure detailed in the `force_merges curation details` subsection below.
-- **`seed_tokens`** (Python overlay, **redesigned 2026-05-26**) — data-driven seed merges inserted at their natural-firing rank in `mergeable_ranks` (rank `max(id_L, id_R) + 1`, where the merge would have minted mid-BPE-training). Two mining iterations tested: morpheme-mining (failed, net-negative) and within-chunk adjacent-token-pair mining from baseline output (succeeded, K=1,750 canonical at vocab=34,518 → **−0.63% ClimbMix val tokens** vs baseline). The win is small in magnitude and the predicted CORE delta sits below the per-task noise floor at d24; preserved but not queued for Lambda alone. See §seed_tokens redesign for the full empirical arc and takeaways.
-- **`case_marker`** (designed only, not yet implemented) — lossless casing collapse via input preprocessing: cased words → `<|cap|>` / `<|allcaps|>` marker tokens + lowercased base. Pure-Python (~200-300 LOC); no Rust work. Orthogonal to all merge-producer variants. Catalog entry: `ideas/tokenizer-variants/README.md` variant 13. Now de-gated since `force_merges` validated the data-driven methodology — pursue as a parallel lossless-compression source.
+**Evaluating a (re)trained tokenizer variant** — the standard offline loop, all `vs baseline` (`~/.cache/nanochat/tokenizer`):
 
-`force_merges` is adopted as the new default tokenizer. `seed_tokens` (the K=1,750 composition canonical) is offline-positive vs baseline (−0.63%) but the magnitude is too small to predict a clear CORE win at d24 — preserved as a reproducible artifact but not queued for a standalone Lambda run. `space_digits` is functionally subsumed by `force_merges` (the `?\p{N}{1,2}` tweak is folded in).
+```bash
+# 0. smoke, then (re)train → ~/.cache/nanochat-variants/<variant>/tokenizer/
+uv run python -m wrappers.smoke_tok_train_<variant>
+uv run python -m wrappers.tok_train_<variant>
+
+# 1. Tier-1 filter: compression battery, structural round-trips, task probes
+uv run python -m tools.eval_tokenizer \
+    --tokenizers ours,~/.cache/nanochat-variants/<variant>/tokenizer
+
+# 2. corpus deltas vs baseline: compression, dead/mangled tokens, firing-rank buckets
+uv run python -m tools.pass_metrics \
+    --variant ~/.cache/nanochat-variants/<variant>/tokenizer
+
+# 3. inspect the vocab (rank, corpus firing count, byte_len, repr) — throwaway dump
+uv run python -m tools.dump_vocab \
+    --tokenizer ~/.cache/nanochat-variants/<variant>/tokenizer \
+    --output /tmp/<variant>_vocab.txt
+```
+
+These are **offline filters** — they do NOT predict CORE/SFT gain (see `ideas/tokenizer-variants/README.md` "Methodological problem encountered"). A favorable read gates a GPU A/B, it doesn't replace one.
+
+**Live variants** (each its own crate; see [`rustbpe_variants/README.md`](rustbpe_variants/README.md)):
+
+- **`force_merges`** (Rust, **adopted default**) — forced cross-boundary common-phrase merges (` of the`, `, and`, etc.) via regex carve-out. Crate: `rustbpe_variants/force_merges/` (`rustbpe_force_merges` module); canonical pair list at `pairs.py` (105 mined FORCED + 15 mined DERIVED + 2 numeric DERIVED = 122, vocab=32788). Build: `VARIANT=force_merges RELEASE=1 bash runs/build_rustbpe.sh`. On a 15M-char climbmix sample: **−6.9% total tokens vs baseline** (3.27M → 3.05M). Lambda speedrun (2026-05-25 canonical): **CORE +5.81%, val/bpb tied, ChatCORE +0.62%** ($115.76, see §d24 force_merges results). Construction provenance + per-pair attribution + vocab-cost mechanism in the `force_merges curation details` subsection below. (Its ablation tooling — `tools/ablate_*`, `wrappers/tok_train_force_merges_mined_*` — was removed 2026-06-05; the result + `pairs.py` are kept, tooling recoverable from git.)
+- **`auto_tune`** (Rust crate `rustbpe_auto_tune`, **fixpoint converged r194 → 129 blocked pairs; d24 A/B CORE +5.59%, single seed — see §d24 auto_tune results**) — blocking-only under the **pristine** `SPLIT_PATTERN` (no forced merges, no vocab bump); curated `BLOCKED_PAIRS` of mangled stem+suffix merges in `rustbpe_variants/auto_tune/pairs.py`. Forked from `force_merges` + `load_corpus`/`train_from_cached` so the block-list audit trains many block-lists over one cached corpus (~30s/candidate vs ~174s). Driver: `tools/heldout_fixpoint_cached.py` (held-out-Pareto greedy fixpoint). Wrapper: `wrappers/tok_train_auto_tune.py`. See [`rustbpe_variants/auto_tune/`](rustbpe_variants/auto_tune/) and its `audit/`.
+
+**Removed 2026-06-05** (dead research directions; findings retained here + in git history): `space_digits` (leading-space-before-digits regex tweak — subsumed by force_merges' `SPLIT_PATTERN`); `seed_tokens` (within-chunk composition seeds at mid-rank — offline-positive −0.63% val tokens but below the d24 noise floor; see §seed_tokens redesign); `blocked_morphemes` (the `blocked_pairs=` mangled-merge cascade — precursor to auto_tune's mechanism); `manual_merges` (composite blocking + hand-written merges); `unigram` (Unigram-LM-vs-BPE comparison track).
 
 The [non-backprop LLM](ideas/non-backprop/README.md) is a **separate research track**, not part of this capability-tuning sequence. Pursue independently.
 
@@ -139,7 +183,7 @@ Replaced a ~70-pair hand-picked list (lifted from `veryfansome/nanochat@force_me
 
    **+20 vocab is the smallest bump that recovers all 4 known borderline merges**. Cost: ~10K params at d24 (~0.001% of model size, well below numerical noise). Beyond +20, returns diminish sharply (only 0.01% additional corpus compression per +20 vocab). Even at +80, 8 specific canonical tokens (the `(' of the', ' most')`-family carve-outs from the prior curation) never come back — they were demoted past K=15 in the re-mined ranking and aren't recoverable just by adding vocab. This is a *vocab-content swap*, not pure addition.
 
-   An earlier "2× vocab cost per forced pair" heuristic extrapolated from a single v5 data point overpredicts: actual cost in this regime is ~0.57 vocab slots per forced pair, not 2. Replicate before treating as a general rule.
+   An earlier "2× vocab cost per forced pair" heuristic (extrapolated from a single v5 data point) is the wrong model entirely: forced pairs mostly reuse existing ids (`apply_forced_merges_at_end`), so there is no per-pair vocab price — the +20 bracket is set by merge *displacement* (the swap above), not by pair count. Don't treat any "slots per pair" figure as a rule.
 
 8. **Promoted 2026-05-26**: re-curated list (105 mined FORCED + 15 mined DERIVED + 2 numeric DERIVED = 122 forced merges at vocab=32788) is the in-tree canonical. The Lambda speedrun result above used the 2026-05-25 canonical; whether the local +0.42% real-corpus gain translates to a CORE/val_bpb improvement at d24 scale is the open question — the next default speedrun (`zloss + force_merges` stacked) will tell us.
 
@@ -161,23 +205,13 @@ Steps 1–5 above describe the methodology, applied first to the 2026-05-25 mini
 - **Ablate-driver caches** are keyed by an 8-char hash of all tokenizer-defining inputs (mining artifact + subset module + `pairs.py` + wrapper + `src/lib.rs` + upstream `nanochat` HEAD). Any edit invalidates automatically; `--force` bypasses for `.so`-rebuilt-outside-tree edge cases. Implemented in `tools/_ablate_common.py` (shared by both ablate drivers).
 - **Pre-shadow-fix tokenizer preserved** at `~/.cache/nanochat-variants/force_merges_pre_shadow_fix_104pairs/tokenizer/` — the exact tokenizer used in speedrun `7aesostl`. The matching mining output is `mined/forced_pairs_climbmix_20rg_twopass_pre_shadow_fix.py`.
 
-#### Reusable infrastructure
+#### Curation infrastructure (removed 2026-06-05)
 
-- `tools/mine_forced_pairs.py` — corpus miner; continuation-whitelist filter (closed-class-leaning LHS/RHS sets), single-pass + `--two-pass`, shadow detection. Outputs `pairs.py`-compatible artifacts.
-- `tools/ablate_mined.py` (env `MINED_TOP_K`) — cumulative ablation over the FORCED list.
-- `tools/ablate_derived.py` (env `DERIVED_TOP_K`) — cumulative ablation over the DERIVED list.
-- `wrappers/tok_train_force_merges_mined_{forced_subset,derived_subset,ablate}.py` + matching `pairs_mined_*.py` modules — FORCED / DERIVED / arbitrary-`INCLUDE_INDICES` subset trainers invoked by the ablation drivers.
-- Per-K eval JSONs at `results/{mined,derived}_ablation/`.
-- Mining artifacts at `rustbpe_variants/force_merges/mined/`.
-
-Re-curation workflow (when corpus or curation rule changes):
-1. **Re-mine** (`tools/mine_forced_pairs.py --two-pass` with canonical defaults) → updates `rustbpe_variants/force_merges/mined/`.
-2. **Re-ablate** (`tools/ablate_derived.py`) → find the new K cutoff.
-3. **Paste** new mined tuples into `_MINED_FORCED` / `_MINED_DERIVED` literals in `pairs.py`.
-4. **Re-validate** the `_NUMERIC_DERIVED` hand-adds against the new corpus + probe battery — the current ones (`("00","0")`, `(",","000")`) were added to recover the `currency` probe; a different corpus may need different (or no) numeric concats.
-5. **Re-bracket vocab** if the new pair set is significantly larger — `RECOMMENDED_VOCAB_SIZE` in `pairs.py` is currently +20 (~0.001% params at d24), bracketed for 122 pairs.
+force_merges is frozen as a kept result, so its mining + ablation tooling was removed (recoverable from git): `tools/mine_forced_pairs.py` (corpus miner, continuation-whitelist filter, two-pass + shadow detection), `tools/ablate_{mined,derived}.py` (cumulative FORCED/DERIVED ablation), `tools/_ablate_common.py`, and `wrappers/tok_train_force_merges_mined_{forced_subset,derived_subset,ablate}.py` (subset trainers). The kept artifacts remain: `rustbpe_variants/force_merges/pairs.py`, the `pairs_mined_*.py` modules, mining outputs under `force_merges/mined/`, and per-K eval JSONs at `results/{mined,derived}_ablation/`. To re-curate (re-mine → re-ablate for the K cutoff → paste tuples into `pairs.py`'s `_MINED_FORCED`/`_MINED_DERIVED` → re-validate the `_NUMERIC_DERIVED` hand-adds against the probe battery → re-bracket `RECOMMENDED_VOCAB_SIZE`), restore the tooling from git history.
 
 ## seed_tokens redesign (2026-05-26)
+
+> **Variant removed 2026-06-05** (dead direction; code in git history). Findings below retained as research record — notably the cross-chunk-vs-within-chunk gap analysis and the offline→CORE translation caveat, which inform the auto_tune work.
 
 Replaced a YAML-driven constructive-merge-chain approach (from `origin/seed_tokens` prior art) with a data-driven mining pipeline + mid-rank insertion in pure Python. Two mining iterations tested: morpheme-mining (failed, net-negative) and within-chunk composition mining (succeeded, K=1,750 canonical). The successful variant delivers a small offline win but the magnitude doesn't predict a clear downstream gain; canonical is preserved but not queued for Lambda alone.
 
@@ -185,7 +219,7 @@ Replaced a YAML-driven constructive-merge-chain approach (from `origin/seed_toke
 
 Each seed `(L_bytes, R_bytes, S_bytes)` is inserted into the final `mergeable_ranks` at rank `max(id_L, id_R) + 1` — the rank the merge would have had if introduced mid-BPE-training. Natural merges with id ≥ the insertion point shift up by 1 per inserted seed; relative order preserved. Tiktoken applies the merge at encode time via standard rank-based greedy matching whenever L and R are adjacent.
 
-**Why mid-rank, not append-at-end**: a natural BPE merge that would consume one of a seed's operands has lower rank than an appended seed and fires first, leaving no `(L, R)` adjacent pair to match. Smoke witness during early development: seed `(q, q) → qq` appended at rank ~328 got preempted by a natural ` q` merge at rank ~271 and never fired. Mid-rank insertion places each seed where no preempting natural merge can yet exist (both operands are still bare at that point in the BPE sequence). Each seed consumes exactly one vocab slot (final vocab = baseline + N_seeds). force_merges uses a different vocab-budgeting scheme — reserve one slot per forced pair during phase-1 BPE, then backfill any unused reservations (safe-aliased pairs, etc.) with normal merges in phase 2 — so its vocab bump is set by an unrelated mechanism: the +20 over baseline for 122 pairs is the empirical bracketing needed to recover the ~20 borderline BPE merges that the reservation displaces from the tail of the distribution, not a per-pair slot cost.
+**Why mid-rank, not append-at-end**: a natural BPE merge that would consume one of a seed's operands has lower rank than an appended seed and fires first, leaving no `(L, R)` adjacent pair to match. Smoke witness during early development: seed `(q, q) → qq` appended at rank ~328 got preempted by a natural ` q` merge at rank ~271 and never fired. Mid-rank insertion places each seed where no preempting natural merge can yet exist (both operands are still bare at that point in the BPE sequence). Each seed consumes exactly one vocab slot (final vocab = baseline + N_seeds). force_merges uses a different mechanism — `apply_forced_merges_at_end` appends each forced concat *after* normal BPE training, reusing an existing id whenever the concat already exists in the vocab (so most of the 122 pairs cost zero new slots). Its vocab bump is therefore not a per-pair cost: `RECOMMENDED_VOCAB_SIZE=32788` is a hand-set bracket (+20 over the 32768 baseline) chosen empirically to keep the borderline tail BPE merges that the extra carve-outs would otherwise displace.
 
 ### What we tried
 
@@ -243,8 +277,8 @@ Canonical (K=1,750, vocab=34,518) is preserved as a complete, reproducible artif
 
 3. **Build the next overlay** — per sequencing, **deep supervision** (folds into the existing `MTPGPT` subclass, scaffolding already in place) or **token-level loss weighting** (entropy/focal — pure-loss overlay, no extra model). Deep supervision is the more natural next step; token weighting is a viable parallel cheap track if you want two signals in flight.
 
-4. **Tokenizer-variants track** — `force_merges` is adopted as default; in-tree canonical promoted to the post-shadow-fix 122-pair list at vocab=32788 (locally validated; Lambda-pending). Next:
-   - **Stacked A/B**: `zloss` + new `force_merges` canonical together in one d24 run, vs `d24_baseline + new force_merges` reference. Tests whether the two adopted improvements compound or interfere AND confirms the local +0.42% real-corpus gain of the new canonical translates to a CORE/val_bpb edge. ~$120, decisive.
-   - **`seed_tokens`**: offline curation done, preserved but not queued for standalone Lambda (−0.63% offline magnitude predicts CORE delta below the per-task noise floor). Could stack opportunistically if another tokenizer variant earns Lambda time. `space_digits` is subsumed.
+4. **Tokenizer-variants track** — `force_merges` is the adopted default (122-pair canonical at vocab=32788). **`auto_tune`**: the held-out-Pareto block-list **fixpoint** (`tools/heldout_fixpoint_cached.py`) has **converged** (r194, 129 blocked pairs under the pristine regex; anti-churn cooldown + transactional net-commit were added mid-run to break a limit cycle — see `auto_tune/audit/README.md`). Fresh-shard generalization (`tools/generalization_check_cached.py`, two never-used 10-shard sets): coverage (+111 words) and dead-token reduction generalize; the gate's compression gain does **not** (≈ neutral on fresh shards) — the run traced a coverage-vs-compression frontier, so the promotion target is a prefix on that frontier, not necessarily the full r194 set. Next:
+   - **d24 A/B done** (§d24 auto_tune results): CORE +5.59%, val/bpb tied — a strong-but-borderline single-seed positive (sign test p≈0.095; ~79% of the delta is boolq + agi_lsat). **Next: a 2nd seed** to confirm before adopting; then promote the chosen prefix into `auto_tune/pairs.py` → canonical retrain (`wrappers/tok_train_auto_tune.py`) → `tools/blocked_pairs_report`. (val/bpb tied means the post-r170 compression cost was downstream-invisible → the full r194 looks promotable, not just an earlier frontier knee.) Deferred candidates (the ~52 coverage-flat keeps + the LOG'd set) remain a later pass.
+   - **Stacked A/B (decisive)**: `zloss` + the best tokenizer (force_merges canonical and/or the auto_tune block list) in one d24 run vs `d24_baseline`. Offline tokenizer metrics are proxies; the speedrun is the real verdict. ~$120.
 
 5. After that: differential attention, then online data selection if the earlier results justify the harness-touching investment.

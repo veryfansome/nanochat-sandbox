@@ -18,8 +18,8 @@ Tier 2 (--full, minutes):
                         dead-token count
 
 What this does NOT do: predict downstream CORE / SFT / RL gain. These are
-FILTERS. See ideas/tokenizer-variants/README.md "What offline metrics will
-NOT do" before drawing speedrun conclusions from these numbers.
+FILTERS. See ideas/tokenizer-variants/README.md "Methodological problem
+encountered" before drawing speedrun conclusions from these numbers.
 
 Usage:
     # Default: cached tokenizer vs GPT-2 / GPT-4 baselines, Tier 1 only

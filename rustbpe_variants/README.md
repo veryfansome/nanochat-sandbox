@@ -1,6 +1,6 @@
 # rustbpe_variants/
 
-Forked tokenizer-training crates. Each variant is a **fully independent Rust crate** that produces a uniquely-named Python module. The pristine upstream lives at [`../rustbpe/`](../rustbpe/) and is never modified.
+Forked tokenizer-training crates and the Python-only variants built on them. A variant that needs new Rust gets its own **fully independent crate** producing a uniquely-named Python module; variants that only add Python data (block/seed lists) reuse an existing crate instead of forking. The pristine upstream at [`../rustbpe/`](../rustbpe/) is never modified.
 
 This mirrors the project's overlay pattern at the Rust layer: pristine upstream stays untouched and `git pull`-able; experimentation lives in parallel crates that the existing pipeline can consume via a thin Python wrapper.
 
@@ -57,20 +57,24 @@ Each variant compiles to its own Python module so multiple variants can coexist 
 
 The wrapper relies on `nanochat/tokenizer.py:160` doing `import rustbpe` at module level; the alias must be installed in `sys.modules` *before* the first `import nanochat.tokenizer`. Mirrors the model-overlay pattern in [`../wrappers/`](../wrappers/).
 
-## Prior art to port (paused, sitting on branches in `veryfansome/nanochat`)
+## Implemented variants
 
-These should be lifted into this directory when re-engaged. See [`../ideas/tokenizer-variants/README.md`](../ideas/tokenizer-variants/README.md) "Prior art" for full design notes.
+Two live variants, each with its own crate. `force_merges` is the **adopted default** tokenizer (its results are kept); `auto_tune` is the active line of work. Per-variant design notes live in each variant's README; full results in [`../STATUS.md`](../STATUS.md) "Tokenizer variants".
 
-| Variant | Source branch | Notes |
-|---|---|---|
-| `seed_tokens` | `origin/seed_tokens` | Morpheme-seeded BPE. Adds `seed_tokens=` kwarg to `train_from_iterator`; constructive merge-chain builder (`ensure_token`, `compute_common_suffixes`, `best_rtl_tail_len`). Seed list in `sandbox/seed_tokens.yaml` (~200 morphemes). |
-| `force_merges` | `origin/force_merges_wip` | Forced cross-boundary common-phrase merges. Adds `forced_pairs=`/`blocked_pairs=` kwargs; `apply_forced_merges_at_end` post-training pass. Critical: paired with regex carve-out in the Python wrapper so tiktoken inference stays consistent (see ideas doc). |
+| Variant | Crate | Mechanism | Status |
+|---|---|---|---|
+| [`force_merges`](force_merges/) | own (`rustbpe_force_merges`) | `forced_pairs=`/`blocked_pairs=` + `apply_forced_merges_at_end` (append) + regex carve-out so cross-boundary phrases survive as one chunk | **adopted default** (Lambda: CORE +5.81%, val/bpb tied) |
+| [`auto_tune`](auto_tune/) | own (`rustbpe_auto_tune`) | blocking-only under the **pristine** regex (`blocked_pairs=`); forked from `force_merges` + `load_corpus`/`train_from_cached` so the block-list audit trains many block-lists over one cached corpus | **active** — held-out-Pareto block-list auto-tuning |
 
-Port-forward checklist when lifting a branch variant:
+Removed (dead research directions, recoverable from git history): `seed_tokens` (within-chunk composition seeds), `blocked_morphemes` (mangled-merge cascade), `manual_merges` (hand-curated blocks + manual merges), and the `space_digits`/`unigram` pre-tokenization/construction probes. Their findings are preserved in [`../STATUS.md`](../STATUS.md).
+
+### Lifting a variant from an upstream branch
+
+`force_merges` was lifted from a branch of [`veryfansome/nanochat`](https://github.com/veryfansome/nanochat) (`origin/force_merges_wip`). To port another branch variant:
 1. `git -C ../nanochat show origin/<branch>:rustbpe/src/lib.rs > rustbpe_variants/<name>/src/lib.rs` (then rename `#[pymodule]`).
-2. Lift any branch-side Python-side data (e.g. `sandbox/seed_tokens.yaml`, `FORCED_PAIRS` list) into a parallel sandbox location.
+2. Lift branch-side Python data (e.g. a `FORCED_PAIRS` list) into the parallel `rustbpe_variants/<name>/` location.
 3. Write the matching `wrappers/tok_train_<name>.py`.
-4. Run `tools/eval_tokenizer.py` on the resulting tokenizer to confirm structural battery still passes (it should — the round-trip tests are the safety net for regex carve-outs).
+4. Run `tools/eval_tokenizer.py` to confirm the structural round-trip battery still passes (the safety net for regex carve-outs).
 
 ## Why this layout (vs. Cargo features or branches)
 

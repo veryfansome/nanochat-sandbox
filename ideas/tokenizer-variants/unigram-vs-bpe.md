@@ -5,6 +5,8 @@ Standalone results document. Records what we learned from a controlled compariso
 **Date**: 2026-05-28.
 **Eval**: offline (per-domain compression + vocab inspection). **No downstream LM training was run.** This document reports tokenizer-side findings only; conclusions about LM-side effects are explicitly out of scope.
 
+> **The `unigram` variant + its wrappers (`wrappers/tok_train_unigram.py`, `smoke_tok_train_unigram.py`) were removed 2026-06-05** as a dead direction. This results doc is retained as the research record; the repro commands below reference the removed wrappers (recoverable from git history).
+
 ## Setup
 
 | | BPE (baseline) | Unigram |
@@ -23,7 +25,7 @@ The construction algorithm is the primary variable; both sides share the same `S
 
 ## Headline result
 
-**BPE compresses 12% better than Unigram overall** on the offline probe battery (`tools/eval_tokenizer.py` — 20 probes across 7 domains).
+**BPE compresses 12% better than Unigram overall** on the offline probe battery (`tools/eval_tokenizer.py` — 20 probes across 8 domains).
 
 | | Total bytes | Total tokens | bytes/token |
 |---|---:|---:|---:|
@@ -120,7 +122,7 @@ Both algorithms are picking up multi-syllable English content words. The differe
 
 ## What this experiment does NOT tell us
 
-- **Downstream LM performance.** No LM was trained. The 12% compression gap could translate to a downstream regression, neutral, or even a downstream win — none of these are determinable from compression alone. Independent literature (Schmidt et al. 2024, *Tokenization Is More Than Compression*) found at 350M params / 32K vocab on The Pile that Unigram with likelihood segmentation slightly *outperformed* BPE downstream (49.2 vs 48.8 avg accuracy). At their scale and corpus, the construction algorithm's compression delta (whatever its sign) didn't predict the downstream ranking — consistent with their broader finding that Pearson(CTC, accuracy) = 0.241 across all 18 tokenizers they tested. Compression and downstream rank can decouple.
+- **Downstream LM performance.** No LM was trained. The 12% compression gap could translate to a downstream regression, neutral, or even a downstream win — none of these are determinable from compression alone. Independent literature (Schmidt et al. 2024, *Tokenization Is More Than Compression*) found at 350M params / 32K vocab that Unigram with likelihood segmentation slightly *outperformed* BPE downstream (49.2 vs 48.8 avg accuracy). At their scale and corpus, the construction algorithm's compression delta (whatever its sign) didn't predict the downstream ranking — consistent with their broader finding that Pearson(CTC, accuracy) = 0.241 across all 18 tokenizers they tested. Compression and downstream rank can decouple.
 - **Generalization across vocab sizes.** Tested only at 32K. UnigramTrainer's `max_piece_length=16` may bind less tightly at larger vocabs; relative rankings may shift.
 - **Generalization across corpora.** Tested only on climbmix's web-crawl mix. A heavier English-text corpus (Wikipedia, arXiv) might shrink the gap; a heavier multilingual corpus might invert it.
 - **Generalization across UnigramTrainer hyperparameters.** Used HF defaults. `shrinking_factor`, `n_sub_iterations`, and `max_piece_length` are not swept.
