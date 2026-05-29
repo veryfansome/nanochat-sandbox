@@ -15,6 +15,7 @@ Curated catalog of experiments. Each entry has its own folder with a design doc;
 | [Adaptive sequence length / batch size](adaptive-schedule/README.md) — schedule what's currently fixed | compute efficiency (A) + sample efficiency (B) | harness change |
 | [Layer-wise LR / staged maturation](layerwise-lr/README.md) | depth-staged plasticity (brain-inspired) | overlay (`setup_optimizer`) / harness change for staged freezing |
 | [Tokenizer variants](tokenizer-variants/README.md) — merge-producer experiments (regex / seed tokens / forced phrases / corpus / vocab) | capability ceiling (representational atoms); sample efficiency (forced common-phrase tokens) | preprocessing artifact (parallel track, no GPU until A/B). **Prior art in `seed_tokens` + `force_merges_wip` branches.** |
+| [BPE-dropout](bpe-dropout/README.md) — stochastic segmentation at pretrain time | sample efficiency (train undertrained subword atoms) + tokenization robustness | encode-time overlay (monkeypatch `tokenizer.encode`, train-split-gated; no copied harness) |
 | [Non-backprop LLM](non-backprop/README.md) — DFA → block-local | non-backprop credit assignment; memory / parallelism / forgetting | model subclass + harness change (separate research track) |
 
 ## Overlay fit — what the categories mean
@@ -24,6 +25,7 @@ Curated catalog of experiments. Each entry has its own folder with a design doc;
 - **config-only** — a CLI arg on `base_train.py`; no code at all. (Batch-size tuning)
 - **harness change** — restructures the training loop; needs a **copied** `base_train.py` diffed against upstream periodically. (Online data selection, adaptive sequence length / batch size, non-backprop, layer-wise-LR variant B)
 - **preprocessing artifact** — produces a non-model artifact (e.g. a trained tokenizer) that the existing pipeline consumes via its cache. No nanochat edits, no harness edits. Iteration happens offline; GPU is paid only for the final A/B. (Tokenizer variants)
+- **encode-time overlay** — monkeypatches `tokenizer.encode` (and gates train vs val/eval) before `runpy`, exploiting that nanochat tokenizes raw-text parquet on-the-fly in the dataloader. No copied `base_train.py`; the one non-`GPT` patch is the train-split gate. (BPE-dropout)
 
 ## Lessons learned (ideation)
 
@@ -45,4 +47,4 @@ Cheap things first (config + pure-loss overlays — z-loss, token-level loss wei
 ## Ruled out (explicitly out of scope)
 
 - **Knowledge distillation**, **RLVR**, **test-time compute** — removed from scope by decision.
-- **Optimizer swaps** (Muon is already frontier here), attention/norm micro-tweaks, **MLA** (efficiency, not capability), **µP**, and regularization/dropout (not in an overfitting regime) — low ROI for this goal.
+- **Optimizer swaps** (Muon is already frontier here), attention/norm micro-tweaks, **MLA** (efficiency, not capability), **µP**, and **weight/activation dropout** (not in an overfitting regime) — low ROI for this goal. Note: this rules out *overfitting-control* dropout; it does **not** rule out [BPE-dropout](bpe-dropout/README.md), which is segmentation-space augmentation targeting undertrained subword atoms / robustness, not a train/val gap.

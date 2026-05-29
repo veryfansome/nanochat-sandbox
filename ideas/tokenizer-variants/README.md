@@ -110,7 +110,7 @@ Organized by which knob each touches. Items marked **(adopted)** are the current
 
 ### Alternative algorithm (path 2: HF tokenizers)
 
-11. **Unigram LM tokenizer** (SentencePiece-style). Different inference algorithm; would route through `HuggingFaceTokenizer`. Bigger change but tests the "is BPE itself optimal" question.
+11. **Unigram LM tokenizer** (SentencePiece-style). Different inference algorithm; would route through `HuggingFaceTokenizer`. Bigger change but tests the "is BPE itself optimal" question. **Implemented + offline-evaluated (2026-05-28): Unigram compresses 12% worse than BPE at vocab=32K on climbmix; mechanism + per-domain breakdown + caveats in [`unigram-vs-bpe.md`](unigram-vs-bpe.md). No downstream LM eval yet.**
 12. **WordPiece** — same shape as 11.
 
 ### Input preprocessing
@@ -205,4 +205,5 @@ The sandbox project's overlay discipline applies: don't edit `nanochat/` master 
 - Karpathy nanochat tokenizer comment (`nanochat/tokenizer.py:27-29`) — already-explored portion of the digit-rule sweep at vocab=32K.
 - Petrov et al. 2023 — "Language Model Tokenizers Introduce Unfairness Between Languages" (per-language compression bias).
 - Xue et al. 2022 — ByT5, byte-level alternative (out of scope here but the conceptual contrast worth knowing).
+- See [`papers.md`](papers.md) for end-to-end reads of Zouhar et al. 2023 (BPE optimality theory), PathPiece (Schmidt et al. 2024 — compression vs downstream at 350M–2.4B params), GreedTok (Lim et al. 2025 — partition-cover construction + 1B-param LM result + code review), and Train-It-And-Forget-It (Sawada & Goyal 2025 — merge-list-free BPE inference).
 - Prior art branches: [`origin/seed_tokens`](https://github.com/veryfansome/nanochat/tree/seed_tokens) and [`origin/force_merges_wip`](https://github.com/veryfansome/nanochat/tree/force_merges_wip) in `veryfansome/nanochat`.

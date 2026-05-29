@@ -47,7 +47,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 
-from nanochat.tokenizer import RustBPETokenizer, get_tokenizer
+from nanochat.tokenizer import RustBPETokenizer, HuggingFaceTokenizer, get_tokenizer
 
 # ANSI colors (match style of scripts/tok_eval.py)
 GREEN = "\033[92m"
@@ -220,7 +220,14 @@ def load_tokenizer(spec: str):
       'gpt2'       — GPT-2 base via tiktoken
       'gpt4'       — cl100k_base via tiktoken
       'gpt4o'      — o200k_base via tiktoken
-      /abs/path    — load from a directory (must contain tokenizer.pkl)
+      path         — load from a directory; `~` and `~user` are expanded
+                     (bash doesn't expand `~` after a comma in
+                     `--tokenizers a,~/path/b`, so we expand here).
+                     Dispatches by file present:
+                       tokenizer.json → HuggingFaceTokenizer (HF format,
+                                        e.g. unigram variant)
+                       tokenizer.pkl  → RustBPETokenizer (BPE format,
+                                        scripts.tok_train / rustbpe-variants)
     """
     if spec == "ours":
         return get_tokenizer()
@@ -230,7 +237,10 @@ def load_tokenizer(spec: str):
         return RustBPETokenizer.from_pretrained("cl100k_base")
     if spec == "gpt4o":
         return RustBPETokenizer.from_pretrained("o200k_base")
+    spec = os.path.expanduser(spec)
     if os.path.isdir(spec):
+        if os.path.exists(os.path.join(spec, "tokenizer.json")):
+            return HuggingFaceTokenizer.from_directory(spec)
         return RustBPETokenizer.from_directory(spec)
     raise ValueError(f"Cannot resolve tokenizer spec: {spec!r}")
 
@@ -265,13 +275,71 @@ def compute_compression(tok) -> dict:
     return out
 
 
+# The GPT-2 / HF tokenizers ByteLevel pre-tokenizer maps each of the 256 input
+# bytes to a unique printable Unicode char (byte 0x20 (space) → "Ġ", byte 0xC4
+# → "Ä", etc.). To recover real represented bytes from `id_to_token()`'s
+# output, we reverse this mapping char-by-char.
+#
+# IMPORTANT: do NOT use `pre_tokenizers.ByteLevel.alphabet()` to build the
+# reverse map by `enumerate()`. That method returns the 256 chars in
+# alphabetized order, NOT in byte-value order — so `enumerate` would map
+# each char to its list-position, not to the byte it actually represents.
+# The correct mapping is computed via the canonical GPT-2 algorithm below.
+_BYTELEVEL_CHAR_TO_BYTE: dict | None = None
+
+
+def _build_bytelevel_reverse() -> dict:
+    """
+    Compute the GPT-2 / HF ByteLevel byte → char mapping, then invert it.
+
+    Reference: https://github.com/openai/gpt-2/blob/master/src/encoder.py
+    Bytes in printable ranges (33–126, 161–172, 174–255) map to themselves;
+    remaining bytes (0–32, 127–160, 173) map to chars 256+ (in order).
+    """
+    bs = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    cs = list(bs)
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    # bs[i] is the byte, cs[i] is the codepoint it maps to.
+    return {chr(c): b for b, c in zip(bs, cs)}
+
+
+def _is_bytelevel_hf(tok) -> bool:
+    """True iff `tok` is a HuggingFaceTokenizer using a ByteLevel decoder."""
+    inner = getattr(tok, "tokenizer", None)
+    if inner is None:
+        return False
+    try:
+        decoder = inner.decoder
+    except AttributeError:
+        return False
+    return decoder is not None and type(decoder).__name__ == "ByteLevel"
+
+
 def _safe_token_bytes(tok, tid):
     """
-    Return raw bytes for a token id, or None if the id is a vocab gap
-    (e.g. cl100k_base reserves id 100256 between regular and special tokens).
+    Return raw bytes for a token id (the actual text bytes the token
+    represents on encode), or None if the id is a vocab gap (e.g. cl100k_base
+    reserves id 100256 between regular and special tokens).
 
-    Uses tiktoken's decode_single_token_bytes when available; falls back to
-    id_to_token for HuggingFaceTokenizer.
+    Dispatch by tokenizer family:
+      - tiktoken (RustBPETokenizer): `decode_single_token_bytes` (exact).
+      - HuggingFaceTokenizer with ByteLevel decoder: reverse-map `id_to_token`'s
+        ByteLevel-encoded form back to bytes via `_BYTELEVEL_CHAR_TO_BYTE`.
+        Without this step, `id_to_token().encode("utf-8")` returns the internal
+        glyph bytes (e.g. b"\\xc4\\xa0the" for the " the" token), not the
+        represented text bytes (b" the") — overcounts byte lengths and breaks
+        single-byte / digit-only detection.
+      - HuggingFaceTokenizer without ByteLevel (e.g. plain WordPiece): the
+        id_to_token form already IS the represented text → UTF-8 encode it.
     """
     enc = getattr(tok, "enc", None)
     if enc is not None:
@@ -279,12 +347,31 @@ def _safe_token_bytes(tok, tid):
             return enc.decode_single_token_bytes(tid)
         except (KeyError, Exception):
             return None
-    # HuggingFaceTokenizer fallback
+    # HuggingFaceTokenizer path.
     try:
         s = tok.id_to_token(tid)
-        return s.encode("utf-8") if s else None
     except Exception:
         return None
+    if not s:
+        return None
+    if _is_bytelevel_hf(tok):
+        global _BYTELEVEL_CHAR_TO_BYTE
+        if _BYTELEVEL_CHAR_TO_BYTE is None:
+            _BYTELEVEL_CHAR_TO_BYTE = _build_bytelevel_reverse()
+        try:
+            return bytes(_BYTELEVEL_CHAR_TO_BYTE[c] for c in s)
+        except KeyError:
+            # Token contains chars outside the ByteLevel alphabet — almost
+            # certainly a special token (e.g. "<|bos|>", "<|unk|>") whose id
+            # is in get_special_tokens() and gets filtered downstream by
+            # `if s in special_set`. Return the literal UTF-8 so the caller
+            # can still display/compare it; the resulting byte count is
+            # excluded from the length distribution via the special-token
+            # filter in compute_vocab_stats.
+            return s.encode("utf-8")
+    # Non-ByteLevel HF (WordPiece, plain BPE without ByteLevel pre-tok, etc.):
+    # id_to_token() returns the represented text directly.
+    return s.encode("utf-8")
 
 
 def compute_vocab_stats(tok) -> dict:
