@@ -21,8 +21,10 @@ Contrast with the two other forced-merge engines:
 
 Base BPE runs on the `rustbpe_force_merges` crate (reused for its `blocked_pairs=`
 support; `forced_pairs` stays empty — seeds go in via pure-Python insertion).
-BLOCKED_PAIRS forbid specific merges during training. Standard `SPLIT_PATTERN`
-(no carve-out), so pairs must be within-chunk / sub-word compositions.
+BLOCKED_PAIRS forbid specific merges during training. `SPLIT_PATTERN` is the
+standard regex minus one tweak — opening delimiters `" ( , “` no longer glue to
+the following word (see `apply_patches` / pairs.py) — so pairs are still
+within-chunk / sub-word compositions.
 
 Usage:
     uv run python -m wrappers.tok_train_manual_merges
@@ -43,11 +45,27 @@ def apply_patches():
     `rustbpe_force_merges` crate (for `blocked_pairs=` support; `forced_pairs`
     stays empty since seeds go in via pure-Python front-insertion). MANUAL_PAIRS
     are inserted at their natural rank; BLOCKED_PAIRS are forbidden during
-    training. Returns MANUAL_PAIRS. No SPLIT_PATTERN patch — standard regex."""
+    training. Returns MANUAL_PAIRS. Patches SPLIT_PATTERN with one small tweak
+    (stop opening-delimiter junk `" ( , “` from gluing to words — see pairs.py)."""
     alias_rustbpe("rustbpe_force_merges")
 
     import nanochat.tokenizer as tk
     from rustbpe_variants.manual_merges import pairs as _pairs_mod
+
+    # Regex tweak (the one departure from the standard regex — see the note in
+    # pairs.py): drop the opening-delimiter junk (" ( , “) from the leading-char
+    # word-gluing clause, so '"The', '(x', ',y' etc. don't form delimiter+word
+    # tokens. Space / - / . / gluing is untouched. Derived from the live pattern
+    # so it tracks upstream changes; asserts the clause is present so a regex
+    # change upstream fails loudly instead of silently no-op'ing.
+    _GLUE = r"[^\r\n\p{L}\p{N}]?+\p{L}+"
+    _GLUE_NEW = r'[^\r\n\p{L}\p{N}"(,“]?+\p{L}+'
+    if _GLUE_NEW not in tk.SPLIT_PATTERN:  # idempotent: skip if already patched
+        assert _GLUE in tk.SPLIT_PATTERN, (
+            "manual_merges: word-gluing clause not found in SPLIT_PATTERN "
+            "(upstream regex changed?) — update the tweak in tok_train_manual_merges.py"
+        )
+        tk.SPLIT_PATTERN = tk.SPLIT_PATTERN.replace(_GLUE, _GLUE_NEW)
 
     def _patched_train_classmethod(text_iterator, vocab_size):
         import rustbpe  # aliased to rustbpe_force_merges (for blocked_pairs)
@@ -182,7 +200,7 @@ def main():
     from rustbpe_variants.manual_merges.pairs import BLOCKED_PAIRS
     print(f"==> variant_base:    {variant_base}")
     print(f"==> rustbpe module:  {__import__('rustbpe').__file__}")
-    print(f"==> SPLIT_PATTERN:   standard (no carve-out)")
+    print('==> SPLIT_PATTERN:   standard, minus opening-delimiter gluing (" ( , “)')
     print(f"==> manual pairs:    {len(manual)} (seeds @ max(id_L,id_R)+1, byte-bigrams → rank 256)")
     print(f"==> blocked pairs:   {len(BLOCKED_PAIRS)}")
     print(f"==> vocab_size:      {effective_vocab}")

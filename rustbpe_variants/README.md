@@ -57,20 +57,26 @@ Each variant compiles to its own Python module so multiple variants can coexist 
 
 The wrapper relies on `nanochat/tokenizer.py:160` doing `import rustbpe` at module level; the alias must be installed in `sys.modules` *before* the first `import nanochat.tokenizer`. Mirrors the model-overlay pattern in [`../wrappers/`](../wrappers/).
 
-## Prior art to port (paused, sitting on branches in `veryfansome/nanochat`)
+## Implemented variants
 
-These should be lifted into this directory when re-engaged. See [`../ideas/tokenizer-variants/README.md`](../ideas/tokenizer-variants/README.md) "Prior art" for full design notes.
+All four are ported, in-tree, and smoke-tested. `force_merges` is the **adopted default** tokenizer. Per-variant design notes live in each variant's README (or, for the crate-less Python overlays, the `pairs.py`/`routes.py` module docstrings); full results in [`../STATUS.md`](../STATUS.md) "Tokenizer variants".
 
-| Variant | Source branch | Notes |
-|---|---|---|
-| `seed_tokens` | `origin/seed_tokens` | Morpheme-seeded BPE. Adds `seed_tokens=` kwarg to `train_from_iterator`; constructive merge-chain builder (`ensure_token`, `compute_common_suffixes`, `best_rtl_tail_len`). Seed list in `sandbox/seed_tokens.yaml` (~200 morphemes). |
-| `force_merges` | `origin/force_merges_wip` | Forced cross-boundary common-phrase merges. Adds `forced_pairs=`/`blocked_pairs=` kwargs; `apply_forced_merges_at_end` post-training pass. Critical: paired with regex carve-out in the Python wrapper so tiktoken inference stays consistent (see ideas doc). |
+| Variant | Crate | Mechanism | Status |
+|---|---|---|---|
+| [`force_merges`](force_merges/) | own (`rustbpe_force_merges`) | `forced_pairs=`/`blocked_pairs=` + `apply_forced_merges_at_end` (append) + regex carve-out so cross-boundary phrases survive as one chunk | **adopted default** (Lambda: CORE +5.81%, val/bpb tied) |
+| [`seed_tokens`](seed_tokens/) | none — pure-Python overlay on pristine `rustbpe` | within-chunk composition seeds inserted at natural rank in `mergeable_ranks` | offline-positive (−0.63% val tokens); not queued for standalone Lambda |
+| [`blocked_morphemes`](blocked_morphemes/) | reuses `rustbpe_force_merges` | `blocked_pairs=` cascade forbids mangled `<stem>+<suffix>` merges | offline-only |
+| [`manual_merges`](manual_merges/) | reuses `rustbpe_force_merges` | composite: `BLOCKED_PAIRS` + hand-written `MANUAL_PAIRS` (natural-rank insertion) | offline-only |
 
-Port-forward checklist when lifting a branch variant:
+Note the "fully independent crate" layout above applies only to variants that need new Rust: `force_merges` is the one own-crate variant; `seed_tokens` is pure Python (its legacy constructive-merge crate is preserved in `seed_tokens/` but unused); `blocked_morphemes` and `manual_merges` reuse `force_merges`' crate for `blocked_pairs=` rather than forking their own, so their dirs hold only Python (`pairs.py` + README).
+
+### Lifting a variant from an upstream branch
+
+The first two variants were lifted from branches of [`veryfansome/nanochat`](https://github.com/veryfansome/nanochat) (`origin/force_merges_wip`, `origin/seed_tokens`). To port another branch variant:
 1. `git -C ../nanochat show origin/<branch>:rustbpe/src/lib.rs > rustbpe_variants/<name>/src/lib.rs` (then rename `#[pymodule]`).
-2. Lift any branch-side Python-side data (e.g. `sandbox/seed_tokens.yaml`, `FORCED_PAIRS` list) into a parallel sandbox location.
+2. Lift branch-side Python data (e.g. a `FORCED_PAIRS` list) into the parallel `rustbpe_variants/<name>/` location.
 3. Write the matching `wrappers/tok_train_<name>.py`.
-4. Run `tools/eval_tokenizer.py` on the resulting tokenizer to confirm structural battery still passes (it should — the round-trip tests are the safety net for regex carve-outs).
+4. Run `tools/eval_tokenizer.py` to confirm the structural round-trip battery still passes (the safety net for regex carve-outs).
 
 ## Why this layout (vs. Cargo features or branches)
 

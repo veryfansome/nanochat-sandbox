@@ -33,6 +33,10 @@ runs/
 tools/
   compare_runs.py        # pull wandb metrics for N runs; side-by-side table + trajectory
   eval_tokenizer.py      # offline tokenizer eval harness (Tier 1/2 metrics, multi-tokenizer compare)
+  pass_metrics.py        # tokenizer corpus deltas vs baseline (compression, dead/mangled tokens, firing buckets)
+  dump_vocab.py          # dump a tokenizer's vocab (rank, corpus count, byte_len, repr) for inspection
+  blocked_pairs_report.py # one-shot post-retrain report for a blocked-pairs variant: eval+pass_metrics+dumps+blocked-R firing diff
+  token_contexts.py      # which words a no-space token fires in + bare-word % -> river/parasite/mangle call before blocking
 rustbpe/                 # PRISTINE vendored Karpathy rustbpe (commit 9467d83); built via build_rustbpe.sh
 rustbpe_variants/        # parallel-crate variants; each produces a uniquely-named Python module
 results/                 # per-run logs / checkpoints / metadata (gitignored)
@@ -358,6 +362,10 @@ See [`rustbpe_variants/README.md`](rustbpe_variants/README.md) for the variant-o
 | Terminate Lambda instance | `bash runs/lambda.sh terminate <id>` |
 | Compare runs (A/B from wandb) | `uv run python -m tools.compare_runs RUN_A RUN_B [RUN_C ...]` |
 | Evaluate tokenizer(s) offline | `uv run python -m tools.eval_tokenizer [--tokenizers ours,gpt2,gpt4,/path/...] [--full]` |
+| Tokenizer corpus deltas vs baseline | `uv run python -m tools.pass_metrics --variant ~/.cache/nanochat-variants/<v>/tokenizer` |
+| Dump a tokenizer's vocab | `uv run python -m tools.dump_vocab --tokenizer <dir> --output /tmp/<v>_vocab.txt` |
+| Post-retrain report (blocked-pairs variant) | `uv run python -m tools.blocked_pairs_report` (defaults to manual_merges) |
+| Classify a token before blocking it | `uv run python -m tools.token_contexts led red ated` (firing context + bare-word %) |
 | Build vendored rustbpe (pristine) | `bash runs/build_rustbpe.sh` |
 | Build a rustbpe variant | `VARIANT=<name> bash runs/build_rustbpe.sh` |
 | Verify wiring | `uv run python -m wrappers.smoke_zloss` |

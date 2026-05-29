@@ -1,7 +1,10 @@
 """
-Per-pass metrics for the blocked_morphemes tokenizer (or any variant vs
-baseline). Run after each blocking pass to track whether the cascade is
-converging and whether firing mass is concentrating toward common tokens.
+Corpus-delta metrics for ANY tokenizer variant vs baseline, on a fixed
+held-out corpus. Generic — `--variant` takes any tokenizer dir. (Originally
+written for blocked_morphemes' blocking cascade, hence the convergence framing
+below: re-run after each curation pass to track whether the cascade converges
+and whether firing mass concentrates toward common tokens; the same four
+metrics read meaningfully for force/seed/manual variants too.)
 
 Reports, baseline vs variant, on a fixed held-out corpus (ClimbMix val):
 

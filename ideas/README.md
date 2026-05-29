@@ -14,7 +14,7 @@ Curated catalog of experiments. Each entry has its own folder with a design doc;
 | [Online data selection + batch-size tuning](online-data-selection/README.md) | sample efficiency | config-only (A) / harness change (B) |
 | [Adaptive sequence length / batch size](adaptive-schedule/README.md) — schedule what's currently fixed | compute efficiency (A) + sample efficiency (B) | harness change |
 | [Layer-wise LR / staged maturation](layerwise-lr/README.md) | depth-staged plasticity (brain-inspired) | overlay (`setup_optimizer`) / harness change for staged freezing |
-| [Tokenizer variants](tokenizer-variants/README.md) — merge-producer experiments (regex / seed tokens / forced phrases / corpus / vocab) | capability ceiling (representational atoms); sample efficiency (forced common-phrase tokens) | preprocessing artifact (parallel track, no GPU until A/B). **Prior art in `seed_tokens` + `force_merges_wip` branches.** |
+| [Tokenizer variants](tokenizer-variants/README.md) — merge-producer experiments (regex / seed tokens / forced phrases / corpus / vocab) | capability ceiling (representational atoms); sample efficiency (forced common-phrase tokens) | preprocessing artifact (parallel track, no GPU until A/B). **Six variants in-tree; `force_merges` adopted (CORE +5.81%). See [STATUS.md](../STATUS.md).** |
 | [BPE-dropout](bpe-dropout/README.md) — stochastic segmentation at pretrain time | sample efficiency (train undertrained subword atoms) + tokenization robustness | encode-time overlay (monkeypatch `tokenizer.encode`, train-split-gated; no copied harness) |
 | [Non-backprop LLM](non-backprop/README.md) — DFA → block-local | non-backprop credit assignment; memory / parallelism / forgetting | model subclass + harness change (separate research track) |
 

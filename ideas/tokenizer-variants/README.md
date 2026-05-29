@@ -1,6 +1,6 @@
-# Tokenizer variants (offline-evaluable) — proposed setup
+# Tokenizer variants (offline-evaluable)
 
-Status: **proposal / not yet implemented in this project**, but **substantial prior art exists** in two branches of [`veryfansome/nanochat`](https://github.com/veryfansome/nanochat) — see "Prior art" below before starting any new variant.
+Status: **active track.** `force_merges` is adopted as the default tokenizer (2026-05-26); `seed_tokens` and `unigram` are implemented + offline-evaluated; `blocked_morphemes` and `manual_merges` are ported (offline-only). Six variants live in-tree (`rustbpe_variants/` + `wrappers/tok_train_*.py`); see [`../../STATUS.md`](../../STATUS.md) "Tokenizer variants" for current state. The catalog below also tracks designed-but-unbuilt variants; the "Prior art" sections record the upstream `veryfansome/nanochat` branches the first variants were lifted from.
 
 Target repo: `nanochat` (Karpathy) — kept **pristine**, never edited. The Rust tokenizer source (`rustbpe/`) **is in-tree** and modifiable; PyPI wheels are a build artifact, not a black box.
 
@@ -35,22 +35,11 @@ Two experimental branches of [`veryfansome/nanochat`](https://github.com/veryfan
 
 ### `origin/seed_tokens` — morpheme-seeded BPE
 
-Idea: warm-start BPE training with a linguistically-curated seed list (Greek/Latin roots, English prefixes, suffixes) so the early merges build morpheme-aware tokens rather than purely frequency-driven byte concatenations.
+Idea: warm-start BPE with a linguistically-curated seed list (Greek/Latin roots, prefixes, suffixes) so early merges build morpheme-aware tokens rather than purely frequency-driven ones. The branch carried a ~200-morpheme YAML + a Rust constructive-merge-chain builder (`ensure_token`, `compute_common_suffixes`) at vocab=65536.
 
-What's there:
-- `sandbox/seed_tokens.yaml` — ~200 morphemes with etymology comments, organized as `versatile_morphemes` (can appear anywhere), `prefixes` (word-initial only), `inner_morphemes` (mid/end only). Position-aware variant generation (leading-space, leading-space-capitalized, no-space) is in `sandbox/seed_tokens.py`.
-- `rustbpe/src/lib.rs` — substantial new helpers:
-  - `compute_common_suffixes` — heuristic to identify suffixes worth pre-creating (suffix is itself a seed AND is a proper suffix of ≥2 other seeds).
-  - `best_rtl_tail_len` / `best_suffix_split_len` — pick the longest existing-or-common suffix to split a target token at.
-  - `ensure_merge_pair` / `ensure_token` — constructive merge-chain builder. Given a target seed token, generates the chain of intermediate merges (preferring suffix-reuse, falling back to LTR prefix-folding) so the seed token is achievable in the merge DAG.
-- New `seed_tokens=` kwarg on `train_from_iterator`; `--seed_tokens` CLI on `tok_train.py`; vocab=65536 default.
-- Older snapshots of the Rust file preserved as `sandbox/lib_v1.rs` and `lib_v2.rs`.
-- `sandbox/tok_eval.json` — 118K-line cached eval output.
-- `sandbox/test_rustbpe.py` + `sandbox/test_tok_train.py` — test infrastructure.
+Why it paused: hard to ground *which* morphemes matter without downstream-task priors; compression didn't move decisively.
 
-Why it paused: morphemes vs frequency-pairs is a real design choice but hard to ground without domain priors on *which* morphemes matter for the downstream tasks the model will be evaluated on. Compression metrics didn't move decisively. The next step would have been measuring on a downstream-task corpus rather than general bpb.
-
-**Resolution in this project (2026-05-26)**: ported and tested. The morpheme-mining approach was **net-negative on ClimbMix val** at every K threshold tested — the surfaced morphemes (`cation`, `tation`, `zation`, ...) competed with baseline's already-efficient short morphemes (`ing`, `ation`, `ate`, `ize`) rather than complementing them. Reframed the mining target to **within-pre-tok-chunk adjacent-token-pair bigrams from baseline encoding output** — pairs baseline produces as adjacent but couldn't merge under the 32K budget. That approach was net-positive (−0.63% ClimbMix val tokens at +5.3% vocab, K=1,750 canonical); too small to justify standalone Lambda. See STATUS.md §seed_tokens redesign for the full empirical arc and takeaways.
+**Resolution in this project (2026-05-26)**: ported, then redesigned away from morpheme-mining (net-negative — it competed with baseline's already-efficient short morphemes) toward within-chunk adjacent-pair mining (net-positive but small). Now the in-tree [`seed_tokens`](../../rustbpe_variants/seed_tokens/) variant — see catalog #6 + STATUS.md §seed_tokens redesign for the full arc.
 
 ### `origin/force_merges_wip` — forced cross-boundary common-phrase merges
 
@@ -64,21 +53,16 @@ SPLIT_PATTERN = FORCED_PAIRS_EXPR + r"""|'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]
 
 Now ` of the` is a single pre-tok chunk at both training and inference. BPE/tiktoken process it as one unit; the forced merge produces a single token consistently. Trailing lookahead `(?=([^a-z]|$))` prevents matching ` of theory` as ` of the` + `ory`.
 
-What's there:
-- `FORCED_PAIRS` (~70 hand-picked grammatical phrases, with comments noting conflicts and resolution order — the order matters because BPE/regex alternation is leftmost-first), `BLOCKED_PAIRS` (prevents accidental learning of weird cross-boundary merges that the regex carve-outs allow), `DERIVED_PAIRS` (multi-step compositions like `", in the"`, must match-first in the alternation).
-- `rustbpe/src/lib.rs` — `BlockedPairSpec` / `ForcedMergeSpec` structs; `apply_forced_merges_at_end` runs *after* normal BPE training, requires both operands to exist as tokens, allocates new IDs from remaining vocab capacity (or reuses an existing token if the concat bytes already exist).
-- A side micro-optimization: adding ` ?` before `\p{N}{1,2}` so leading digits merge with their preceding space like words — measured as **+1.09–1.23% compression for ~220 token cost**.
-- `get_tokenizer(tokenizer_dir_name=...)` parameterized so multiple cached tokenizers can coexist — useful for the offline workflow.
-- `sandbox/test_tok_train.py` (624 lines) — extensive tests; `sandbox/tok_analyzer.py` — custom analysis tool.
+What's there: hand-picked `FORCED_PAIRS` / `BLOCKED_PAIRS` / `DERIVED_PAIRS` + `apply_forced_merges_at_end` (appends after BPE, reusing an existing id if the concat already exists). A side micro-opt — ` ?` before `\p{N}{1,2}` so leading digits merge with their preceding space — measured **+1.09–1.23% compression for ~220 tokens** (now folded into the in-tree tokenizer; see catalog #2).
 
-Why it paused: the user achieved **large compression gains** but ran into the methodological problem below. The compression-driven win was clearly there; whether it translates to a real CORE/loss win was inconclusive at the available A/B budget.
+Why it paused: large compression gains, but whether they translate to a real CORE/loss win was inconclusive at the available A/B budget — see the methodological problem below. Now the in-tree [`force_merges`](../../rustbpe_variants/force_merges/) adopted default.
 
 ### Methodological problem encountered (both branches)
 
 **Compression is not a fair comparison across tokenizers with different vocabs.** A tokenizer that adds " of the" as a token wins compression on any text containing "of the" and is roughly neutral elsewhere. So the headline compression number depends on what's in the test corpus — biased toward the variant whose forced/seed tokens match the test distribution.
 
 This is a real bias, not just noise. Going forward (see "Evaluation"), the eval harness needs to:
-- Report compression per-domain (`tools/eval_tokenizer.py` already does this — 21 probes across 6 domains).
+- Report compression per-domain (`tools/eval_tokenizer.py` already does this — 20 probes across 8 domains).
 - Add probes that *don't* contain the forced/seed phrases — measure compression on neutral text to separate "variant has the right tokens for this corpus" from "variant's general BPE is better."
 - For the eventual A/B: use **CORE / val/bpb** on a held-out corpus the tokenizer's training data didn't see, not raw compression.
 
@@ -107,50 +91,25 @@ Organized by which knob each touches. Items marked **(adopted)** are the current
 8. **`min_frequency` filter for normal BPE merges.** Skip merges below a count threshold, reallocate the saved vocab slots to other merges (or just produce a smaller vocab). Not currently exposed by rustbpe. ~30 LOC change.
 9. **Train-big-ship-small (vocab pruning).** Train at vocab=64K, drop the bottom-K by validation-set usage, ship a 32K tokenizer. Dead-token fraction → near zero by construction; the question is whether the pruned tokens were genuinely useless. Combine with `tools/eval_tokenizer.py --full` to pick the pruning threshold.
 10. **Branch-entropy merge scoring.** Penalize merges whose merged token has many high-frequency continuations (token captures less context-conditioning information). Hypothesis: better-tuned per-token information content → better next-token prediction headroom. Speculative; lowest priority.
+14. **Blocked morphemes** — **(implemented, offline-only)**. Forbids mangled `<stem>+<suffix>` merges during BPE training via a `blocked_pairs` cascade (reuses the `force_merges` crate; no own crate, no vocab bump), so suffix firing-mass concentrates on clean standalone stems instead of mangled merges. See [`rustbpe_variants/blocked_morphemes/`](../../rustbpe_variants/blocked_morphemes/). (Numbered 14–15 — appended after the catalog's existing 1–12; an earlier #13 was removed.)
+15. **Manual merges** — **(implemented, offline-only)**. Composite of the blocking mechanism (14) and the seed mechanism (6): `BLOCKED_PAIRS` forbid merges *and* hand-written `MANUAL_PAIRS` are inserted at their natural rank, under the standard regex (no carve-out, so within-chunk pairs only). Either knob may be empty; the current `pairs.py` is blocking-only. See [`rustbpe_variants/manual_merges/`](../../rustbpe_variants/manual_merges/).
 
 ### Alternative algorithm (path 2: HF tokenizers)
 
 11. **Unigram LM tokenizer** (SentencePiece-style). Different inference algorithm; would route through `HuggingFaceTokenizer`. Bigger change but tests the "is BPE itself optimal" question. **Implemented + offline-evaluated (2026-05-28): Unigram compresses 12% worse than BPE at vocab=32K on climbmix; mechanism + per-domain breakdown + caveats in [`unigram-vs-bpe.md`](unigram-vs-bpe.md). No downstream LM eval yet.**
 12. **WordPiece** — same shape as 11.
 
-### Input preprocessing
-
-13. **Case-marker variant** — lossless casing-collapse via preprocessing. Replace cased word forms in the input stream with a small set of case-marker special tokens + the lowercased base:
-    - `The` → `<|cap|> the`
-    - `USA` → `<|allcaps|> usa`
-    - `getUserId` → `get <|cap|> user <|cap|> id`  (open: handle camelCase or keep cased as one chunk)
-
-    Compression gain comes from collapsing all capitalized variants of a word into the shared lowercase form. With ~32K vocab, capitalized variants of common words probably consume 500–2000 slots today; releasing them is a likely few-percent compression win on ClimbMix val — roughly comparable order to force_merges, applied to surface form rather than phrase boundaries. **Lossless** because case is restored at inference via the marker tokens, so this is val/bpb-comparable to baseline (unlike a naive "lowercase everything" preprocessor, which would inflate bpb-comparability by changing the prediction task — see "Open questions" below for the bpb math).
-
-    **Implementation** (~200–300 LOC; pure-Python, no Rust):
-    - **Encode-side preprocessor**: tokenizer-time pass over input text that emits `<|cap|>` / `<|allcaps|>` before lowercased chunks; runs *before* `SPLIT_PATTERN`.
-    - **Two new special tokens**: `<|cap|>`, `<|allcaps|>` added to `SPECIAL_TOKENS`.
-    - **BPE training on the preprocessed stream**: standard rustbpe via the pristine crate; the markers occur frequently enough that the model learns them naturally.
-    - **Decode-side postprocessor**: invert markers at output time, mirroring how chat templates handle role markers.
-    - **`render_conversation` integration**: SFT path expects to control mask values per token; case markers need consistent mask treatment.
-
-    **Trade-offs vs other variants on the list**:
-    - **Different mechanism** from regex (1–3), corpus mix (5), and merge-producer changes (6–10): operates *before* tokenization runs, normalizing the input stream rather than tuning what BPE produces. Combines cleanly with all of the above (orthogonal — surface form ⊥ phrase boundaries ⊥ morphological structure).
-    - **Inference path gets wrapped**: model outputs need a postprocessor before display / downstream use. Similar lift to how SFT chat templates handle `<|user_start|>` etc.
-    - **No Rust work needed.** Implementation lives entirely on the Python side (preprocessor + special-token additions + decoder wrapper).
-
-    **Open questions**:
-    - **Marker set size**: just `<|cap|>` + `<|allcaps|>`, or also a `<|titlecase|>` for words like `iPhone`? Adding more markers spends more vocab on the marker tokens themselves; fewer markers means edge-case words can't be expressed losslessly.
-    - **camelCase / PascalCase handling for code**: split on case transitions (preserves identifier semantics in lowercased form but uses many markers) or treat as a single cased chunk (no compression on identifiers, but simpler)? Hybrid: split for prose, keep cased for code-typed regions — needs language detection.
-    - **Unicode case rules**: Turkish dotless `i`, German `ß` → `SS` (lossy uppercase), final-sigma in Greek. Standard `str.lower()` gets some of these wrong; a Unicode-aware case normalizer is needed for non-English prose.
-    - **bpb math**: a lossless encode→decode roundtrip preserves the byte stream, so per-byte cross-entropy on the same held-out text is directly comparable to baseline. The model has more tokens per byte to predict, but they're more predictable (markers + lowercase chunks have lower entropy than mixed-case). Whether net val/bpb improves is an empirical question; the variant is *comparable* to baseline either way.
-    - **Interaction with proper-noun semantics**: `Apple` and `apple` collapse to the same lowercase form preceded by a marker. The marker carries the case-distinction signal that the model has to learn to associate with named-entity-vs-common-noun semantics. This may or may not be as easy to learn as the current "two separate tokens" representation. Untested.
-    - **CORE eval interaction**: case-restoration on output is well-defined for prose, but CORE tasks that include code or specific casing requirements would need the decoder pipeline integrated correctly. Should be solvable but adds a path that needs testing.
-
 ## Evaluation — what changes given prior art
 
 The eval harness is already built: [`../../tools/eval_tokenizer.py`](../../tools/eval_tokenizer.py). It computes:
 
-- **Per-domain compression** on 21 probes across 6 domains (English prose, code, math, science, 9 languages, structured/JSON, whitespace, emoji).
+- **Per-domain compression** on 20 probes across 8 domains (English prose, code, math, science, 9 languages, structured/JSON, whitespace, emoji).
 - **Vocab inspection** — bytes/tok stats, single-byte fraction, **digit-token analysis by length** (directly answers Karpathy's `\p{N}{1,2}` question), longest tokens, vocab gaps.
 - **Structural round-trip battery** (19 PASS/FAIL tests, catches inference inconsistencies — exactly the class of bug the cross-boundary work needed to verify).
 - **Task probes** (19 capability-relevant strings — arithmetic at multiple digit lengths, code idioms, URLs, dates, named entities).
 - **Coverage curve** (Tier 2 `--full`) — top-N cumulative share + dead-token count.
+
+`eval_tokenizer.py` is the Tier-1 filter; the full offline loop pairs it with `tools/pass_metrics.py` (corpus deltas vs baseline) and `tools/dump_vocab.py` (vocab inspection) — see STATUS.md "Evaluating a (re)trained tokenizer variant".
 
 Adjustments needed given the prior-art lessons:
 
@@ -185,19 +144,17 @@ The sandbox project's overlay discipline applies: don't edit `nanochat/` master 
 3. **Variant 1 (digit rule re-validation against CORE)** — narrowly targeted at a single capability; needs Lambda time for the A/B but is cheap to set up.
 4. **Variant 5 (corpus mix)** — establishes the offline workflow end-to-end without touching Rust.
 5. **Variant 7 (forced merges)** — **Done and adopted**. Data-driven curation via `tools/mine_forced_pairs.py --two-pass` + `tools/ablate_derived.py`; Lambda speedrun on the 2026-05-25 canonical landed CORE +5.81% / val/bpb tied / ChatCORE +0.62%; in-tree canonical re-curated 2026-05-26 with corrected shadow rule (Lambda-pending for the new canonical). See the "For forced merges" item under Open questions below and STATUS.md §force_merges for full details.
-6. **Variant 6 (seeded merges)** — **Done offline; preserved but not queued for standalone Lambda.** Morpheme-mining iteration net-negative; within-chunk composition-mining iteration net-positive (−0.63% ClimbMix val tokens at +5.3% vocab, K=1,750 canonical). The magnitude is too small to predict a clear CORE win at d24 scale. Could stack with another tokenizer variant opportunistically; not worth a standalone Lambda run.
+6. **Variant 6 (seeded merges)** — **Done offline; not queued for standalone Lambda** (−0.63% ClimbMix val tokens, too small for a clear d24 CORE win). Could stack opportunistically. Full arc in catalog #6 + STATUS.md §seed_tokens redesign.
 7. **Variants 4 (vocab grid), 8 (min_frequency), 9 (vocab pruning)** — narrower questions, do as targeted follow-ups.
-8. **Variant 13 (case-marker)** — de-gated now that force_merges validated the data-driven methodology. Pursue as a parallel lossless-compression source; combines orthogonally with whichever variants land alongside.
-9. **Variants 10 (branch entropy), 11/12 (non-BPE algorithms)** — speculative, defer.
+8. **Variants 10 (branch entropy), 11/12 (non-BPE algorithms)** — speculative, defer.
 
 ## Open questions
 
 - Whether `val/bpb` and CORE rank tokenizer variants the same way at d24 scale. If they disagree, the project's primary metric needs adjustment for this track.
 - How to disentangle "tokenizer has the right merges for the test corpus" from "tokenizer's general BPE is better." See "Methodological problem" — needs neutral-corpus probes.
 - For forced merges: which phrases to force. **Resolved by data-driven curation (2026-05-25, re-curated 2026-05-26 with corrected shadow rule).** Replaced the ~70-pair hand-picked list with `tools/mine_forced_pairs.py --two-pass` + `tools/ablate_derived.py`; current canonical at [`rustbpe_variants/force_merges/pairs.py`](../../rustbpe_variants/force_merges/pairs.py) (105 mined FORCED + 15 mined DERIVED + 2 numeric DERIVED = 122 forced merges, vocab=32788 — +20 over the nanochat default to absorb the extra carve-outs without displacing borderline BPE merges). Achieves **−6.9% total tokens vs the baseline nanochat tokenizer** on a 15M-char training-corpus sample; Lambda speedrun on the prior 2026-05-25 canonical (104 pairs at vocab=32768) yielded **CORE +5.81%, val/bpb tied, ChatCORE +0.62%**. Full construction provenance, per-pair attribution table, vocab-cost bracketing experiment, and reusable infrastructure live in [`STATUS.md`](../../STATUS.md) §force_merges. To re-curate against a different corpus: (1) regenerate the mining artifacts under `rustbpe_variants/force_merges/mined/`, (2) rerun `ablate_derived` to find the new K cutoff, (3) **paste the new pair tuples into `pairs.py`** (it's intentionally a flat literal list, not a runtime loader — see the module docstring for the regen command), (4) **re-validate the `_NUMERIC_DERIVED` hand-adds + the `RECOMMENDED_VOCAB_SIZE` constant** against the new corpus + probe battery.
-- For seed tokens: **resolved by data-driven within-chunk composition mining (2026-05-26)**. Replaced the intuition-driven morpheme-list approach with within-chunk adjacent-token-pair bigrams mined from baseline encoding output. K=1,750 canonical at the per-seed-marginal plateau-end. Magnitude (−0.63% offline) too small to justify standalone Lambda. See STATUS.md §seed_tokens redesign for the empirical arc, K-sweep, isolation control vs extended BPE, K_switch sweep findings, and takeaways.
+- For seed tokens: **resolved by within-chunk composition mining (2026-05-26)** — replaced the intuition-driven morpheme-list approach with mined within-chunk adjacent-pair bigrams (K=1,750 canonical, −0.63% offline, too small for standalone Lambda). Full empirical arc, K-sweep, and controls in catalog #6 + STATUS.md §seed_tokens redesign.
 - Whether to combine forced merges + seed tokens — they target **different structural gaps**: `force_merges` captures cross-pre-tok-chunk pairs (BPE structurally cannot see them; addressed via regex carve-out), while `seed_tokens` captures within-chunk pairs that BPE saw at training time but couldn't fit in the 32K budget (addressed via mid-rank insertion). Mechanically orthogonal. Untested as a stack; worth an offline A/B if it bundles into another tokenizer experiment cheaply.
-- For case-marker (variant 13): whether the model learns to use marker tokens as efficient case-distinction signals, or whether it spends gradient relearning that `<|cap|> apple` and `apple` are semantically related but distinct (named-entity vs common-noun). camelCase / Unicode case rules are settled-by-design choices, not empirical questions — but interact with eval pipelines that need a working decode-side postprocessor.
 
 ## References
 

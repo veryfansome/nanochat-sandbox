@@ -129,19 +129,30 @@ fn count_pairs_parallel(
     words
         .par_iter()
         .enumerate()
-        .map(|(i, w)| {
-            let mut local_pc: AHashMap<Pair, i32> = AHashMap::new();
-            let mut local_wtu: AHashMap<Pair, AHashSet<usize>> = AHashMap::new();
-            if w.ids.len() >= 2 && counts[i] != 0 {
-                for (a, b) in w.pairs() {
-                    *local_pc.entry((a, b)).or_default() += counts[i];
-                    local_wtu.entry((a, b)).or_default().insert(i);
+        .fold(
+            || {
+                (
+                    AHashMap::<Pair, i32>::new(),
+                    AHashMap::<Pair, AHashSet<usize>>::new(),
+                )
+            },
+            |(mut local_pc, mut local_wtu), (i, w)| {
+                if w.ids.len() >= 2 && counts[i] != 0 {
+                    for (a, b) in w.pairs() {
+                        *local_pc.entry((a, b)).or_default() += counts[i];
+                        local_wtu.entry((a, b)).or_default().insert(i);
+                    }
                 }
-            }
-            (local_pc, local_wtu)
-        })
+                (local_pc, local_wtu)
+            },
+        )
         .reduce(
-            || (AHashMap::new(), AHashMap::new()),
+            || {
+                (
+                    AHashMap::<Pair, i32>::new(),
+                    AHashMap::<Pair, AHashSet<usize>>::new(),
+                )
+            },
             |(mut acc_pc, mut acc_wtu), (pc, wtu)| {
                 for (k, v) in pc {
                     *acc_pc.entry(k).or_default() += v;
@@ -172,11 +183,79 @@ struct ForcedMergeSpec {
     right_str: String,
 }
 
+type BytePairLookup = AHashMap<Vec<u8>, AHashMap<Vec<u8>, usize>>;
+type ByteLookup = AHashMap<Vec<u8>, usize>;
+
+trait PairSpecBytes {
+    fn pair_bytes(&self) -> (&[u8], &[u8]);
+}
+
+impl PairSpecBytes for BlockedPairSpec {
+    fn pair_bytes(&self) -> (&[u8], &[u8]) {
+        (&self.left_bytes, &self.right_bytes)
+    }
+}
+
+impl PairSpecBytes for ForcedMergeSpec {
+    fn pair_bytes(&self) -> (&[u8], &[u8]) {
+        (&self.left_bytes, &self.right_bytes)
+    }
+}
+
+fn insert_pair_lookup(
+    lookup: &mut BytePairLookup,
+    left: &[u8],
+    right: &[u8],
+    spec_idx: usize,
+) {
+    lookup
+        .entry(left.to_vec())
+        .or_default()
+        // Preserve the old linear-scan behavior for duplicate specs: the
+        // earliest matching entry is the one used for diagnostics.
+        .entry(right.to_vec())
+        .or_insert(spec_idx);
+}
+
+#[inline]
+fn find_pair_lookup(lookup: &BytePairLookup, left: &[u8], right: &[u8]) -> Option<usize> {
+    lookup
+        .get(left)
+        .and_then(|right_lookup| right_lookup.get(right))
+        .copied()
+}
+
+fn build_pair_lookup<T: PairSpecBytes>(specs: &[T]) -> BytePairLookup {
+    let mut lookup = AHashMap::with_capacity(specs.len());
+    for (idx, spec) in specs.iter().enumerate() {
+        let (left, right) = spec.pair_bytes();
+        insert_pair_lookup(&mut lookup, left, right, idx);
+    }
+    lookup
+}
+
+fn build_forced_concat_lookup(specs: &[ForcedMergeSpec]) -> ByteLookup {
+    let mut lookup = AHashMap::with_capacity(specs.len());
+    for (idx, spec) in specs.iter().enumerate() {
+        lookup.entry(spec.concat_bytes.clone()).or_insert(idx);
+    }
+    lookup
+}
+
+#[inline]
+fn increment_chunk_count(counts: &mut AHashMap<CompactString, i32>, piece: &str) {
+    if let Some(count) = counts.get_mut(piece) {
+        *count += 1;
+    } else {
+        counts.insert(CompactString::from(piece), 1);
+    }
+}
+
 /// Apply forced merges *after* normal training.
 /// - `vocab_size` is the final vocab size limit
 /// - `merges_done` is the number of merges that have already allocated token IDs
 fn apply_forced_merges_at_end(
-    blocked_specs: &[BlockedPairSpec],
+    blocked_pair_lookup: &BytePairLookup,
     forced_specs: &[ForcedMergeSpec],
     merges: &mut StdHashMap<Pair, u32>,
     vocab_size: u32,
@@ -202,15 +281,13 @@ fn apply_forced_merges_at_end(
         let r_str = &spec.right_str;
 
         // 1) If this pair is explicitly blocked, do not create a forced merge for it.
-        for blocked in blocked_specs {
-            if spec.left_bytes == blocked.left_bytes && spec.right_bytes == blocked.right_bytes {
-                log::debug!(
-                    "Skipping forced merge {:?}+{:?} because it is in blocked_pairs",
-                    spec.left_str,
-                    spec.right_str
-                );
-                continue 'outer_forced;
-            }
+        if find_pair_lookup(blocked_pair_lookup, &spec.left_bytes, &spec.right_bytes).is_some() {
+            log::debug!(
+                "Skipping forced merge {:?}+{:?} because it is in blocked_pairs",
+                spec.left_str,
+                spec.right_str
+            );
+            continue 'outer_forced;
         }
 
         // 2) Both operands must exist as tokens.
@@ -374,6 +451,10 @@ impl Tokenizer {
             })
             .collect();
 
+        let blocked_pair_lookup = build_pair_lookup(&blocked_specs);
+        let forced_pair_lookup = build_pair_lookup(&forced_specs);
+        let forced_concat_lookup = build_forced_concat_lookup(&forced_specs);
+
         let total_capacity = vocab_size - 256;
         let reserved_merges = forced_specs.len() as u32;
         if reserved_merges > total_capacity {
@@ -430,6 +511,7 @@ impl Tokenizer {
         let mut last_log_percent = 0u32;
         let mut phase: u8 = 1;
         let mut current_target = phase1_target;
+        let mut merged_bytes_scratch: Vec<u8> = Vec::new();
 
         'phase_loop: loop {
         'merge_loop: while merges_done < current_target {
@@ -467,49 +549,52 @@ impl Tokenizer {
                 let right_bytes = &token_bytes[right as usize];
 
                 // 1) Explicitly blocked pairs: NEVER allowed to merge.
-                for spec in &blocked_specs {
-                    if left_bytes == &spec.left_bytes && right_bytes == &spec.right_bytes {
-                        log::debug!(
-                            "Blocking merge of explicitly blocked pair {:?}+{:?}",
-                            spec.left_str,
-                            spec.right_str
-                        );
-                        banned_pairs.insert(top.pair);
-                        continue 'merge_loop;
-                    }
+                if let Some(spec_idx) =
+                    find_pair_lookup(&blocked_pair_lookup, left_bytes, right_bytes)
+                {
+                    let spec = &blocked_specs[spec_idx];
+                    log::debug!(
+                        "Blocking merge of explicitly blocked pair {:?}+{:?}",
+                        spec.left_str,
+                        spec.right_str
+                    );
+                    banned_pairs.insert(top.pair);
+                    continue 'merge_loop;
                 }
 
                 // 2) Forced pairs: suppress natural merges of the forced pair itself,
                 //    and any other merge that would create the same concat as a forced pair.
                 if !forced_specs.is_empty() {
                     // 2a) Block exact forced pair
-                    for spec in &forced_specs {
-                        if left_bytes == &spec.left_bytes && right_bytes == &spec.right_bytes {
-                            log::debug!(
-                                "Suppressing natural merge of forced pair {:?}+{:?} during normal training",
-                                spec.left_str,
-                                spec.right_str
-                            );
-                            banned_pairs.insert(top.pair);
-                            continue 'merge_loop;
-                        }
+                    if let Some(spec_idx) =
+                        find_pair_lookup(&forced_pair_lookup, left_bytes, right_bytes)
+                    {
+                        let spec = &forced_specs[spec_idx];
+                        log::debug!(
+                            "Suppressing natural merge of forced pair {:?}+{:?} during normal training",
+                            spec.left_str,
+                            spec.right_str
+                        );
+                        banned_pairs.insert(top.pair);
+                        continue 'merge_loop;
                     }
 
                     // 2b) Block any merge whose concat == forced concat (different decomposition)
-                    let mut merged_bytes = Vec::with_capacity(left_bytes.len() + right_bytes.len());
-                    merged_bytes.extend_from_slice(left_bytes);
-                    merged_bytes.extend_from_slice(right_bytes);
+                    merged_bytes_scratch.clear();
+                    merged_bytes_scratch.extend_from_slice(left_bytes);
+                    merged_bytes_scratch.extend_from_slice(right_bytes);
 
-                    for spec in &forced_specs {
-                        if merged_bytes == spec.concat_bytes {
-                            log::debug!(
-                                "Suppressing natural merge producing concat of forced pair {:?}+{:?}",
-                                spec.left_str,
-                                spec.right_str
-                            );
-                            banned_pairs.insert(top.pair);
-                            continue 'merge_loop;
-                        }
+                    if let Some(spec_idx) =
+                        forced_concat_lookup.get(merged_bytes_scratch.as_slice())
+                    {
+                        let spec = &forced_specs[*spec_idx];
+                        log::debug!(
+                            "Suppressing natural merge producing concat of forced pair {:?}+{:?}",
+                            spec.left_str,
+                            spec.right_str
+                        );
+                        banned_pairs.insert(top.pair);
+                        continue 'merge_loop;
                     }
                 }
             }
@@ -578,7 +663,11 @@ impl Tokenizer {
                 log::info!("Finished phase-1: {} normal merges completed", merges_done);
                 let before_forced = merges_done;
                 apply_forced_merges_at_end(
-                    &blocked_specs, &forced_specs, &mut self.merges, vocab_size, &mut merges_done,
+                    &blocked_pair_lookup,
+                    &forced_specs,
+                    &mut self.merges,
+                    vocab_size,
+                    &mut merges_done,
                 );
                 let applied = merges_done - before_forced;
                 let unused_reservation = reserved_merges.saturating_sub(applied);
@@ -706,16 +795,18 @@ impl Tokenizer {
             let pattern = self.compiled_pattern.clone();
             let local: AHashMap<CompactString, i32> = py.allow_threads(|| {
                 buf.par_iter()
-                    .map(|s| {
-                        let mut m: AHashMap<CompactString, i32> = AHashMap::new();
-                        for mat in pattern.find_iter(s) {
-                            let piece = mat.expect("regex match failed").as_str();
-                            *m.entry(CompactString::from(piece)).or_default() += 1;
-                        }
-                        m
-                    })
+                    .fold(
+                        || AHashMap::<CompactString, i32>::new(),
+                        |mut m: AHashMap<CompactString, i32>, s| {
+                            for mat in pattern.find_iter(s) {
+                                let piece = mat.expect("regex match failed").as_str();
+                                increment_chunk_count(&mut m, piece);
+                            }
+                            m
+                        },
+                    )
                     .reduce(
-                        || AHashMap::new(),
+                        || AHashMap::<CompactString, i32>::new(),
                         |mut a, b| {
                             for (k, v) in b {
                                 *a.entry(k).or_default() += v;

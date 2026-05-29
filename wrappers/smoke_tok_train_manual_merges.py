@@ -4,12 +4,13 @@ Smoke test for wrappers/tok_train_manual_merges.py.
 Verifies:
   (a) MANUAL_PAIRS and BLOCKED_PAIRS load and are well-formed (lists of (str,str)).
   (b) The shim installs (rustbpe_force_merges crate, for blocked_pairs support)
-      and trains under the STANDARD pattern.
+      and trains under the near-standard pattern (delimiter-glue tweak applied).
   (c) DONE-FIRST seed: a synthetic byte-bigram ('q','z') lands at rank 256 — the
       very first merge.
   (d) BLOCKING: a synthetic blocked pair ('x','y') does NOT merge — 'xy' is absent
       from the vocab even though it's frequent in the corpus.
-  (e) The trained pattern is nanochat's standard SPLIT_PATTERN (no carve-out).
+  (e) The delimiter-glue tweak is applied: `" ( , “` no longer glue to a
+      following word, and the tweak flows through to the saved pattern.
   (f) Seed wins + encode/decode roundtrip.
 
 No real data; runs in <2s.
@@ -37,7 +38,6 @@ with tempfile.TemporaryDirectory() as tmp:
     from wrappers.tok_train_manual_merges import apply_patches
     apply_patches()
     import nanochat.tokenizer as tk
-    STD_PATTERN = tk.SPLIT_PATTERN
     corpus = [
         "the quick qz brown xy fox qz jumps xy. qzqz xy lazy qz dog. " * 40,
         "data qz of xy the qz analysis xy showed qz results xy now. " * 40,
@@ -59,10 +59,14 @@ with tempfile.TemporaryDirectory() as tmp:
     assert b"xy" not in b2i, "blocked pair 'xy' merged despite BLOCKED_PAIRS"
     print("[d] blocked 'xy' correctly absent from vocab")
 
-    # (e) standard pattern
+    # (e) delimiter-glue tweak applied + flows through to the saved pattern
+    import regex as _re
+    assert r'[^\r\n\p{L}\p{N}"(,“]' in tk.SPLIT_PATTERN, "delimiter-exclusion tweak missing"
     if hasattr(tok.enc, "_pat_str"):
-        assert tok.enc._pat_str == STD_PATTERN, "pattern != standard (carve-out leaked?)"
-    print("[e] standard SPLIT_PATTERN (no carve-out)")
+        assert tok.enc._pat_str == tk.SPLIT_PATTERN, "trained pattern != patched SPLIT_PATTERN"
+    assert [m.group() for m in _re.compile(tk.SPLIT_PATTERN).finditer('"The')] == ['"', 'The'], \
+        "delimiter still glues to the following word"
+    print('[e] delimiter-glue tweak applied (" ( , “ no longer glue to words)')
 
     # (f) roundtrip
     test = "the qz quick xy fox."
