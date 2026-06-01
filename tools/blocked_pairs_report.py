@@ -62,6 +62,9 @@ from pathlib import Path
 # The blocked-R section skips these. Crude denylist on purpose — extend as junk
 # R's appear; swap for a word-start-prob gate later if it's worth the corpus pass.
 NON_SUFFIX_R = {
+    "ess",
+    "s",
+    "ss",
 }
 
 
