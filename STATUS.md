@@ -102,6 +102,33 @@ Single-instance run 2026-06-14 with the **r194 block list** (129 mangled stem+su
 
 Reproduce: `uv run python -m tools.compare_runs d24_baseline d24_autotune_r194`
 
+## d24 combined (force_merges + r194) results — PROVISIONAL (ran on wrong vocab size)
+
+Single-instance base-only run 2026-06-15: the **combined** tokenizer = force_merges (122 forced cross-boundary phrases) + r194's 129 mangled-morpheme blocks + the `block_trailing_space` predicate. Same nanochat commit (`dc54a1a`), seed, depth=24, hardware (USE_FP8=0, WINDOW_PATTERN=L) as `d24_baseline`. **DEVICE_BATCH_SIZE=4** (not 8): the non-2^15 vocab fell off torch.compile's fused-cross-entropy path on the 40GB A100 and OOM'd at DBS=8; DBS=4 holds the total batch constant via grad-accum, so the result is unaffected (wall-clock only). FP8 must be off (A100 has no fp8 HW — `USE_FP8=0`); a run that lost that flag crashed in a triton fp8e4nv compile.
+
+| | baseline | force_merges | auto_tune r194 | **combined** |
+|---|---:|---:|---:|---:|
+| CORE (base_eval, full) | 0.2505 | 0.2650 (+5.8%) | 0.2645 (+5.6%) | **0.2671 (+6.6%)** |
+| val/bpb (final) | 0.7135 | 0.7133 | 0.7132 | 0.7132 |
+
+**Additivity — strongly sub-additive.** Combined beats the better single arm (force_merges) by only **+0.0021 CORE (~0.8%, noise-level)**; the naive sum of the two single gains would be +0.0285 (→0.279). Stacking the morpheme blocks onto the forced phrases added essentially nothing measurable — the "two orthogonal ~+5.7% tokenizer wins compound toward +10%" hypothesis does **not** hold here. Per-task the combined is "best" on ~12/22 tasks, but most of those margins are single-seed noise (several sit in the bucket where force_merges and auto_tune *disagree* in sign); on the cross-arm-consistent tasks it only trades wins with force_merges.
+
+### Asterisk: this ran on the suboptimal 32788 tokenizer — the conclusions above are provisional
+
+The combined was meant to run at **vocab 32890** = 32768 **+122** — the forced phrases sitting on *top* of the full base vocab, specified explicitly so they would **not displace auto_tune's blocked-morpheme merges** (and validated in the 32768+122 verification diff: 99.6% base overlap with auto_tune). The miss: `RECOMMENDED_VOCAB_SIZE` was never bumped off **force_merges-alone's** bracketed **32788** (+20 — the minimal bump that recovers *force_merges'* Tier-1 probe tokens; correct for force_merges by itself, see §force_merges curation details, but **not** for the combined). So the bake + this d24 run used 32788, and the 122 forced phrases **displaced ~102 base merges** (base merges 32,657 vs baseline's 32,759) — exactly the displacement of auto_tune's work that 32890 was meant to avoid. Consequence (20M ClimbMix-val battery, `tools/blocked_pairs_report`): the combined **kept** auto_tune's mangled reduction (−92) and suffix-firing redistribution **but lost most of its whole-word coverage gain** — auto_tune **+101** dict-word tokens → combined-32788 **+25**.
+
+So today's combined CORE — and the sub-additivity / boolq-interference reads below — are **on a tokenizer we would now replace, and must be re-confirmed on the corrected 32890 build before they are load-bearing.** The 32890 build was validated offline (coverage recovery below) but **not shipped**: `force_merges` was reverted to its clean original — 122 forced phrases, `BLOCKED_PAIRS=[]` (trailing-space now handled by the `block_trailing_space` crate predicate, not an enumerated list), `RECOMMENDED_VOCAB_SIZE=32788` — to keep the combined experiment out of it. The combined-at-32890 is a **next-step candidate**, re-derivable as `force_merges` + the auto_tune audit's r194 block list at `RECOMMENDED_VOCAB_SIZE=32890`. This run's exact 32788 tokenizer is preserved at `~/.cache/nanochat-variants/force_merges_32788/`.
+
+**The 32890 re-bake recovers coverage only partially:** +25 → **+60** (total whole-words −7 → +45), with mangled (−92) and compression (−6.9%) unchanged. The original coverage loss splits ~half/half: ~half was the vocab-budget mistake (fixed by 32890), ~half is **structural** — the carve-out regex (the ` ?\p{N}` space-digit tweak + the phrase carve-outs) plus the trailing-space rule reshape which base merges form, an irreducible cost of the forced-phrase mechanism (matches the ~130-token diff vs auto_tune in the verification diff). So even the corrected combined is **not** a clean `auto_tune ⊕ force_merges`.
+
+### boolq mechanism — probe-confirmed; corrects an earlier wrong read
+
+Most of every tokenizer arm's CORE headline is boolq (force_merges ~83%, auto_tune ~50%, combined ~32%). An earlier analysis read this as "the model always answers *no* and never reads the passage — the gain is just debiasing-to-chance, a fragile artifact." **That was wrong**, from assuming boolq's CORE random baseline is 50%. It is **62** (majority/always-yes rate; `eval_bundle/eval_meta_data.csv`), so raw accuracies are baseline **51.6%**, force_merges **61.7%**, auto_tune **57.4%**, combined **56.1%** — all above the 50% coin-flip. The per-example probe (`tools/boolq_probe.py --ablate swap`) on the combined model confirms it: pred-yes 0.40 (a residual *no*-lean, not always-no) and **swap-delta +0.08** (a wrong passage costs 8 points) → **the model genuinely uses the passage.** The boolq/CORE gains are real reading improvements, not calibration artifacts.
+
+boolq is the extreme of the sub-additivity: combined raw **56.1% < force_merges 61.7%** (and < auto_tune 57.4%) — combining partially *undid* force_merges' boolq gain. That's a representational interaction, **not** a tokenization-boundary artifact: a binding test shows the r194 blocks fire ~identically under the pristine and carve-out regexes (121/129 bind under both; only 8 go inert under the carve-out).
+
+**Next:** seeded d24 of the **32890** combined vs baseline, plus ≥2 seeds to settle force_merges-vs-combined (within noise at one seed). Until then treat "combining is sub-additive / force_merges-alone captures the win" as provisional.
+
 ## Suggested sequencing (updated post-d24)
 
 1. **z-loss and `force_merges` are both adopted — stack them as the default for future speedruns.** No model-side interaction (z-loss is a loss-term overlay, force_merges is a tokenizer artifact), both are essentially-free wins (~zero compute cost), so the next default speedrun runs `OVERLAY=zloss` *with* the canonical `force_merges` tokenizer in place. Single open question worth ablating: turn off the existing logit-softcap (`gpt.py:472`) with z-loss on; the hard cap may now be unnecessary. Cheap d24 ablation, ~$100.

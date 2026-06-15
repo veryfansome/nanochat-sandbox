@@ -39,26 +39,12 @@ To re-curate against a different corpus:
 
 import re
 
-# BLOCKED_PAIRS guard against "letter + space" fragments that the carve-out
-# makes structurally possible (kept verbatim from the hand-picked list — the
-# carve-out shape is unchanged: LHS=punctuation/function-word, RHS=word-like).
-BLOCKED_PAIRS = [
-    (",", " "),
-    (".", " "),
-    ("d", " "),
-    ("e", " "),
-    ("f", " "),
-    ("g", " "),
-    ("h", " "),
-    ("l", " "),
-    ("m", " "),
-    ("n", " "),
-    ("o", " "),
-    ("r", " "),
-    ("s", " "),
-    ("t", " "),
-    ("y", " "),
-]
+# BLOCKED_PAIRS: empty. Trailing-space merges are blocked thoroughly by the crate's
+# block_trailing_space=True predicate (bans any merge whose right operand ends in a
+# space and whose left operand isn't all whitespace), passed by
+# wrappers/tok_train_force_merges.py (see src/lib.rs). This replaced the old
+# enumerated "(char, ' ')" guard list and needs no pair list of its own.
+BLOCKED_PAIRS = []
 
 # Pass-1 mined FORCED pairs (105 entries, ordered by corpus frequency).
 # Regenerate via:

@@ -419,6 +419,7 @@ impl Tokenizer {
         vocab_size: u32,
         blocked_pairs: Option<Vec<(String, String)>>,
         forced_pairs: Option<Vec<(String, String)>>,
+        block_trailing_space: bool,
     ) {
         assert!(vocab_size >= 256, "vocab_size must be at least 256");
 
@@ -543,10 +544,24 @@ impl Tokenizer {
             }
 
             // --- Suppress natural merges for forced pairs ---
-            if !forced_specs.is_empty() || !blocked_specs.is_empty() {
+            if !forced_specs.is_empty() || !blocked_specs.is_empty() || block_trailing_space {
                 let (left, right) = top.pair;
                 let left_bytes = &token_bytes[left as usize];
                 let right_bytes = &token_bytes[right as usize];
+
+                // 0) Trailing-space rule (block_trailing_space): forbid any merge whose
+                //    right operand ends in a space and whose left operand is not all
+                //    whitespace. Kills "X " junk tokens the carve-out's internal spaces
+                //    would otherwise spawn, while leaving leading-space tokens (" word"),
+                //    internal-space forced phrases (" of the"), and pure whitespace runs
+                //    untouched. A predicate, so it's complete + needs no enumerated list.
+                if block_trailing_space
+                    && right_bytes.last() == Some(&b' ')
+                    && !left_bytes.iter().all(|&b| b == b' ')
+                {
+                    banned_pairs.insert(top.pair);
+                    continue 'merge_loop;
+                }
 
                 // 1) Explicitly blocked pairs: NEVER allowed to merge.
                 if let Some(spec_idx) =
@@ -718,8 +733,8 @@ impl Tokenizer {
     /// Train from a streaming iterator (parallel ingestion).
     /// We refill a Rust Vec<String> buffer under the GIL, then release the GIL
     /// to do the heavy splitting and counting **in parallel** with rayon.
-    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None))]
-    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None)")]
+    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None, block_trailing_space=false))]
+    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None, block_trailing_space=False)")]
     pub fn train_from_iterator(
         &mut self,
         py: pyo3::Python<'_>,
@@ -729,6 +744,7 @@ impl Tokenizer {
         pattern: Option<String>,
         blocked_pairs: Option<Vec<(String, String)>>,
         forced_pairs: Option<Vec<(String, String)>>,
+        block_trailing_space: bool,
     ) -> PyResult<()> {
         // Use provided pattern or default to GPT-4 pattern
         let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
@@ -835,7 +851,7 @@ impl Tokenizer {
             cvec.push(c);
         }
 
-        self.train_core_incremental(words, cvec, vocab_size, blocked_pairs, forced_pairs);
+        self.train_core_incremental(words, cvec, vocab_size, blocked_pairs, forced_pairs, block_trailing_space);
         Ok(())
     }
 

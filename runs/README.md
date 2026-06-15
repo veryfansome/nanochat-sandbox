@@ -41,7 +41,7 @@ while ! bash runs/lambda.sh types --available 2>/dev/null | grep -q "gpu_8x_h100
 done
 ```
 
-**Fall-back ladder**: H100 SXM5 → A100 80GB → A100 40GB → V100. Match the row in "Hardware recipes." Total trio cost is roughly flat across tiers (slower hardware is cheaper per hour).
+**Fall-back ladder**: H100 SXM5 → A100 80GB → A100 40GB → V100. Match the row in "Hardware recipes." Trio cost is *not* flat across tiers and cheaper hardware isn't always cheaper per run — at current Lambda prices the 80GB A100 is ~15% faster but ~20% pricier per run than the 40GB. Check live $/hr (see "Cost expectations") before picking.
 
 ## Run patterns
 
@@ -98,9 +98,11 @@ One d24 base-only speedrun (`USE_SFT=0`). Trio = baseline + zloss + mtp sequenti
 | Hardware | $/hr | per-run hours | trio cost (no SFT) |
 |---|---:|---:|---:|
 | 8x H100 SXM5 | ~$24 | ~3.75 | ~$285 |
-| 8x A100 80GB SXM4 | ~$15 | ~5.75 | ~$280 |
-| 8x A100 40GB SXM4 | ~$15 | ~6.75 (measured: ~$313 steady-state, $337 first trip) | ~$320 |
+| 8x A100 80GB SXM4 | $22.32 | ~5.75 | ~$385 (computed) |
+| 8x A100 40GB SXM4 | $15.92 | ~6.75 (measured: ~$313 steady-state, $337 first trip) | ~$320 (measured ~$313–337) |
 | 8x V100 | ~$8 | ~16+ | ~$390+ |
+
+A100 $/hr are **live Lambda prices (2026-06-14): 40GB $15.92, 80GB $22.32**; H100/V100 rows are older approximations — verify before relying. Per *run* in dollars: 40GB ~$107, 80GB ~$128 — the 80GB is ~15% faster (it fits DEVICE_BATCH_SIZE=16 vs 8 + has ~30% more HBM bandwidth; same GA100 die so identical FLOPS) but ~20% **pricier** per run, because its ~40% hourly premium outweighs the time saved. Hardware never changes the CORE/bpb result, only wall-clock — so 40GB is the cheaper route to the same answer; pick 80GB only when the ~1 hr/run saving is worth ~$21/run.
 
 **First trip on a new hardware tier or with a new overlay adds ~$15-25** for learning incidents (overlay-specific OOMs, hardware quirks, auth retries). Budget for it; subsequent trips amortize the lessons.
 
