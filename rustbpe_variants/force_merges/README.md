@@ -13,7 +13,7 @@ force_merges appends-at-end and needs a carve-out because it forces *cross-bound
 
 ## Vocab size
 
-`RECOMMENDED_VOCAB_SIZE = 32788` — a hand-set bracket, **+20 over the 32768 nanochat default**. This is *not* a per-pair cost (most pairs reuse existing ids); the +20 is chosen empirically to keep the borderline tail BPE merges that the extra carve-outs would otherwise displace. Re-bracket if the pair set changes substantially.
+`RECOMMENDED_VOCAB_SIZE = 32890` — **+122 over the 32768 nanochat default, fully additive** (32768 + 122 forced phrases): the forced merges are bolted on rather than displacing borderline base merges. The old +20 bracket at 32788 is retired — `block_trailing_space` + `block_leading_space` free the natural-bigram slots the carve-outs would otherwise contend for, so no displacement bracketing is needed. Re-set to `32768 + len(FORCED_PAIRS)` if the pair count changes.
 
 ## Canonical pair list
 
@@ -23,7 +23,7 @@ Data-driven curation tooling (`tools/mine_forced_pairs.py`, `tools/ablate_{mined
 
 ## Results
 
-Lambda speedrun on the **2026-05-25 canonical** (the prior 104-pair list at vocab=32768, wandb `7aesostl` vs baseline `qmsi105c`, $115.76): **CORE +5.81%, val/bpb tied (slight edge), ChatCORE +0.62%**, zero compute cost. The current in-tree 122-pair/32788 canonical is locally Tier-1-parity + 0.42% better real-corpus compression, **Lambda-pending**. Caveat: 83% of the CORE delta came from boolq alone — see STATUS.md for the full breakdown and significance discussion.
+Lambda speedrun on the **2026-05-25 canonical** (the prior 104-pair list at vocab=32768, wandb `7aesostl` vs baseline `qmsi105c`, $115.76): **CORE +5.81%, val/bpb tied (slight edge), ChatCORE +0.62%**, zero compute cost. The current in-tree canonical is the 122-pair list at **vocab=32890** (additive) with the block_leading_space cannibalization fix, **Lambda-pending** — the prior 32788 build measured locally Tier-1-parity + 0.42% better real-corpus compression; re-measurement on the 32890 build is pending (no downstream claim until then). Caveat: 83% of the CORE delta came from boolq alone — see STATUS.md for the full breakdown and significance discussion.
 
 ## Layout
 

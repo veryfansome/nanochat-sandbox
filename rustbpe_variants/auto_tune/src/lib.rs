@@ -627,6 +627,8 @@ impl Tokenizer {
         vocab_size: u32,
         blocked_pairs: Option<Vec<(String, String)>>,
         forced_pairs: Option<Vec<(String, String)>>,
+        block_trailing_space: bool,
+        block_leading_space: bool,
     ) {
         assert!(vocab_size >= 256, "vocab_size must be at least 256");
 
@@ -751,10 +753,39 @@ impl Tokenizer {
             }
 
             // --- Suppress natural merges for forced pairs ---
-            if !forced_specs.is_empty() || !blocked_specs.is_empty() {
+            if !forced_specs.is_empty() || !blocked_specs.is_empty() || block_trailing_space || block_leading_space {
                 let (left, right) = top.pair;
                 let left_bytes = &token_bytes[left as usize];
                 let right_bytes = &token_bytes[right as usize];
+
+                // 0) Trailing-space rule (block_trailing_space): forbid any merge whose
+                //    right operand ends in a space and whose left operand is not all
+                //    whitespace. Kills "X " junk tokens the carve-out's internal spaces
+                //    would otherwise spawn, while leaving leading-space tokens (" word"),
+                //    internal-space forced phrases (" of the"), and pure whitespace runs
+                //    untouched. A predicate, so it's complete + needs no enumerated list.
+                if block_trailing_space
+                    && right_bytes.last() == Some(&b' ')
+                    && !left_bytes.iter().all(|&b| b == b' ')
+                {
+                    banned_pairs.insert(top.pair);
+                    continue 'merge_loop;
+                }
+
+                // 0b) Leading-space rule (block_leading_space): forbid any merge whose
+                //     right operand STARTS with a space and whose left operand is not all
+                //     whitespace — i.e. a multi-word bigram attaching a new word. Multi-word
+                //     phrases come ONLY from the injected forced list; inside a carved chunk
+                //     the natural bigram (' It'+' is') would otherwise form first and
+                //     intercept the forced merge ('. It is'), so banning them all makes the
+                //     forced phrases the sole multi-word tokens. Pure-whitespace runs survive.
+                if block_leading_space
+                    && right_bytes.first() == Some(&b' ')
+                    && !left_bytes.iter().all(|&b| b == b' ')
+                {
+                    banned_pairs.insert(top.pair);
+                    continue 'merge_loop;
+                }
 
                 // 1) Explicitly blocked pairs: NEVER allowed to merge.
                 if let Some(spec_idx) =
@@ -933,8 +964,8 @@ impl Tokenizer {
     /// Train from a streaming iterator (parallel ingestion).
     /// We refill a Rust Vec<String> buffer under the GIL, then release the GIL
     /// to do the heavy splitting and counting **in parallel** with rayon.
-    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None))]
-    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None)")]
+    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None, block_trailing_space=false, block_leading_space=false))]
+    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None, block_trailing_space=False, block_leading_space=False)")]
     pub fn train_from_iterator(
         &mut self,
         py: pyo3::Python<'_>,
@@ -944,9 +975,11 @@ impl Tokenizer {
         pattern: Option<String>,
         blocked_pairs: Option<Vec<(String, String)>>,
         forced_pairs: Option<Vec<(String, String)>>,
+        block_trailing_space: bool,
+        block_leading_space: bool,
     ) -> PyResult<()> {
         let (words, cvec) = self.ingest_corpus(py, iterator, pattern, buffer_size)?;
-        self.train_core_incremental(words, cvec, vocab_size, blocked_pairs, forced_pairs);
+        self.train_core_incremental(words, cvec, vocab_size, blocked_pairs, forced_pairs, block_trailing_space, block_leading_space);
         Ok(())
     }
 
@@ -975,13 +1008,15 @@ impl Tokenizer {
     /// consumes its inputs) so it stays reusable. Bit-identical to a
     /// `train_from_iterator` call with the same corpus + args. Errors if no
     /// corpus has been cached.
-    #[pyo3(signature = (vocab_size, blocked_pairs=None, forced_pairs=None))]
-    #[pyo3(text_signature = "(self, vocab_size, blocked_pairs=None, forced_pairs=None)")]
+    #[pyo3(signature = (vocab_size, blocked_pairs=None, forced_pairs=None, block_trailing_space=false, block_leading_space=false))]
+    #[pyo3(text_signature = "(self, vocab_size, blocked_pairs=None, forced_pairs=None, block_trailing_space=False, block_leading_space=False)")]
     pub fn train_from_cached(
         &mut self,
         vocab_size: u32,
         blocked_pairs: Option<Vec<(String, String)>>,
         forced_pairs: Option<Vec<(String, String)>>,
+        block_trailing_space: bool,
+        block_leading_space: bool,
     ) -> PyResult<()> {
         let words = self.cached_words.clone().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
@@ -989,60 +1024,8 @@ impl Tokenizer {
         let counts = self.cached_counts.clone().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
         })?;
-        self.train_core_incremental(words, counts, vocab_size, blocked_pairs, forced_pairs);
+        self.train_core_incremental(words, counts, vocab_size, blocked_pairs, forced_pairs, block_trailing_space, block_leading_space);
         Ok(())
-    }
-
-    /// Train MANY candidates against the cached corpus in PARALLEL, sharing it
-    /// read-only (each candidate clones the words its own merge loop mutates).
-    /// Returns one mergeable-ranks list per candidate, in input order — each
-    /// bit-identical to the matching `train_from_cached`. The merge loop is
-    /// serial per candidate (see `train_core_incremental`), so N candidates run
-    /// on ~N cores; this recovers the throughput the serial `train_from_cached`
-    /// leaves on the table. `num_threads` caps the rayon pool (None = all cores)
-    /// so callers can sweep concurrency to find where throughput saturates.
-    /// Releases the GIL for the whole parallel section.
-    #[pyo3(signature = (vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None))]
-    #[pyo3(text_signature = "(self, vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None)")]
-    pub fn train_many(
-        &self,
-        py: pyo3::Python<'_>,
-        vocab_size: u32,
-        blocked_pairs_batch: Vec<Vec<(String, String)>>,
-        num_threads: Option<usize>,
-        forced_pairs: Option<Vec<(String, String)>>,
-    ) -> PyResult<Vec<Vec<(Vec<u8>, u32)>>> {
-        let words = self.cached_words.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
-        })?;
-        let counts = self.cached_counts.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
-        })?;
-        let run = || {
-            blocked_pairs_batch
-                .par_iter()
-                .map(|blocked| {
-                    let mut t = Tokenizer::new();
-                    t.train_core_incremental(
-                        words.clone(),
-                        counts.clone(),
-                        vocab_size,
-                        Some(blocked.clone()),
-                        forced_pairs.clone(),
-                    );
-                    t.get_mergeable_ranks()
-                })
-                .collect::<Vec<_>>()
-        };
-        let results = py.allow_threads(|| match num_threads {
-            Some(p) => rayon::ThreadPoolBuilder::new()
-                .num_threads(p)
-                .build()
-                .expect("failed to build rayon pool")
-                .install(run),
-            None => run(),
-        });
-        Ok(results)
     }
 
     /// Cache the lowercased dictionary wordlist for the in-Rust coverage scan.
@@ -1119,8 +1102,8 @@ impl Tokenizer {
     /// Python `build_tok` + `measure` path, so callers can drop the per-candidate
     /// tiktoken round-trip entirely. Requires `load_corpus`, `finalize_holdout`,
     /// and `set_wordlist` first.
-    #[pyo3(signature = (vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None))]
-    #[pyo3(text_signature = "(self, vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None)")]
+    #[pyo3(signature = (vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None, block_trailing_space=false, block_leading_space=false))]
+    #[pyo3(text_signature = "(self, vocab_size, blocked_pairs_batch, num_threads=None, forced_pairs=None, block_trailing_space=False, block_leading_space=False)")]
     pub fn evaluate_many(
         &self,
         py: pyo3::Python<'_>,
@@ -1128,6 +1111,8 @@ impl Tokenizer {
         blocked_pairs_batch: Vec<Vec<(String, String)>>,
         num_threads: Option<usize>,
         forced_pairs: Option<Vec<(String, String)>>,
+        block_trailing_space: bool,
+        block_leading_space: bool,
     ) -> PyResult<Vec<(usize, usize, Vec<(u64, usize)>)>> {
         let words = self.cached_words.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("no cached corpus; call load_corpus() first")
@@ -1157,6 +1142,8 @@ impl Tokenizer {
                         vocab_size,
                         Some(blocked.clone()),
                         forced_pairs.clone(),
+                        block_trailing_space,
+                        block_leading_space,
                     );
                     let n_merge = 256 + t.merges.len();
 

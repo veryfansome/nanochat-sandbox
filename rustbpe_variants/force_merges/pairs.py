@@ -2,9 +2,11 @@
 FORCED_PAIRS / BLOCKED_PAIRS / DERIVED_PAIRS + derived SPLIT_PATTERN.
 
 105 mined FORCED + 15 mined DERIVED + 2 numeric DERIVED = 122 forced
-merges, vocab=32788 (+20 over nanochat default — bracketed empirically to
-keep the borderline BPE merges that the extra carve-outs would otherwise
-displace; see STATUS.md §force_merges curation details).
+merges, vocab=32890 (32768 nanochat default + 122, fully ADDITIVE — the forced
+phrases are bolted on rather than displacing borderline base merges). The old +20
+bracket at 32788 is retired: block_leading_space frees the natural-bigram slots,
+so no displacement bracketing is needed. See RECOMMENDED_VOCAB_SIZE below + the
+BLOCKED_PAIRS note, and STATUS.md §force_merges curation details.
 
 ## History
 
@@ -27,23 +29,29 @@ lineage preserved at `mined/forced_pairs_climbmix_20rg.py` (single-pass,
 pre-shadow-fix) and `mined/forced_pairs_climbmix_20rg_twopass_pre_shadow_fix.py`
 (2026-05-25's two-pass output, source for the speedrun tokenizer).
 
-To re-curate against a different corpus:
+To re-curate against a different corpus (the mining/ablation tooling —
+`tools/mine_forced_pairs.py`, `tools/ablate_derived.py` — was removed 2026-06-05;
+restore it from git history first, see STATUS.md §force_merges):
   1. Re-mine (`tools/mine_forced_pairs.py --two-pass`).
   2. Re-ablate K (`tools/ablate_derived.py`).
   3. Paste new tuples into `_MINED_FORCED` / `_MINED_DERIVED` below
      (intentionally a flat literal list, not a runtime loader).
   4. Re-validate `_NUMERIC_DERIVED` — added for `currency` probe; a
      different corpus may need different (or no) numeric concats.
-  5. Re-bracket `RECOMMENDED_VOCAB_SIZE` if the new pair set is much larger.
+  5. Set `RECOMMENDED_VOCAB_SIZE = 32768 + len(FORCED_PAIRS)` (additive; the old
+     +20 displacement bracket no longer applies — see the summary above).
 """
 
 import re
 
-# BLOCKED_PAIRS: empty. Trailing-space merges are blocked thoroughly by the crate's
-# block_trailing_space=True predicate (bans any merge whose right operand ends in a
-# space and whose left operand isn't all whitespace), passed by
-# wrappers/tok_train_force_merges.py (see src/lib.rs). This replaced the old
-# enumerated "(char, ' ')" guard list and needs no pair list of its own.
+# BLOCKED_PAIRS: empty. The forced-phrase cannibalizers — inner bigrams (' It'+' is')
+# AND shared prefixes ('.'+' T') — are now killed wholesale by the crate's
+# block_leading_space=True predicate (bans any base merge whose right operand STARTS
+# with a space and whose left operand isn't all whitespace), the mirror of
+# block_trailing_space. Both predicates are passed by wrappers/tok_train_force_merges.py
+# (see src/lib.rs), so no enumerated pair list is needed. (Multi-word phrases come only
+# from the injected forced list, so no legitimate base merge has a space-leading R —
+# except pure-whitespace runs, which the all-whitespace-L guard preserves.)
 BLOCKED_PAIRS = []
 
 # Pass-1 mined FORCED pairs (105 entries, ordered by corpus frequency).
@@ -214,8 +222,11 @@ SPLIT_PATTERN = (
     r"""| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 )
 
-# Recommended vocab_size when training this tokenizer. Bracketed empirically
-# for the 122-pair set (see STATUS.md §force_merges curation details →
-# §"Re-curation (2026-05-26)" → vocab-cost bracketing).
-# `tok_train_force_merges.py` reads this.
-RECOMMENDED_VOCAB_SIZE = 32788
+# Recommended vocab_size when training this tokenizer. 32890 = 32768 (nanochat
+# default) + 122 forced phrases, fully ADDITIVE — the forced merges are bolted onto
+# the normal vocab rather than displacing borderline base merges (the old +20 bracket
+# at 32788). This keeps force_merges' base-merge budget identical to baseline AND to
+# the auto_tune audit (which also runs at 32890), so cross-tokenizer comparisons are
+# apples-to-apples. With block_leading_space freeing the natural-bigram slots, the old
+# displacement bracketing no longer applies. `tok_train_force_merges.py` reads this.
+RECOMMENDED_VOCAB_SIZE = 32890

@@ -10,16 +10,13 @@ Pristine pretokenization `SPLIT_PATTERN` (no carve-out), blocking only — no fo
 auto_tune/
 ├── README.md            # this file (CLAUDE.md → README.md): the overlay + methodology
 ├── Cargo.toml + pyproject.toml + src/lib.rs   # the rustbpe_auto_tune crate (force_merges fork + corpus caching)
-├── pairs.py             # the proven BLOCKED_PAIRS + the audit's candidate queues
-├── mined_candidates.py  # frozen CANDIDATES_MINED  (generators removed 2026-06-05; lists kept)
-├── flag_candidates.py   # frozen CANDIDATES_FLAGS
-├── pass2_candidates.py  # frozen CANDIDATES_PASS2  (the current fixpoint's candidate list)
+├── pairs.py             # BLOCKED_PAIRS (the only thing the trainer reads; currently empty — see file comment)
 └── audit/               # the block-list audit: live log + checked-in resume state
     ├── README.md        # live audit log — round plan, status, results, exploration directions (CLAUDE.md → README.md)
     └── checkpoint.json + ledger.md + lineage.jsonl  # CANONICAL converged auto-mine run (comptol6, promoted to top level); earlier passes removed 2026-06-14 — lessons in audit/README.md §Superseded passes
 ```
 
-`pairs.py` separates **`BLOCKED_PAIRS`** (the proven list — *the only thing the trainer reads*) from the candidate queues (`CANDIDATES`, `CANDIDATES_MANUAL`, `CANDIDATES_MINED`, `CANDIDATES_FLAGS`, `CANDIDATES_PASS2`). The current driver reads `CANDIDATES_PASS2`. **Live audit status, round plan, and per-round results: [`audit/README.md`](audit/README.md).**
+`pairs.py` holds **`BLOCKED_PAIRS`** — *the only thing the trainer reads*; it is currently **empty** (the downstream-tested r194 set is env-baked, pending promotion of the held-out-vetted fixpoint winners — see the file's comment). The audit's candidate pool is no longer a static list: the driver mines it adaptively from the reference vocab each round (`--mine`, the default). The old static `CANDIDATES*` queues (and the generators that produced them) were retired in the 2026-06 cleanup — git history preserves them. **Live audit status, round plan, and per-round results: [`audit/README.md`](audit/README.md).**
 
 ## Tuning objective
 
@@ -36,13 +33,13 @@ There is no fixed exchange rate between these yet. The lexicographic rule never 
 The methodology itself is under active tuning — refine it as evidence accumulates. The core discipline: **every entry in `BLOCKED_PAIRS` must have a proven net-positive effect; nothing that doesn't pull its weight stays in.**
 
 ### The driver: held-out-Pareto fixpoint
-`tools/heldout_fixpoint_cached.py` rebuilds `BLOCKED_PAIRS` from empty over a candidate list (`CANDIDATES_PASS2`), training each candidate on top of the growing kept set and measuring it on **10 held-out shards** (never trained on). It uses the `rustbpe_auto_tune` crate's `load_corpus`/`train_from_cached` — the training corpus is read+tokenized once and reused for every candidate (~30s/candidate vs ~174s), which is what makes the maximally-thorough scheme below affordable.
+`tools/heldout_fixpoint_cached.py` rebuilds `BLOCKED_PAIRS` from empty over an adaptively-mined candidate pool (`--mine`, the default: each round re-mines the reference vocab for mangled + low-firing tokens), training each candidate on top of the growing kept set and measuring it on **10 held-out shards** (never trained on). It uses the `rustbpe_auto_tune` crate's `load_corpus`/`train_from_cached` — the training corpus is read+tokenized once and reused for every candidate (~30s/candidate vs ~174s), which is what makes the maximally-thorough scheme below affordable.
 
 - **Gate (held-out Pareto):** KEEP a candidate iff, **averaged over the 10 held-out shards, whole-word coverage ↑ AND compression ≤ 0 AND dead ≤ 0**. Generalization is baked into selection — no separate after-the-fact check. Mangled is *logged* (on the tune shard, for keeps) but **not gated**: it's a heuristic that can be gamed by shoving tokens into its blind spots, and held-out shards don't catch that.
 - **Greedy fixpoint:** each round trains the whole remaining pool against the current reference, commits the single best keep (max Δcov, then min Δcomp, then min Δdead), and re-checks *everything* against the new reference — so unlock-combos (a pair that fails alone but passes once another block reshapes the tree) are caught inline. Converges when a full round finds no keep; a final **leave-one-out** pass flags any kept pair made redundant by a later keep. Not globally optimal (the gate is non-monotonic, so no greedy method is) — a complete greedy fixpoint.
 - **Why build-up / retrain per candidate:** a candidate redundant with an already-kept pair shows ~0 gain on top of `kept`, so it drops naturally. Training is deterministic, so one retrain gives a real delta (`train_from_cached` is bit-identical to a full `train_from_iterator`).
 
-*Predecessor:* the earlier **single-shard lexicographic** build-up (`tools/audit_blocked_pairs.py`; rounds 1–3 + a flag-revisit; coverage > compression > mangled on one shard) produced the promoted 96-pair list — but single-shard compression turned out to overfit (held-out mean went the wrong way; see `audit/README.md` End-game), which is why the held-out-Pareto redesign replaced it. That history + per-round results live in [`audit/README.md`](audit/README.md).
+*Predecessor:* the earlier **single-shard lexicographic** build-up (`tools/audit_blocked_pairs.py`, removed in the 2026-06 cleanup; rounds 1–3 + a flag-revisit; coverage > compression > mangled on one shard) produced the promoted 96-pair list — but single-shard compression turned out to overfit (held-out mean went the wrong way; see `audit/README.md` End-game), which is why the held-out-Pareto redesign replaced it. That history + per-round results live in [`audit/README.md`](audit/README.md).
 
 ### Candidate generation (how to find pairs worth testing)
 Most room to improve here — no settled "best" generator yet.
@@ -53,7 +50,7 @@ Most room to improve here — no settled "best" generator yet.
 - The blocked-pairs report's sections (blocked-R diff, cleanup candidates, latent routes) are additional per-round signal.
 
 ### Multi-pair follow-up: co-requisite & cascade sets
-Single-pair-in-isolation misses pairs that pay off only **together**, so a DROP means "not useful alone," not "never useful." The predecessor's `--mode groups` re-tested **sets** (`CANDIDATE_GROUPS*`) jointly (the 2 passes below); future combination tests would instead seed the fixpoint with the proven reference and feed the sets as candidates (see `audit/README.md` direction 1). Two flavors:
+Single-pair-in-isolation misses pairs that pay off only **together**, so a DROP means "not useful alone," not "never useful." The predecessor's `--mode groups` re-tested **sets** (`CANDIDATE_GROUPS*`) jointly (the 2 passes below; both that driver and the static group queues were retired in the 2026-06 cleanup, but the finding stands); future combination tests would instead seed the fixpoint with the proven reference and feed the sets as candidates (see `audit/README.md` direction 1). Two flavors:
 - **Co-requisite (multi-route):** a surface form reachable via >1 merge route — every route must be blocked or the token still forms (`astically` = `ast+ically` *or* `astic+ally`).
 - **Cascade-enabling:** blocking one pair reshapes the tree so a cheaper block suffices elsewhere (`b+ility` lets `ubility` fall to `ub+ility`).
 - **What we've seen so far (small sample — 2 families, ~32 sets, 0 keeps):** in `-ically` and `-ation`, the enumerated routes to a surface form were *not* co-equal — one carried the delta and blocking the siblings added nothing, so the set behaved like its best single route. **Too little data to generalize** (other families, and cascade-enabling sets, are untested). A lead worth trying: prioritize sets where **no single route shows the full delta** (candidate co-equal routes). Details + the open question in [`audit/README.md`](audit/README.md).
@@ -67,7 +64,7 @@ Single-pair-in-isolation misses pairs that pay off only **together**, so a DROP 
 ### Running the audit
 In-process + serial; the corpus is cached once (~140s), then ~30s/candidate. State (`checkpoint.json` + `ledger.md` + `lineage.jsonl`) is checked in and rewritten every eval batch (`--eval-batch`, default 30), so a crash resumes mid-round and `commit`+`pull` resumes on another machine. The canonical (converged) run is promoted to the **top level of `audit/`**; to resume/rerun it pass `--state-dir rustbpe_variants/auto_tune/audit` (its invocation: `--mine --gate-comp-tolerance 6 --gate-dead-tolerance 1 --cooldown-base 4 --net-commit`; see `audit/README.md`).
 ```
-uv run python -m tools.heldout_fixpoint_cached            # full run (180 candidates, ~16–30h)
+uv run python -m tools.heldout_fixpoint_cached            # full run (adaptive --mine pool, ~16–30h)
 uv run python -m tools.heldout_fixpoint_cached --resume   # continue after any interruption
 ```
 Why in-process + cached, not parallel subprocesses: a single BPE train already saturates all cores (rayon), so running many trains at once doesn't add throughput — and the dominant cost was re-reading the corpus (~85% of a train), not the merge loop. Caching the corpus once and running merge loops back-to-back gives the ~6× speedup; concurrency would only oversubscribe.

@@ -574,87 +574,41 @@ def find_mangled_prefixes(
     return mangled
 
 
-def _build_parents(b2i: dict[bytes, int], i2b: dict[int, bytes]) -> dict[int, list[int]]:
-    """token_id -> parent token_ids (tokens that use it as a merge child), via the
-    reconstructed formation tree (find_formation_split's min-max-rank split). Used to
-    test whether a dead token is load-bearing (a descendant of a firing token)."""
-    parents: dict[int, list[int]] = {}
-    for tid, b in i2b.items():
-        if tid < 256:
-            continue
-        sp = find_formation_split(b, b2i, tid)
-        if sp:
-            parents.setdefault(sp[2], []).append(tid)
-            parents.setdefault(sp[3], []).append(tid)
-    return parents
-
-
-def find_dead_orphans(
-    tok,
+def find_firing_percentile_candidates(
     fire: dict[int, int],
     b2i: dict[bytes, int],
     i2b: dict[int, bytes],
-    words,
+    percentile: float,
     *,
-    parents: dict[int, list[int]] | None = None,
     all_routes: bool = True,
-    skip_proper_nouns: bool = True,
+    exclude: set[tuple[bytes, bytes]] | None = None,
 ) -> set[tuple[str, str]]:
-    """Detect genuinely-wasted dead tokens and emit their formation-route block
-    candidates. A token qualifies iff ALL hold:
-      1. it never fires (`fire[tid] == 0`) — pass `fire` from a LARGE corpus so
-         corpus-rarity doesn't masquerade as waste (a 20M slice flags rare-but-real
-         tokens like ' Dubai' as dead);
-      2. it isn't a dictionary word or a light inflection of one — so legitimate
-         rare-word tokens (e.g. ' fundament') are NOT blocked;
-      3. it isn't load-bearing — not in the merge subtree of any FIRING token, so
-         removing it can't break a longer token's formation (in BPE, producing a
-         token forms its whole subtree, so a dead token with a firing ancestor is a
-         necessary intermediate, not waste);
-      4. (optional) it isn't proper-noun-shaped (leading capital) — the highest
-         false-dead risk on any finite corpus.
-    Blocking such a token's formation pair frees its merge slot at ~zero coverage
-    cost; the held-out gate remains the final arbiter. Base bytes and invalid-UTF-8
-    byte-fragments are skipped (byte-level, not cleanly blockable)."""
-    from tools.blocked_pairs_report import _is_word
-    if parents is None:
-        parents = _build_parents(b2i, i2b)
-
-    def has_firing_ancestor(d: int) -> bool:
-        seen: set[int] = set()
-        stack = list(parents.get(d, ()))
-        while stack:
-            a = stack.pop()
-            if a in seen:
-                continue
-            seen.add(a)
-            if fire.get(a, 0) > 0:
-                return True
-            stack.extend(parents.get(a, ()))
-        return False
-
+    """Emit formation-route block candidates for every fireable MERGE token whose
+    firing count is at or below the `percentile`-th percentile of the fireable-merge
+    firing distribution. A pure firing cut — NO word / load-bearing / proper-noun
+    filter (the held-out gate is the sole arbiter; this generalizes + replaces the
+    old `find_dead_orphans`, whose dead-token case is just the low-percentile band
+    where the threshold lands at 0 firings). Specials are already absent from `i2b`
+    (see build_vocab_maps);
+    single-byte base tokens are skipped here, so the percentile is computed over
+    fireable merges only (`len(b) >= 2`). Pass `fire` from a LARGE corpus
+    (mine_candidates does, over `firing_max_chars`) so corpus-rarity doesn't
+    masquerade as low value. `percentile <= 0` returns empty."""
+    if percentile <= 0:
+        return set()
+    merges = [(tid, b) for tid, b in i2b.items() if len(b) >= 2]   # drop base bytes
+    if not merges:
+        return set()
+    firings = sorted(fire.get(tid, 0) for tid, _ in merges)
+    threshold = firings[int(percentile / 100.0 * (len(firings) - 1))]
     cands: set[tuple[str, str]] = set()
-    for tid, b in i2b.items():
-        if tid < 256 or fire.get(tid, 0) > 0:          # base byte, or fires => not a dead orphan
-            continue
-        try:
-            s = b.decode("utf-8")
-        except UnicodeDecodeError:                      # byte-level fragment — skip
-            continue
-        stripped = s.lstrip()
-        if not stripped:
-            continue
-        if skip_proper_nouns and stripped[0].isupper():  # proper-noun-shaped => false-dead risk
-            continue
-        w = stripped.lower()
-        if w in words or _is_word(w, words):            # legitimate (rare) word — keep it
-            continue
-        if has_firing_ancestor(tid):                    # load-bearing intermediate — keep it
+    for tid, b in merges:
+        if fire.get(tid, 0) > threshold:
             continue
         if all_routes:
-            routes = find_formation_routes(b, b2i, tid)
+            routes = find_formation_routes(b, b2i, tid, exclude=exclude)
         else:
-            sp = find_formation_split(b, b2i, tid)
+            sp = find_formation_split(b, b2i, tid, exclude=exclude)
             routes = [sp] if sp else []
         for r in routes:
             try:
@@ -674,9 +628,8 @@ def mine_candidates(
     mode: str = "suffix",
     all_routes: bool = True,
     exclude: set[tuple[bytes, bytes]] | None = None,
-    dead_orphans: bool = False,
-    words=None,
-    dead_max_chars: int = 100_000_000,
+    firing_percentile: float = 0.0,
+    firing_max_chars: int = 100_000_000,
 ) -> set[tuple[str, str]]:
     """Mine `(L, R)` block candidates from a tokenizer's CURRENT vocab, in-process.
 
@@ -689,11 +642,12 @@ def mine_candidates(
     DISAPPEAR (their mangled token no longer forms) drop out. Stderr tallies are
     suppressed (callers log a one-line pool size instead).
 
-    With `dead_orphans=True`, also adds genuinely-wasted dead tokens as candidates
-    (see `find_dead_orphans`): a fresh fire-count over `dead_max_chars` of the
-    discovery split gates the "doesn't fire" test on a LARGE corpus, then the
-    not-a-word / not-load-bearing / not-proper-noun filters apply. `words` is the
-    dict wordlist (loaded if None).
+    With `firing_percentile > 0`, ALSO adds every fireable merge token (specials +
+    base bytes excluded) whose firing is at or below that percentile of the
+    fireable-merge firing distribution — a fresh fire-count over `firing_max_chars`
+    of the discovery split gives the percentile (see
+    `find_firing_percentile_candidates`). Pure firing cut, no morpheme/word filter;
+    the held-out gate is the arbiter.
     """
     import contextlib
     import io as _io
@@ -734,20 +688,18 @@ def mine_candidates(
             except UnicodeDecodeError:
                 continue
 
-    if dead_orphans:
+    if firing_percentile > 0:
         from tools._corpus_iter import iter_capped_batches
-        if words is None:
-            from tools.blocked_pairs_report import load_wordlist
-            words = load_wordlist()
-        # Dead-check on a LARGE corpus (corpus-rarity != waste): fresh fire counts
-        # for THIS reference over up to dead_max_chars of the discovery split, well
-        # beyond the mangled detector's `max_chars`. The held-out gate is still the
-        # final arbiter on each emitted candidate.
-        dead_fire: Counter = Counter()
-        for docs in iter_capped_batches("val", dead_max_chars):
+        # Fresh fire counts for THIS reference over a LARGE corpus (up to
+        # firing_max_chars of the discovery split, beyond the mangled detector's
+        # `max_chars`) so corpus-rarity doesn't masquerade as low value. The
+        # held-out gate is the final arbiter on each emitted candidate.
+        fire: Counter = Counter()
+        for docs in iter_capped_batches("val", firing_max_chars):
             for ids in tok.enc.encode_ordinary_batch(docs, num_threads=8):
-                dead_fire.update(ids)
-        cands |= find_dead_orphans(tok, dead_fire, b2i, i2b, words, all_routes=all_routes)
+                fire.update(ids)
+        cands |= find_firing_percentile_candidates(
+            fire, b2i, i2b, firing_percentile, all_routes=all_routes, exclude=exclude)
 
     return cands
 

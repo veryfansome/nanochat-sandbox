@@ -61,12 +61,15 @@ def apply_patches():
             pattern=tk.SPLIT_PATTERN,
             forced_pairs=FORCED_PAIRS,
             blocked_pairs=BLOCKED_PAIRS,
-            # Predicate rule: ban any merge whose right operand ends in a space and
-            # whose left operand isn't all-whitespace — thoroughly kills "X " trailing-
-            # space junk the carve-out's internal spaces spawn (replaces the old
-            # enumerated (char, " ") guard list, which was frequency-incomplete and
-            # never covered (word, " ")). See rustbpe crate's merge loop.
+            # Predicate rules (see rustbpe crate's merge loop):
+            #  - block_trailing_space: ban any merge whose right operand ENDS in a space
+            #    (left not all-whitespace) — kills "X " trailing-space junk.
+            #  - block_leading_space: ban any merge whose right operand STARTS with a space
+            #    (left not all-whitespace) — kills natural multi-word bigrams (' It'+' is',
+            #    '.'+' T') that would otherwise intercept the injected forced phrases
+            #    ('. It is'); the forced list stays the sole source of multi-word tokens.
             block_trailing_space=True,
+            block_leading_space=True,
         )
         pattern = tokenizer.get_pattern()
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()

@@ -33,10 +33,9 @@ def apply_patches():
     import nanochat.tokenizer as tk
     from rustbpe_variants.auto_tune.pairs import BLOCKED_PAIRS
 
-    # Audit override: tools/audit_blocked_pairs.py sets AUTO_TUNE_BLOCKED_PAIRS_JSON
-    # to a JSON list of [L, R] pairs to train this run with, bypassing pairs.py's
-    # BLOCKED_PAIRS. Lets the build-up sweep train kept+candidate sets without
-    # editing the module each iteration.
+    # Manual override: set AUTO_TUNE_BLOCKED_PAIRS_JSON to a JSON list of [L, R]
+    # pairs to train this run with, bypassing pairs.py's BLOCKED_PAIRS — for a
+    # one-off train of a specific block set without editing the module.
     import json
     import os
     _override = os.environ.get("AUTO_TUNE_BLOCKED_PAIRS_JSON")

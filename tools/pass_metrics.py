@@ -146,6 +146,29 @@ def compute_metrics(tok, corpus, count_mangled: bool, bound_threshold: float):
     }
 
 
+def whole_word_counts(tok, words):
+    """(base, inflected) space-prefixed dictionary-word tokens in the vocab.
+    Mirrors blocked_pairs_report.whole_word_count but reads token strings
+    straight from the tokenizer (no dump file needed). Used by the held-out
+    audit drivers as the coverage metric."""
+    from tools.blocked_pairs_report import _is_word
+    base = inflected = 0
+    n = tok.get_vocab_size() - len(tok.get_special_tokens())
+    for tid in range(n):
+        try:
+            s = tok.decode([tid])
+        except Exception:
+            continue
+        if not s.startswith(" "):
+            continue
+        w = s[1:].lower()
+        if w in words:
+            base += 1
+        elif _is_word(w, words):
+            inflected += 1
+    return base, inflected
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,

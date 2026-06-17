@@ -420,6 +420,7 @@ impl Tokenizer {
         blocked_pairs: Option<Vec<(String, String)>>,
         forced_pairs: Option<Vec<(String, String)>>,
         block_trailing_space: bool,
+        block_leading_space: bool,
     ) {
         assert!(vocab_size >= 256, "vocab_size must be at least 256");
 
@@ -544,7 +545,7 @@ impl Tokenizer {
             }
 
             // --- Suppress natural merges for forced pairs ---
-            if !forced_specs.is_empty() || !blocked_specs.is_empty() || block_trailing_space {
+            if !forced_specs.is_empty() || !blocked_specs.is_empty() || block_trailing_space || block_leading_space {
                 let (left, right) = top.pair;
                 let left_bytes = &token_bytes[left as usize];
                 let right_bytes = &token_bytes[right as usize];
@@ -557,6 +558,21 @@ impl Tokenizer {
                 //    untouched. A predicate, so it's complete + needs no enumerated list.
                 if block_trailing_space
                     && right_bytes.last() == Some(&b' ')
+                    && !left_bytes.iter().all(|&b| b == b' ')
+                {
+                    banned_pairs.insert(top.pair);
+                    continue 'merge_loop;
+                }
+
+                // 0b) Leading-space rule (block_leading_space): forbid any merge whose
+                //     right operand STARTS with a space and whose left operand is not all
+                //     whitespace — i.e. a multi-word bigram attaching a new word. Multi-word
+                //     phrases come ONLY from the injected forced list; inside a carved chunk
+                //     the natural bigram (' It'+' is') would otherwise form first and
+                //     intercept the forced merge ('. It is'), so banning them all makes the
+                //     forced phrases the sole multi-word tokens. Pure-whitespace runs survive.
+                if block_leading_space
+                    && right_bytes.first() == Some(&b' ')
                     && !left_bytes.iter().all(|&b| b == b' ')
                 {
                     banned_pairs.insert(top.pair);
@@ -733,8 +749,8 @@ impl Tokenizer {
     /// Train from a streaming iterator (parallel ingestion).
     /// We refill a Rust Vec<String> buffer under the GIL, then release the GIL
     /// to do the heavy splitting and counting **in parallel** with rayon.
-    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None, block_trailing_space=false))]
-    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None, block_trailing_space=False)")]
+    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None, block_trailing_space=false, block_leading_space=false))]
+    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, blocked_pairs=None, forced_pairs=None, block_trailing_space=False, block_leading_space=False)")]
     pub fn train_from_iterator(
         &mut self,
         py: pyo3::Python<'_>,
@@ -745,6 +761,7 @@ impl Tokenizer {
         blocked_pairs: Option<Vec<(String, String)>>,
         forced_pairs: Option<Vec<(String, String)>>,
         block_trailing_space: bool,
+        block_leading_space: bool,
     ) -> PyResult<()> {
         // Use provided pattern or default to GPT-4 pattern
         let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
@@ -851,7 +868,7 @@ impl Tokenizer {
             cvec.push(c);
         }
 
-        self.train_core_incremental(words, cvec, vocab_size, blocked_pairs, forced_pairs, block_trailing_space);
+        self.train_core_incremental(words, cvec, vocab_size, blocked_pairs, forced_pairs, block_trailing_space, block_leading_space);
         Ok(())
     }
 

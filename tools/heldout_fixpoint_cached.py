@@ -23,7 +23,6 @@ subprocess path exactly.
 """
 import argparse
 import glob
-import importlib
 import json
 import os
 import shutil
@@ -35,25 +34,61 @@ from pathlib import Path
 def main():
     home = os.path.expanduser("~")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pairs-module", default="rustbpe_variants.auto_tune.pairs")
-    p.add_argument("--candidates-attr", default="CANDIDATES_PASS2")
     p.add_argument("--holdout-glob", default=f"{home}/.cache/nanochat/base_data_climbmix_holdout/*.parquet")
     p.add_argument("--tune-shard", default=f"{home}/.cache/nanochat/base_data_climbmix/shard_06542.parquet")
     p.add_argument("--max-chars", type=int, default=10_000_000, help="char cap per held-out shard")
     p.add_argument("--corpus-max-chars", type=int, default=2_000_000_000, help="training-corpus char cap (tok_train default 2B)")
     p.add_argument("--doc-cap", type=int, default=10_000, help="per-doc char cap (tok_train default 10k)")
     p.add_argument("--vocab-size", type=int, default=32768)
+    p.add_argument("--fm-context", action=argparse.BooleanOptionalAction, default=False,
+                   help="tune blocks INSIDE force_merges' pretokenization: carve-out SPLIT_PATTERN "
+                        "+ 122 forced phrases + block_trailing_space, vocab 32890 (32768+122); selects "
+                        "blocks optimal for force_merges. Default off = pristine audit.")
     p.add_argument("--work-base", default=f"{home}/.cache/nanochat-variants/auto_tune_fixpoint")
     p.add_argument("--state-dir", default="rustbpe_variants/auto_tune/audit/heldout_fixpoint")
     p.add_argument("--bound-threshold", type=float, default=0.05)
     p.add_argument("--limit", type=int, default=None, help="cap pool size (smoke)")
     p.add_argument("--no-loo", action="store_true")
     p.add_argument("--resume", action="store_true")
+    # --- orchestrated mode: a human/Claude judge picks the commit each round ---
+    p.add_argument("--propose", action="store_true",
+                   help="orchestrated mode: run ONE round (cleanup → cooldown → eval → gate), compute "
+                        "net-firing-coverage for the top keeps, print them ranked, then STOP before "
+                        "committing — for an external judge to pick. Resumes/inits the checkpoint like a "
+                        "normal run; pairs with --commit. Run it in the background (the eval is the slow part).")
+    p.add_argument("--commit", default=None, metavar='\'["L","R"]\'',
+                   help="orchestrated mode: net-commit the chosen keep into a round already scored by "
+                        "--propose, then re-mine. Value is a JSON 2-list (e.g. '[\" ev\",\"ol\"]'), or "
+                        "'none' to advance the round with no commit. A net-negative pick is vetoed+jailed "
+                        "(then --propose the next round and pick another).")
+    p.add_argument("--propose-top-n", type=int, default=12,
+                   help="how many top keeps (by the heuristic order) to compute net-firing-cov for + "
+                        "present in --propose (each costs one retrain + a held-out fire pass)")
     p.add_argument("--rerun", default=None,
                    help="re-run IN PLACE from a prior round: 'last' (re-do the final round) or an int N "
                         "(roll back to before round N). Discards rounds >= N, re-derives kept from rounds "
-                        "1..N-1, re-mines with the CURRENT flags (e.g. newly-added --mine-dead-orphans), "
+                        "1..N-1, re-mines with the CURRENT flags (e.g. a changed --mine-firing-percentile), "
                         "and continues to re-convergence. Backs up the prior checkpoint/ledger to *.prerun.* first.")
+    p.add_argument("--inspect-round", type=int, default=None,
+                   help="READ-ONLY: reconstruct a past round's reference (keeps 1..N-1), re-mine its "
+                        "pool, and show the ACTUAL born/died whole-words + held-out firing counts for "
+                        "that round's top gate-passers (by Δcov) — the same view --propose gives, so a "
+                        "past pick can be re-judged against its alternatives. Writes inspect_r{N}.md. "
+                        "Mutates NO audit state (no checkpoint/ledger/lineage write).")
+    p.add_argument("--inspect-top", type=int, default=15,
+                   help="how many of the round's gate-passers to retrain for --inspect-round")
+    p.add_argument("--pool-override", default=None, metavar='\'[["L","R"],...]\'',
+                   help="replace the mined pool with this exact JSON list of pairs for the next round "
+                        "(with --rerun/--resume). Commits a KNOWN pick WITHOUT scoring the whole pool: "
+                        "`--rerun N --pool-override '[[\"L\",\"R\"]]' --propose` then `--commit '[\"L\",\"R\"]'` "
+                        "— scores one candidate (~minutes) instead of the ~18K pool (~a full round). The "
+                        "net-commit gate still runs on the pick; round N+1 re-mines the full pool normally.")
+    p.add_argument("--loo-words", action="store_true",
+                   help="READ-ONLY: for the current kept set, leave-one-out each pair (vocab WITH vs "
+                        "WITHOUT it) and show the actual whole-words it marginally contributes/suppresses, "
+                        "realness-annotated (tools.word_realness) + its LOO Δcov/comp/dead. Writes "
+                        "loo_words.md. Catches keeps that pass the numeric gate but whose words have "
+                        "degraded to artifacts/duplicates as the kept set grew. Mutates no audit state.")
     p.add_argument("--threads", type=int, default=10,
                    help="rayon threads for the fused parallel evaluate_many (M4 Pro has 10 P-cores; "
                         "throughput peaks ~10-11 and drops at 14)")
@@ -92,41 +127,64 @@ def main():
                         "next round (cheap: the reference is unchanged, so the round's scores carry over)")
     # --- adaptive candidate mining (auto-mine): pool is re-derived from the reference
     #     vocab each round, so new mangled tokens that arise enter and ones that vanish drop ---
-    p.add_argument("--mine", action="store_true",
-                   help="adaptive mode: ignore the static candidate list; mine the reference vocab "
-                        "each round (add new mangled tokens, drop disappeared ones)")
+    p.add_argument("--mine", action=argparse.BooleanOptionalAction, default=True,
+                   help="adaptive mining (default, and the only candidate source): mine the reference "
+                        "vocab each round — add newly-arisen mangled/low-firing tokens, drop vanished "
+                        "ones. --no-mine yields an empty pool (trivial no-op; the old static candidate "
+                        "queues were retired in the 2026-06 cleanup).")
     p.add_argument("--mine-bound-threshold", type=float, default=0.15)
     p.add_argument("--mine-sibling", type=int, default=3, help="sibling_min_stem_len for mining")
-    p.add_argument("--mine-mode", choices=["suffix", "prefix", "both"], default="suffix")
+    p.add_argument("--mine-mode", choices=["suffix", "prefix", "both", "none"], default="suffix",
+                   help="affix-based mangled mining: suffix / prefix / both, or 'none' to disable it "
+                        "entirely and rely solely on --mine-firing-percentile. (--mine-bound-threshold "
+                        "and --mine-sibling feed only the affix detectors, so they are INERT when "
+                        "mode=none.)")
     p.add_argument("--mine-all-routes", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mine-min-firings", type=int, default=1)
     p.add_argument("--mine-max-chars", type=int, default=20_000_000, help="discovery-corpus (val) char cap")
     p.add_argument("--mine-max-pool", type=int, default=0, help="cap pool size (0 = uncapped)")
-    p.add_argument("--mine-dead-orphans", action="store_true",
-                   help="also mine genuinely-wasted dead tokens (don't fire, not words, not "
-                        "load-bearing intermediates, not proper-noun-shaped) as candidates")
-    p.add_argument("--mine-dead-max-chars", type=int, default=100_000_000,
-                   help="corpus size for the dead-orphan 'doesn't fire' check (big, to avoid "
-                        "flagging rare-but-real tokens as dead)")
+    p.add_argument("--mine-firing-percentile", type=float, default=1.0,
+                   help="ALSO mine every fireable merge token (specials + base bytes excluded) "
+                        "whose firing is at or below this percentile of the fireable-merge "
+                        "firing distribution, emitting its formation routes — a raw firing cut "
+                        "with no morpheme/word filter (the held-out gate is the arbiter). Unions "
+                        "with the mangled --mine pool. 0 disables; percentile 1 (the default) "
+                        "captures the 0-firing dead floor.")
+    p.add_argument("--mine-firing-max-chars", type=int, default=100_000_000,
+                   help="corpus size for the firing-percentile fire count (big, so the percentile "
+                        "reflects real rarity, not a small-slice artifact)")
     args = p.parse_args()
 
     import rustbpe_auto_tune
     import tiktoken
     from nanochat.tokenizer import RustBPETokenizer, SPLIT_PATTERN, SPECIAL_TOKENS
     from nanochat.dataset import parquets_iter_batched
-    from tools.audit_blocked_pairs import whole_word_counts
-    from tools.pass_metrics import fire_counts, mergeable_vocab_size, compute_metrics
+    from tools.pass_metrics import whole_word_counts, fire_counts, mergeable_vocab_size, compute_metrics
     from tools.blocked_pairs_report import load_wordlist
     from tools.heldout_buildup import iter_capped_from_path, vocab_str2id
     from tools.find_mangled_morphemes import mine_candidates
 
-    if args.mine:
-        candidates = []  # pool is mined from the reference vocab each round, not a fixed list
+    # --- force_merges pretokenization context (opt-in): select blocks where they'll be deployed ---
+    if args.fm_context:
+        from rustbpe_variants.force_merges.pairs import (
+            SPLIT_PATTERN as PATTERN, FORCED_PAIRS as FORCED, BLOCKED_PAIRS as _BLK)
+        BTS = True
+        BLS = True  # block_leading_space: bans natural multi-word bigrams in the base loop, so no
+        #             ' It'+' is' can intercept the injected forced '. It is' (the cannibalization fix).
+        # force_merges' OWN explicit blocks (now [] — the predicate subsumes the old inner-bigram list);
+        # still prepended as base blocks so the audit tunes ON TOP of the corrected force_merges.
+        BASE_BLOCKS = [tuple(b) for b in _BLK]
+        if args.vocab_size == 32768:  # default not overridden -> make the 122 forced phrases additive
+            args.vocab_size = 32890
+        print(f"[fxc] --fm-context: carve-out regex + {len(FORCED)} forced phrases + block_trailing_space "
+              f"+ block_leading_space + {len(BASE_BLOCKS)} extra base blocks, vocab={args.vocab_size}", flush=True)
     else:
-        mod = importlib.import_module(args.pairs_module)
-        candidates = [tuple(c) for c in getattr(mod, args.candidates_attr)]
-        if args.limit:
-            candidates = candidates[:args.limit]
+        PATTERN, FORCED, BTS, BLS, BASE_BLOCKS = SPLIT_PATTERN, [], False, False, []
+
+    # The pool is mined from the reference vocab each round (see --mine); there is no
+    # static candidate list anymore. `candidates` stays empty so the residual --no-mine
+    # branches below are harmless no-ops (empty pool → trivial convergence).
+    candidates = []
     words = load_wordlist()
     if words is None:
         raise SystemExit("no wordlist at /usr/share/dict/words")
@@ -161,7 +219,7 @@ def main():
     print(f"[fxc] caching training corpus (doc_cap {args.doc_cap:,}, max {args.corpus_max_chars:,})...", flush=True)
     t0 = time.time()
     trainer = rustbpe_auto_tune.Tokenizer()
-    trainer.load_corpus(corpus_iter(), pattern=SPLIT_PATTERN)
+    trainer.load_corpus(corpus_iter(), pattern=PATTERN)
     print(f"[fxc] corpus cached [{time.time()-t0:.0f}s]", flush=True)
 
     # Stage held-out + wordlist into the cached trainer so train+measure FUSE into one
@@ -169,7 +227,7 @@ def main():
     # loop and measures coverage/compression/dead in Rust, encoding each held-out chunk
     # once (global dedup). Reuses the in-memory `holdout`/`words` (no re-read).
     for nm, batches in holdout.items():
-        trainer.add_holdout_shard(nm, (doc for batch in batches for doc in batch), pattern=SPLIT_PATTERN)
+        trainer.add_holdout_shard(nm, (doc for batch in batches for doc in batch), pattern=PATTERN)
     trainer.finalize_holdout()
     trainer.set_wordlist(list(words))
     holdout_names = trainer.get_holdout_names()
@@ -178,13 +236,22 @@ def main():
     def build_tok(blocked):
         """Train the merge loop on the cached corpus with `blocked` pairs; return an
         in-process RustBPETokenizer (bit-identical to the canonical wrapper path)."""
-        trainer.train_from_cached(V, blocked_pairs=[tuple(b) for b in blocked], forced_pairs=[])
+        trainer.train_from_cached(V, blocked_pairs=[tuple(b) for b in blocked] + BASE_BLOCKS, forced_pairs=FORCED, block_trailing_space=BTS, block_leading_space=BLS)
         ranks = {bytes(k): v for k, v in trainer.get_mergeable_ranks()}
         offset = len(ranks)
         specials = {name: offset + i for i, name in enumerate(SPECIAL_TOKENS)}
         enc = tiktoken.Encoding(name="auto_tune_fixpoint", pat_str=trainer.get_pattern(),
                                 mergeable_ranks=ranks, special_tokens=specials)
         return RustBPETokenizer(enc, "<|bos|>")
+
+    def _eval(block_lists):
+        """evaluate_many with the fm-context BASE_BLOCKS (force_merges' inner-bigram
+        blocks) prepended to every candidate block set — so the reference and every
+        candidate share the corrected force_merges base — plus the carve-out forced/bts
+        context. Keeps the trained inputs identical to build_tok's."""
+        return trainer.evaluate_many(
+            V, [[tuple(p) for p in bl] + BASE_BLOCKS for bl in block_lists],
+            num_threads=args.threads, forced_pairs=FORCED, block_trailing_space=BTS, block_leading_space=BLS)
 
     def measure(tok, with_lineage=False):
         base, infl = whole_word_counts(tok, words)
@@ -259,7 +326,19 @@ def main():
     def commit(kept_list, n, with_lineage=True):
         """Build + measure the kept set, retain its tokenizer as keep_{n}."""
         tok = build_tok(kept_list)
-        res = measure(tok, with_lineage=with_lineage)
+        # Gate metrics come from evaluate_many — the SAME path candidates use — so comp/dead
+        # use identical held-out chunking. Python measure() (live tiktoken encode) and Rust
+        # evaluate_many (held-out staged via the Rust split regex) diverge on comp/dead under
+        # the carve-out pattern by a constant per-shard offset; mixing ref(Python) with
+        # candidates(Rust) sank every Δcomp through the tight comp tolerance → spurious 0
+        # keeps. eval-to-eval cancels the offset. (Coverage is vocab-based and agrees, but we
+        # take the whole metric dict from eval for consistency.) Python fire/vocab kept for lineage.
+        gm = metrics_from_eval(*_eval([kept_list])[0])
+        if with_lineage:
+            _, agg, voc = measure(tok, with_lineage=True)
+            res = (gm, agg, voc)
+        else:
+            res = gm
         dst = retain_dir / f"keep_{n:04d}"
         if dst.exists():
             shutil.rmtree(dst)
@@ -303,11 +382,13 @@ def main():
             ref_tok, max_chars=args.mine_max_chars, bound_threshold=args.mine_bound_threshold,
             sibling_min_stem_len=args.mine_sibling, min_firings=args.mine_min_firings,
             mode=args.mine_mode, all_routes=args.mine_all_routes,
-            dead_orphans=args.mine_dead_orphans, words=words, dead_max_chars=args.mine_dead_max_chars)
+            firing_percentile=args.mine_firing_percentile, firing_max_chars=args.mine_firing_max_chars)
         skip = {tuple(k) for k in state["kept"]} | cooling_set()
         pool = [c for c in sorted(cands) if c not in skip]
         if args.mine_max_pool and len(pool) > args.mine_max_pool:
             pool = pool[:args.mine_max_pool]
+        if args.limit:  # smoke: cap the mined pool
+            pool = pool[:args.limit]
         return pool
 
     def loo_deltas(kept, full_ref):
@@ -325,7 +406,7 @@ def main():
             return {}
         loo_sets = [[x for x in kept if x != k] for k in kept]
         try:
-            results = trainer.evaluate_many(V, loo_sets, num_threads=args.threads, forced_pairs=[])
+            results = _eval(loo_sets)
         except Exception as e:
             print(f"[fxc]   LOO error {e!r} — skipping cleanup/recompute this pass", flush=True)
             return {}
@@ -364,6 +445,14 @@ def main():
             d = ref[k] - bl[k]
             return f"{d:+d}" if intfmt else f"{d:+.1f}"
         ac, ad = ref.get("avg_comp"), ref.get("avg_dead")
+        if args.mine:
+            _affix = "" if args.mine_mode == "none" else (
+                f"{args.mine_mode}, thr {args.mine_bound_threshold}, sib {args.mine_sibling}, "
+                f"all-routes {args.mine_all_routes}")
+            _fpct = f"firing-pct {args.mine_firing_percentile}" if args.mine_firing_percentile > 0 else ""
+            cand_desc = "adaptive mine (" + ", ".join(x for x in (_affix, _fpct) if x) + ")"
+        else:
+            cand_desc = str(len(candidates))
         L = ["# auto_tune held-out-Pareto FIXPOINT ledger (corpus-cached)", "",
              f"- held-out shards: {len(holdout)} ({args.max_chars:,} chars each), avg-gated",
              f"- gate: held-out Pareto — cov≥0 AND comp≤0 AND dead≤0 AND ≥1 strict improvement "
@@ -378,7 +467,7 @@ def main():
                 if args.cooldown_base else "")
              + ("; transactional net-commit (trial → settle ejections → net gate; "
                 "net-negative trials vetoed + jailed)" if args.net_commit else ""),
-             f"- candidates: {('adaptive mine (' + args.mine_mode + ', thr ' + str(args.mine_bound_threshold) + ', sib ' + str(args.mine_sibling) + ', all-routes ' + str(args.mine_all_routes) + (', +dead-orphans' if args.mine_dead_orphans else '') + ')') if args.mine else len(candidates)}",
+             f"- candidates: {cand_desc}",
              "",
              "## running tally",
              f"- status **{state['status']}** | rounds {len(state['rounds'])} (commits {nc}, cleanups {ncl}, "
@@ -421,7 +510,7 @@ def main():
                   f"{len(ks)} keep(s) so far (best committed at round end)"]
             if ks:
                 L += ["| pair | Δcov | Δcomp | Δdead |", "|---|---|---|---|"]
-                L += [f"| `{k}` | {d[0]} | {d[1]} | {d[2]} |" for k, d in ks]
+                L += [f"| `{k!r}` | {d[0]} | {d[1]} | {d[2]} |" for k, d in ks]
         kd = state.get("kept_deltas") or {}
         L += ["", f"## kept ({len(kept)}) — LIVE contribution (LOO vs the rest, recomputed every round; "
               "rounds table above is commit-time history and drifts). Promote these into BLOCKED_PAIRS.",
@@ -454,6 +543,186 @@ def main():
             L += ["", f"redundant keeps flagged: {red}"]
         ledger_path.write_text("\n".join(L) + "\n")
 
+    def present_round(keeps_order, ref_fire, ref_vocab, top_n, out_name="propose.md"):
+        """Orchestrated --propose: for the top-N keeps (heuristic order), retrain each,
+        diff its vocab vs the reference, and report NET firing whole-words added
+        (born-WW-that-fire − died-WW-that-fired) + the surface token each block prevents,
+        so a judge can rank by firing-coverage AND veto blocks that would shatter a useful
+        token. Pure presentation: nothing here is persisted (only the committed pick is)."""
+        from tools.blocked_pairs_report import _is_word
+        from tools.word_realness import standalone_counts, annotate, ambient_surfaces
+
+        def is_ww(s):
+            if not s.startswith(" "):
+                return False
+            w = s[1:].lower()
+            return bool(w) and (w in words or _is_word(w, words))
+
+        rows = []
+        for (cand, dcv, dco, ddd, _kp, _ps) in keeps_order[:top_n]:
+            tok = build_tok(list(state["kept"]) + [cand])
+            new_vocab = vocab_str2id(tok)
+            new_fire = Counter()
+            for corp in holdout.values():
+                new_fire.update(fire_counts(tok, corp))
+            born_ww = [s for s in new_vocab if s not in ref_vocab and is_ww(s)]
+            died_ww = [s for s in ref_vocab if s not in new_vocab and is_ww(s)]
+            born_counts = sorted(((s, new_fire.get(new_vocab[s], 0)) for s in born_ww), key=lambda x: -x[1])
+            died_counts = sorted(((s, ref_fire.get(ref_vocab[s], 0)) for s in died_ww), key=lambda x: -x[1])
+            born_fire = [s for s, c in born_counts if c > 0]
+            died_fire = [s for s, c in died_counts if c > 0]
+            surface = cand[0] + cand[1]
+            sfire = ref_fire.get(ref_vocab.get(surface), 0)
+            rows.append({"cand": cand, "surface": surface, "sfire": sfire,
+                         "net_fc": len(born_fire) - len(died_fire), "dcv": dcv, "dco": dco, "ddd": ddd,
+                         "born_counts": born_counts, "died_counts": died_counts})
+        rows.sort(key=lambda r: (-r["net_fc"], -r["dcv"], r["dco"], r["ddd"]))
+
+        # realness lens (tools.word_realness): standalone-word counts on held-out (one pass) +
+        # ambient slot-fillers, so each firing count reads as REAL coverage vs reroute ARTIFACT
+        # vs AMBIENT. DATA for the per-round hand judgment — it does NOT re-rank or pick.
+        shown = {s for r in rows for s, _ in (r["born_counts"] + r["died_counts"])}
+        ho_docs = [doc for corp in holdout.values() for batch in corp for doc in batch]  # holdout = list of batches
+        stand_map, _ = standalone_counts(shown, ho_docs)
+        ambient = ambient_surfaces([[s for s, _ in r["born_counts"]] for r in rows])
+
+        def fmt_ww(counts):
+            # each WW as fire[sStandalone·DICT/INFL·flags]: DICT w/ standalone usage = real
+            # coverage; INFL/ART? (fires but ~0 standalone) = reroute fragment; AMBIENT = a
+            # slot-filler any block gets. JUDGE realness + firing BY HAND, never the Δfc headline.
+            return "  ".join(annotate(s, c, words, stand_map, ambient) for s, c in counts[:12]) or "—"
+        out = [f"# round {len(state['rounds']) + 1} — AWAITING COMMIT  (kept so far: {len(state['kept'])})",
+               f"# JUDGE the actual added words BY HAND (realness + standalone usage + firing), NOT the Δfc headline.",
+               f"# WW annotated fire[sStandalone·dict·flags] — DICT+standalone=coverage · INFL/ART?=reroute fragment · AMBIENT=slot-filler",
+               f"{'#':>2}  {'(L, R) blocked':<26} {'prevents':<16} {'fS':>5} {'Δfc':>4} {'Δcov':>5} {'Δcomp':>7} {'Δdead':>6}"]
+        for i, r in enumerate(rows, 1):
+            out.append(f"{i:>2}  {repr(r['cand']):<26} {repr(r['surface'])[1:-1]:<16} {r['sfire']:>5} "
+                       f"{r['net_fc']:>+4} {r['dcv']:>+5} {r['dco']:>+7.1f} {r['ddd']:>+6.1f}   "
+                       f"commit={json.dumps(list(r['cand']))}")
+            out.append(f"      adds WW: {fmt_ww(r['born_counts'])}")
+            if r["died_counts"]:
+                out.append(f"      loses WW: {fmt_ww(r['died_counts'])}")
+        out.append("# commit:  --commit '[\"L\",\"R\"]'  (use the exact JSON above)   |   skip:  --commit none")
+        text = "\n".join(out)
+        print("\n[propose]\n" + text, flush=True)
+        (state_dir / out_name).write_text(text + "\n")  # clean, Read-able (no grep needed)
+        return rows
+
+    # ---- READ-ONLY: inspect a past round's alternatives (mutates no audit state) ----
+    if args.inspect_round is not None:
+        if not ckpt_path.exists():
+            raise SystemExit(f"--inspect-round needs an existing checkpoint at {ckpt_path}")
+        prev = json.loads(ckpt_path.read_text())
+        all_rounds = prev.get("rounds", [])
+        N = args.inspect_round
+        rec = next((r for r in all_rounds if r["round"] == N), None)
+        if rec is None:
+            raise SystemExit(f"round {N} not in checkpoint ({len(all_rounds)} rounds)")
+        # reconstruct kept = rounds 1..N-1 (replay commits + cleanups), same as --rerun
+        kept = []
+        for r in all_rounds[:N - 1]:
+            if r.get("committed"):
+                kept.append(tuple(r["committed"]))
+            for rm in r.get("cleanup", []):
+                t = tuple(rm)
+                if t in kept:
+                    kept.remove(t)
+        state = {"kept": kept, "rounds": all_rounds[:N - 1]}  # for cooling_set() + present_round header
+        print(f"[fxc] INSPECT round {N}: reference = {len(kept)} keeps (rounds 1..{N-1}); "
+              f"round {N} actually committed {rec.get('committed')!r}", flush=True)
+        ref_tok = build_tok(kept)                                  # build_tok + measure, NOT commit
+        _, ref_fire, ref_vocab = measure(ref_tok, with_lineage=True)   # (skips commit's tokenizer-save)
+        # re-mine the pool at this reference to recover candidate (L,R) tuples (verdict keys are
+        # the ambiguous "L+R" join — re-mining gives exact tuples and reproduces round N's pool)
+        pool = mine_pool(ref_tok)
+        by_key = {f"{c[0]}+{c[1]}": tuple(c) for c in pool}
+        verd = rec.get("verdicts", {})
+        gp = [(k, d) for k, d in verd.items() if len(d) >= 4 and d[3]]  # gate-passers
+        gp.sort(key=lambda kd: (-kd[1][0], kd[1][1]))                   # Δcov desc, then Δcomp asc
+        sel = [(by_key[k], d) for k, d in gp if k in by_key][:args.inspect_top]
+        missing = [k for k, d in gp if k not in by_key]
+        if missing:
+            print(f"[fxc]   note: {len(missing)} gate-passer(s) absent from re-mined pool "
+                  f"(cooldown/flag drift), skipped: {missing[:8]}", flush=True)
+        com = rec.get("committed")                                     # always include the actual pick
+        if com:
+            ckey = f"{com[0]}+{com[1]}"
+            if ckey in by_key and not any(f"{c[0]}+{c[1]}" == ckey for c, _ in sel) and ckey in verd:
+                sel.append((by_key[ckey], verd[ckey]))
+        keeps_order = [(c, d[0], d[1], d[2], None, None) for c, d in sel]
+        present_round(keeps_order, ref_fire, ref_vocab, len(keeps_order), out_name=f"inspect_r{N}.md")
+        print(f"[fxc] INSPECT done ({len(keeps_order)} candidates retrained) — "
+              f"committed pick was {com!r}; see {state_dir / f'inspect_r{N}.md'}", flush=True)
+        return
+
+    # ---- READ-ONLY: word-level leave-one-out of the current kept set (mutates no state) ----
+    if args.loo_words:
+        if not ckpt_path.exists():
+            raise SystemExit(f"--loo-words needs an existing checkpoint at {ckpt_path}")
+        from tools.blocked_pairs_report import _is_word
+        from tools.word_realness import standalone_counts, annotate, ambient_surfaces
+        prev = json.loads(ckpt_path.read_text())
+        kept = [tuple(p) for p in prev["kept"]]
+        if not kept:
+            raise SystemExit("kept set is empty — nothing to LOO")
+        state = {"kept": kept, "rounds": prev.get("rounds", [])}
+
+        def is_ww(s):
+            if not s.startswith(" "):
+                return False
+            w = s[1:].lower()
+            return bool(w) and (w in words or _is_word(w, words))
+
+        def fire_of(tok):
+            f = Counter()
+            for corp in holdout.values():
+                f.update(fire_counts(tok, corp))
+            return f
+
+        print(f"[fxc] LOO-WORDS over {len(kept)} kept pairs (build_tok + eval each)...", flush=True)
+        full_tok = build_tok(kept)
+        full_vocab, full_fire = vocab_str2id(full_tok), fire_of(full_tok)
+        ref_full = metrics_from_eval(*_eval([kept])[0])
+        rows = []
+        for k in kept:
+            rest = [x for x in kept if x != k]
+            minus_tok = build_tok(rest)
+            minus_vocab, minus_fire = vocab_str2id(minus_tok), fire_of(minus_tok)
+            born = sorted(((s, full_fire.get(full_vocab[s], 0)) for s in full_vocab          # k's UNIQUE WW
+                           if s not in minus_vocab and is_ww(s)), key=lambda x: -x[1])
+            died = sorted(((s, minus_fire.get(minus_vocab[s], 0)) for s in minus_vocab        # restored WITHOUT k
+                           if s not in full_vocab and is_ww(s)), key=lambda x: -x[1])
+            dc, dco, dd = deltas(metrics_from_eval(*_eval([rest])[0]), ref_full)              # k's marginal Δ (cov+ = adds)
+            rows.append({"pair": k, "born": born, "died": died, "dcov": dc, "dcomp": dco,
+                         "ddead": dd, "earns": gate(dc, dco, dd)})
+
+        # realness annotations: standalone on held-out (one pass) + ambient across pairs' born sets
+        shown = {s for r in rows for s, _ in (r["born"] + r["died"])}
+        ho_docs = [doc for corp in holdout.values() for batch in corp for doc in batch]
+        stand_map, _ = standalone_counts(shown, ho_docs)
+        shared = ambient_surfaces([[s for s, _ in r["born"]] for r in rows], min_n=2)  # co-held by >=2 keeps
+
+        def fmt(counts):
+            return "  ".join(annotate(s, c, words, stand_map, shared, ambient_tag="SHARED") for s, c in counts[:12]) or "—"
+        rows.sort(key=lambda r: (r["earns"], sum(1 for _, c in r["born"] if c > 0)))  # weakest first
+        out = [f"# LOO-WORDS — current kept set ({len(kept)} pairs); each pair's MARGINAL whole-words",
+               f"# provides = WW present ONLY with the pair · restores = WW that reappear WITHOUT it",
+               f"# fire[sStandalone·dict·flags]: DICT+standalone=real coverage · INFL/ART?=reroute fragment",
+               f"#   SHARED=co-held by >=2 keeps (removing any one drops it) — real but slot-marginal, NOT low-value",
+               f"# POP (hand call, like commits) a pair whose UNIQUE 'provides' is now only artifacts/duplicates"]
+        for r in rows:
+            mark = "" if r["earns"] else "   <== fails numeric gate"
+            out.append(f"\n{r['pair'][0]!r}+{r['pair'][1]!r}  LOO Δcov{r['dcov']:+} Δcomp{r['dcomp']:+.1f} "
+                       f"Δdead{r['ddead']:+.1f}{mark}")
+            out.append(f"   provides: {fmt(r['born'])}")
+            if r["died"]:
+                out.append(f"   restores: {fmt(r['died'])}")
+        text = "\n".join(out)
+        print("\n[loo-words]\n" + text, flush=True)
+        (state_dir / "loo_words.md").write_text(text + "\n")
+        print(f"[fxc] LOO-WORDS done — see {state_dir / 'loo_words.md'}", flush=True)
+        return
+
     # ---- rerun (in place) / resume / init ----
     if args.rerun:
         if not ckpt_path.exists():
@@ -479,13 +748,14 @@ def main():
         ref_fire, ref_vocab = Counter(), {}
         print(f"[fxc] RERUN from round {N}: rolled back to {len(kept)} kept (rounds 1..{N-1}); "
               f"re-mining with current flags (backup: checkpoint.prerun.json)", flush=True)
-    elif args.resume and ckpt_path.exists():
+    elif (args.resume or args.commit is not None or args.propose) and ckpt_path.exists():
         state = json.loads(ckpt_path.read_text())
         state["kept"] = [tuple(p) for p in state["kept"]]
         state["pool"] = [tuple(p) for p in state["pool"]]
         print(f"[fxc] resumed: round {len(state['rounds'])}, kept={len(state['kept'])}, pool={len(state['pool'])}, status={state['status']}", flush=True)
-        _, (ref_m, ref_fire, ref_vocab) = None, measure(build_tok(state["kept"]), with_lineage=True)
-        state["ref"] = ref_m
+        ref_tok = build_tok(state["kept"])
+        state["ref"] = metrics_from_eval(*_eval([state["kept"]])[0])   # gate metric from eval (match candidates)
+        _, ref_fire, ref_vocab = measure(ref_tok, with_lineage=True)   # Python fire/vocab for lineage only
     else:
         state = {"kept": [], "pool": list(candidates), "ref": None, "rounds": [],
                  "loo": None, "status": "running", "cur_round": None, "n_candidates": len(candidates)}
@@ -506,12 +776,29 @@ def main():
         print(f"[fxc] reference: cov={r['coverage']} (base {r['base']}/infl {r['infl']}) "
               f"avg_comp={r['avg_comp']:.0f} avg_dead={r['avg_dead']:.1f}", flush=True)
 
+    # pool override (commit a known pick without scoring the whole pool): replace the mined
+    # pool with the given pair(s) so the round scores just them. Persisted so the follow-up
+    # --commit (a separate invocation) resumes onto the single-candidate pool.
+    if args.pool_override is not None:
+        state["pool"] = [tuple(p) for p in json.loads(args.pool_override)]
+        print(f"[fxc] pool OVERRIDE: {len(state['pool'])} candidate(s) "
+              f"{[list(c) for c in state['pool']]} — skips full-pool scoring this round", flush=True)
+        ckpt_path.write_text(json.dumps(state))
+
     # baseline (kept=0) metrics, once — drives the running-tally's Δ-vs-baseline
     if "baseline" not in state:
-        bm = measure(build_tok([]))
+        # eval-path (same as commit/candidates) so the ledger's Δ-vs-baseline isn't offset
+        bm = metrics_from_eval(*_eval([[]])[0])
         state["baseline"] = {k: bm[k] for k in ("coverage", "base", "infl", "avg_comp", "avg_dead")}
         print(f"[fxc] baseline (kept=0): cov={bm['coverage']} avg_comp={bm['avg_comp']:.0f} avg_dead={bm['avg_dead']:.1f}", flush=True)
         ckpt_path.write_text(json.dumps(state))
+
+    # --- orchestrated --commit needs a round already scored by --propose ---
+    if args.commit is not None and args.commit.strip().lower() != "none":
+        cr = state.get("cur_round")
+        if not cr or not cr.get("done"):
+            raise SystemExit("--commit needs a round already scored by --propose "
+                             "(no cur_round.done in the checkpoint). Run --propose first.")
 
     # ---- fixpoint loop ----
     while state["status"] == "running" and state["pool"]:
@@ -549,7 +836,8 @@ def main():
                                         "committed": None, "committed_deltas": None, "verdicts": {},
                                         "cleanup": [list(k) for k in nonearners]})
                 tok = build_tok(state["kept"])
-                state["ref"], ref_fire, ref_vocab = measure(tok, with_lineage=True)
+                state["ref"] = metrics_from_eval(*_eval([state["kept"]])[0])   # gate metric from eval (match candidates)
+                _, ref_fire, ref_vocab = measure(tok, with_lineage=True)       # Python fire/vocab for lineage only
                 cooling = cooling_set()
                 state["pool"] = mine_pool(tok) if args.mine else \
                     [c for c in candidates if c not in set(state["kept"]) and c not in cooling]
@@ -584,14 +872,13 @@ def main():
             chunk = pending[bstart:bstart + args.eval_batch]
             batch = [list(state["kept"]) + [c] for c in chunk]
             try:
-                results = trainer.evaluate_many(V, batch, num_threads=args.threads, forced_pairs=[])
+                results = _eval(batch)
             except Exception as e:  # a bad candidate must not kill the run — isolate it
                 print(f"[fxc]   r{rnd} batch ERROR {e!r} — retrying chunk per-candidate", flush=True)
                 results = []
                 for c in chunk:
                     try:
-                        results.append(trainer.evaluate_many(V, [list(state["kept"]) + [c]],
-                                                             num_threads=args.threads, forced_pairs=[])[0])
+                        results.append(_eval([list(state["kept"]) + [c]])[0])
                     except Exception as e2:
                         print(f"[fxc]   r{rnd} ERROR on {c[0]}+{c[1]}: {e2!r} — skip (non-keep)", flush=True)
                         results.append(None)
@@ -648,11 +935,34 @@ def main():
             state["cur_round"] = None
             print(f"[fxc] round {rnd}: pool={len(state['pool'])} keeps=0 [{time.time()-t0:.0f}s] "
                   f"→ FIXPOINT ({len(state['pool'])} final LOGs)", flush=True)
+            if args.propose or args.commit is not None:
+                (state_dir / "propose.md").write_text(
+                    f"# CONVERGED — fixpoint at round {rnd}: 0 viable candidates, kept {len(state['kept'])}.\n"
+                    f"# The orchestrated loop is DONE. Promote/inspect the kept set (see ledger.md).\n")
             ckpt_path.write_text(json.dumps(state)); write_ledger(state)
             break
         # free keeps (Δcomp<=0 AND Δdead<=0) before costed ones (comp- or dead-tolerance);
         # then max Δcov, min Δcomp, min Δdead
         order = sorted(keeps, key=lambda s: (1 if (s[2] > 0 or s[3] > 0) else 0, -s[1], s[2], s[3]))
+        if args.propose:
+            present_round(order, ref_fire, ref_vocab, args.propose_top_n)
+            ckpt_path.write_text(json.dumps(state)); write_ledger(state)
+            print(f"[propose] round {rnd}: {len(keeps)} gate-passing keep(s); awaiting --commit", flush=True)
+            return
+        if args.commit is not None:
+            if args.commit.strip().lower() == "none":
+                state["rounds"].append(rec)
+                state["cur_round"] = {"round": rnd + 1, "done": dict(cur["done"])}
+                print(f"[commit] round {rnd}: NO COMMIT (judge skipped all keeps); "
+                      f"scores carried to round {rnd + 1}", flush=True)
+                ckpt_path.write_text(json.dumps(state)); write_ledger(state)
+                return
+            chosen = tuple(json.loads(args.commit))
+            sel = next((s for s in keeps if s[0] == chosen), None)
+            if sel is None:
+                raise SystemExit(f"--commit {chosen!r} is not a gate-passing keep in round {rnd}; "
+                                 f"re-run --propose and pick from its list")
+            order = [sel]  # trial ONLY the chosen pair; the net-commit logic below runs on it
         # --- transactional commit (--net-commit): trial the best keep, settle the LOO
         # ejections it triggers (cascades included), and judge the SETTLED state against
         # the pre-commit reference with the same gate. Per-pair deltas can't assign blame
@@ -672,7 +982,7 @@ def main():
                 break
             cand = best[0]
             settled, flipped = list(state["kept"]) + [cand], []
-            m = measure(build_tok(settled))
+            m = metrics_from_eval(*_eval([settled])[0])
             last_ld = None
             while not args.no_loo and len(settled) > 1:  # settle: eject non-earners until stable
                 ld = loo_deltas(settled, m)
@@ -685,7 +995,7 @@ def main():
                 flipped += ne
                 nes = set(ne)
                 settled = [k for k in settled if k not in nes]
-                m = measure(build_tok(settled))
+                m = metrics_from_eval(*_eval([settled])[0])
             net = deltas(state["ref"], m)
             if cand in settled and gate(*net):
                 accepted = (best, settled, flipped, net, last_ld)
@@ -712,6 +1022,10 @@ def main():
             print(f"[fxc] round {rnd}: pool={rec['n_pool']} keeps={len(keeps)} [{time.time()-t0:.0f}s] "
                   f"→ NO COMMIT ({len(vetoed)} trial(s) vetoed net-negative)", flush=True)
             ckpt_path.write_text(json.dumps(state)); write_ledger(state)
+            if args.commit is not None:
+                print(f"[commit] your pick was vetoed (net-negative after LOO settling) and jailed; "
+                      f"--propose round {rnd + 1} (scores carried) and pick another.", flush=True)
+                return
             continue
         best, settled, flipped, net, last_ld = accepted
         cand = best[0]
@@ -743,6 +1057,8 @@ def main():
               + (f" | {len(vetoed)} vetoed" if vetoed else "")
               + f" (mangled_tune {mng})", flush=True)
         ckpt_path.write_text(json.dumps(state)); write_ledger(state)
+        if args.commit is not None:
+            return
 
     # ---- leave-one-out redundancy pass ----
     if state["status"] == "fixpoint" and not args.no_loo and state.get("loo") is None and state["kept"]:
@@ -751,7 +1067,7 @@ def main():
         loo = []
         for k in state["kept"]:
             try:
-                m = measure(build_tok([x for x in state["kept"] if x != k]))
+                m = metrics_from_eval(*_eval([[x for x in state["kept"] if x != k]])[0])
                 dc, dco, dd = deltas(m, final_ref)  # full(=others+k) vs others: does k still earn its slot?
                 loo.append({"pair": list(k), "d_cov": dc, "d_comp": dco, "d_dead": dd, "earns": gate(dc, dco, dd)})
             except Exception as e:  # conservatively keep k (don't flag redundant) on error

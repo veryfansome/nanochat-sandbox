@@ -10,8 +10,8 @@ tokens with zero firings) — so the deltas are directly comparable with the
 run's gate-shard tally. Coverage is a vocab property (shard-independent); it's
 reported as a sanity check that the right kept set was evaluated.
 
-Supersedes tools.generalization_check (single-shard era: subprocess trainer,
-no dead metric) for fixpoint-era checks.
+Replaces the earlier non-cached generalization_check (single-shard era:
+subprocess trainer, no dead metric; removed in the 2026-06 cleanup).
 
     uv run python -m tools.generalization_check_cached
     uv run python -m tools.generalization_check_cached --shards-glob '.../base_data_climbmix_holdout2/*.parquet'
@@ -30,7 +30,7 @@ def main():
     home = os.path.expanduser("~")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint",
-                   default="rustbpe_variants/auto_tune/audit/heldout_fixpoint_comptol6/checkpoint.json",
+                   default="rustbpe_variants/auto_tune/audit/checkpoint.json",
                    help="fixpoint checkpoint to read the kept block list from (snapshot-read, so a "
                         "live run rewriting it is fine)")
     p.add_argument("--shards-glob",
