@@ -83,6 +83,20 @@ def main():
                         "`--rerun N --pool-override '[[\"L\",\"R\"]]' --propose` then `--commit '[\"L\",\"R\"]'` "
                         "— scores one candidate (~minutes) instead of the ~18K pool (~a full round). The "
                         "net-commit gate still runs on the pick; round N+1 re-mines the full pool normally.")
+    p.add_argument("--bulk-pairs", default=None, metavar='\'[["L","R"],...]\'',
+                   help="BULK-HARVEST a large vetted free-win list IN-PROCESS (corpus loaded once): "
+                        "eval candidates in parallel chunks vs the current reference, commit the "
+                        "gate-passers per chunk with ONE reference-retrain, periodic LOO ejects "
+                        "non-earners. ~2h for ~800 vs ~40h one-at-a-time. Journals each commit "
+                        "(committed=pair) so --rerun/--trajectory work. Checkpointed/resumable "
+                        "(re-pass the same list; already-kept pairs are skipped). Skips per-pair "
+                        "lineage/net-commit settle — run a final --loo-words + generalization check.")
+    p.add_argument("--bulk-chunk", type=int, default=12, help="candidates per parallel eval chunk")
+    p.add_argument("--bulk-loo-every", type=int, default=50, help="run a retention LOO every N commits")
+    p.add_argument("--bulk-max-cov", type=int, default=None,
+                   help="only commit free wins with Δcov <= this (use 0 for veto-safe pure-compression "
+                        "bulk; cov-bearing candidates need individual judgment). Pass 'mine' as "
+                        "--bulk-pairs to scan the freshly-mined pool instead of an explicit list.")
     p.add_argument("--loo-words", action="store_true",
                    help="READ-ONLY: for the current kept set, leave-one-out each pair (vocab WITH vs "
                         "WITHOUT it) and show the actual whole-words it marginally contributes/suppresses, "
@@ -493,11 +507,14 @@ def main():
                     nd = r.get("net_deltas") or ["?", "?", "?"]
                     notes.append(f"−{len(r['cleanup'])} ejected, net {nd[0]}/{nd[1]}/{nd[2]}")
                 if r.get("vetoed"):
-                    notes.append(f"{len(r['vetoed'])} vetoed")
+                    vp = ", ".join(f"{v[0]}+{v[1]}" for v in r["vetoed"][:6])
+                    notes.append(f"vetoed {vp}" + ("…" if len(r["vetoed"]) > 6 else ""))
                 if notes:
                     cs += " — " + "; ".join(notes)
             elif r.get("vetoed"):
-                cs = f"— no commit: {len(r['vetoed'])} trialed keep(s) vetoed (net-negative)"
+                vp = ", ".join(f"{v[0]}+{v[1]}" for v in r["vetoed"][:8])
+                cs = (f"— no commit: vetoed {vp}" + ("…" if len(r["vetoed"]) > 8 else "")
+                      + " (net-negative)")
             else:
                 cs = "— (fixpoint)"
             L.append(f"| {r['round']} | {r['n_pool']} | {r['n_keeps']} | {cs} | {cd[0]} | {cd[1]} | {cd[2]} |")
@@ -723,6 +740,108 @@ def main():
         print(f"[fxc] LOO-WORDS done — see {state_dir / 'loo_words.md'}", flush=True)
         return
 
+    # ---- BULK-HARVEST a vetted free-win list in-process (chunked eval + commit) ----
+    if args.bulk_pairs is not None:
+        if not ckpt_path.exists():
+            raise SystemExit("--bulk-pairs needs an existing checkpoint")
+        state = json.loads(ckpt_path.read_text())
+        state["kept"] = [tuple(p) for p in state["kept"]]
+        state["loo"] = None
+        keptset = set(state["kept"])
+        if args.bulk_pairs.strip() == "mine":   # scan the freshly-mined pool (the free-win list is
+            cands = mine_pool(build_tok(state["kept"]))   # rediscovered, not re-typed)
+        else:
+            cands = [tuple(p) for p in json.loads(args.bulk_pairs)]
+        pairs = [tuple(p) for p in cands if tuple(p) not in keptset]
+        rnd = len(state["rounds"])
+        state["ref"] = metrics_from_eval(*_eval([state["kept"]])[0])
+        print(f"[bulk] kept={len(state['kept'])} (round {rnd}); {len(pairs)} candidate(s) to grind "
+              f"(chunk={args.bulk_chunk}, loo every {args.bulk_loo_every})", flush=True)
+
+        def bulk_ref_retrain():
+            tok = build_tok(state["kept"])
+            state["ref"] = metrics_from_eval(*_eval([state["kept"]])[0])
+            tok.save(str(retain_dir / f"keep_{len(state['kept']):04d}"))
+
+        def bulk_loo():
+            if len(state["kept"]) < 2:
+                return 0
+            ld = loo_deltas(state["kept"], state["ref"])
+            ne = [k for k in state["kept"] if k in ld and not gate(*ld[k])]
+            if ne:
+                nes = set(ne)
+                nonlocal rnd
+                rnd += 1
+                state["kept"] = [k for k in state["kept"] if k not in nes]
+                state["rounds"].append({"round": rnd, "n_pool": 0, "n_keeps": 0, "committed": None,
+                                        "committed_deltas": None, "verdicts": {},
+                                        "cleanup": [list(k) for k in ne], "bulk": True})
+                state["kept_deltas"] = {f"{a}+{b}": list(v) for (a, b), v in ld.items() if (a, b) not in nes}
+                bulk_ref_retrain()
+                print(f"[bulk]   LOO ejected {len(ne)}: {[f'{a}+{b}' for a,b in ne][:8]}", flush=True)
+            else:
+                state["kept_deltas"] = {f"{a}+{b}": list(v) for (a, b), v in ld.items()}
+            return len(ne)
+
+        t0 = time.time()
+        committed_total, since_loo = 0, 0
+        for ci in range(0, len(pairs), args.bulk_chunk):
+            chunk = pairs[ci:ci + args.bulk_chunk]
+            try:
+                results = _eval([list(state["kept"]) + [c] for c in chunk])
+            except Exception as e:
+                print(f"[bulk]   chunk eval error {e!r} — per-candidate retry", flush=True)
+                results = []
+                for c in chunk:
+                    try:
+                        results.append(_eval([list(state["kept"]) + [c]])[0])
+                    except Exception:
+                        results.append(None)
+            passers = []
+            for c, res in zip(chunk, results):
+                if res is None:
+                    continue
+                dc, dco, dd = deltas(state["ref"], metrics_from_eval(*res))
+                # --bulk-max-cov keeps the bulk grind veto-safe: only PURE-compression free wins
+                # (cov<=0) can't be a shatter-fragment-as-coverage (ob+by-style), so cov-bearing
+                # candidates are deferred to individual propose-board judgment.
+                if gate(dc, dco, dd) and (args.bulk_max_cov is None or dc <= args.bulk_max_cov):
+                    passers.append((c, dc, dco, dd))
+            passers.sort(key=lambda x: x[2])  # most-compressive first
+            nc = 0
+            for c, *_ in passers:
+                # RE-EVAL vs the LIVE ref (advanced by earlier commits this chunk). The pre-filter
+                # above measured each candidate vs the PRE-CHUNK ref, but cov=0-alone blocks INTERACT
+                # and can shatter whole-words together (the bug that lost cov +45→+7). Re-validating
+                # each vs the current state restores telescoping: every commit is cov>=0 vs the live
+                # ref, so cumulative coverage cannot decrease. The re-eval's metrics ARE the new ref.
+                m = metrics_from_eval(*_eval([list(state["kept"]) + [c]])[0])
+                dc, dco, dd = deltas(state["ref"], m)
+                if not (gate(dc, dco, dd) and (args.bulk_max_cov is None or dc <= args.bulk_max_cov)):
+                    continue
+                rnd += 1
+                state["kept"].append(c)
+                state["ref"] = m
+                state["rounds"].append({"round": rnd, "n_pool": len(pairs), "n_keeps": 1,
+                                        "committed": list(c), "committed_deltas": [dc, dco, dd],
+                                        "verdicts": {}, "bulk": True})
+                committed_total += 1; since_loo += 1; nc += 1
+            if nc:
+                build_tok(state["kept"]).save(str(retain_dir / f"keep_{len(state['kept']):04d}"))
+            done = min(ci + args.bulk_chunk, len(pairs))
+            print(f"[bulk] {done}/{len(pairs)} scanned, +{nc} (kept={len(state['kept'])}) "
+                  f"covΔ{state['ref']['coverage']-state['baseline']['coverage']:+} [{time.time()-t0:.0f}s]", flush=True)
+            ckpt_path.write_text(json.dumps(state)); write_ledger(state)
+            if since_loo >= args.bulk_loo_every:
+                bulk_loo()
+                since_loo = 0
+                ckpt_path.write_text(json.dumps(state)); write_ledger(state)
+        n_ej = bulk_loo()  # final retention pass
+        ckpt_path.write_text(json.dumps(state)); write_ledger(state)
+        print(f"[bulk] DONE: committed {committed_total}, final LOO ejected {n_ej}, "
+              f"kept={len(state['kept'])} [{time.time()-t0:.0f}s]", flush=True)
+        return
+
     # ---- rerun (in place) / resume / init ----
     if args.rerun:
         if not ckpt_path.exists():
@@ -756,6 +875,14 @@ def main():
         ref_tok = build_tok(state["kept"])
         state["ref"] = metrics_from_eval(*_eval([state["kept"]])[0])   # gate metric from eval (match candidates)
         _, ref_fire, ref_vocab = measure(ref_tok, with_lineage=True)   # Python fire/vocab for lineage only
+        # A plain --propose (no --pool-override) onto an EMPTY/stunted pool means the persisted
+        # pool was left small by prior --pool-override commits (each overwrites state["pool"], and
+        # a final veto empties it). Re-mine the full pool for a real board instead of scanning the
+        # leftover; reset the stale cur_round so its scores don't poison the fresh round.
+        if args.propose and args.pool_override is None and args.mine and not state["pool"]:
+            state["pool"] = mine_pool(ref_tok)
+            state["cur_round"] = None
+            print(f"[fxc] --propose onto empty pool → re-mined {len(state['pool'])} candidates", flush=True)
     else:
         state = {"kept": [], "pool": list(candidates), "ref": None, "rounds": [],
                  "loo": None, "status": "running", "cur_round": None, "n_candidates": len(candidates)}
@@ -793,8 +920,10 @@ def main():
         print(f"[fxc] baseline (kept=0): cov={bm['coverage']} avg_comp={bm['avg_comp']:.0f} avg_dead={bm['avg_dead']:.1f}", flush=True)
         ckpt_path.write_text(json.dumps(state))
 
-    # --- orchestrated --commit needs a round already scored by --propose ---
-    if args.commit is not None and args.commit.strip().lower() != "none":
+    # --- orchestrated --commit needs a round already scored by --propose, EXCEPT when
+    # --pool-override supplies the candidates: then the loop scores that small pool itself,
+    # so `--pool-override '[["L","R"]]' --commit '["L","R"]'` commits in one invocation. ---
+    if args.commit is not None and args.commit.strip().lower() != "none" and args.pool_override is None:
         cr = state.get("cur_round")
         if not cr or not cr.get("done"):
             raise SystemExit("--commit needs a round already scored by --propose "
@@ -803,6 +932,12 @@ def main():
     # ---- fixpoint loop ----
     while state["status"] == "running" and state["pool"]:
         rnd = len(state["rounds"]) + 1
+        # The leave-one-out redundancy snapshot (state["loo"]) is only valid for the kept set
+        # it was computed on (at a fixpoint). Any new round means the set may change, so drop a
+        # stale snapshot now — it's recomputed by the post-loop pass when we actually converge.
+        # (Guards against a snapshot outliving its set, e.g. a false fixpoint that was repaired.)
+        if state.get("loo") is not None:
+            state["loo"] = None
         # Resume a partially-evaluated round if present (the reference is fixed
         # within a round, so already-scored candidates are still valid).
         cur = state.get("cur_round")
@@ -906,6 +1041,23 @@ def main():
                "committed": None, "committed_deltas": None,
                "verdicts": {f"{c[0]}+{c[1]}": [dc, dco, dd, int(kp)] for (c, dc, dco, dd, kp, _ps) in scored}}  # kp re-derived via gate()
         if not keeps:
+            if args.pool_override is not None:
+                # 0 keeps from an ARTIFICIAL override pool = the override candidate(s) don't pass
+                # vs the CURRENT kept set (e.g. a redundant pick mid-harvest), NOT global
+                # convergence. Do NOT journal a phantom round or declare fixpoint (that would
+                # poison `status` and stall the audit). Re-mine the real pool so the checkpoint
+                # is left clean, then return.
+                if args.mine:
+                    state["pool"] = mine_pool(build_tok(state["kept"]))
+                state["cur_round"] = None
+                msg = f"override candidate(s) evaporated vs kept={len(state['kept'])} (NOT convergence)"
+                print(f"[fxc] round {rnd}: override → 0 keeps [{time.time()-t0:.0f}s] — {msg}; "
+                      f"pool re-mined, state unchanged.", flush=True)
+                if args.commit is not None or args.propose:
+                    (state_dir / "propose.md").write_text(
+                        f"# OVERRIDE EVAPORATED at round {rnd}: {msg}. No commit.\n")
+                ckpt_path.write_text(json.dumps(state)); write_ledger(state)
+                return
             state["rounds"].append(rec)
             nxt = len(state["rounds"]) + 1
             kept_now = {tuple(k) for k in state["kept"]}

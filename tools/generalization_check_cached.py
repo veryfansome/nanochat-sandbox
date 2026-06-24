@@ -41,6 +41,11 @@ def main():
                    help="char cap per shard — keep equal to the fixpoint's --max-chars so "
                         "comp/dead are on the same scale as the gate tally")
     p.add_argument("--vocab-size", type=int, default=32768)
+    p.add_argument("--fm-context", action=argparse.BooleanOptionalAction, default=False,
+                   help="evaluate under the force_merges deployment context (carve-out SPLIT_PATTERN "
+                        "+ FORCED_PAIRS + block_trailing/leading_space + BLOCKED base blocks, vocab 32890) "
+                        "— REQUIRED to match a kept set produced by a --fm-context fixpoint run, else "
+                        "comp/dead are measured under the wrong (pristine) tokenization.")
     p.add_argument("--corpus-max-chars", type=int, default=2_000_000_000)
     p.add_argument("--doc-cap", type=int, default=10_000)
     p.add_argument("--threads", type=int, default=2,
@@ -63,6 +68,20 @@ def main():
     from nanochat.dataset import parquets_iter_batched
     from tools.blocked_pairs_report import load_wordlist
     from tools.heldout_buildup import iter_capped_from_path
+
+    # force_merges deployment context — must mirror tools.heldout_fixpoint_cached's --fm-context
+    # exactly, or the kept set is measured under the wrong tokenization (comp/dead incomparable).
+    if args.fm_context:
+        from rustbpe_variants.force_merges.pairs import (
+            SPLIT_PATTERN as PATTERN, FORCED_PAIRS as FORCED, BLOCKED_PAIRS as _BLK)
+        BTS, BLS = True, True
+        BASE_BLOCKS = [tuple(b) for b in _BLK]
+        if args.vocab_size == 32768:           # default not overridden → make forced phrases additive
+            args.vocab_size = 32890
+        print(f"[genc] --fm-context: carve-out regex + {len(FORCED)} forced phrases + "
+              f"block_trailing/leading_space + {len(BASE_BLOCKS)} base blocks, vocab={args.vocab_size}", flush=True)
+    else:
+        PATTERN, FORCED, BTS, BLS, BASE_BLOCKS = SPLIT_PATTERN, [], False, False, []
 
     # snapshot-read the checkpoint: the live run's write_text() is not atomic, so
     # copy first and retry once if we caught a partial write
@@ -125,14 +144,14 @@ def main():
     print(f"[genc] caching training corpus (doc_cap {args.doc_cap:,}, max {args.corpus_max_chars:,})...", flush=True)
     t0 = time.time()
     trainer = rustbpe_auto_tune.Tokenizer()
-    trainer.load_corpus(corpus_iter(), pattern=SPLIT_PATTERN)
+    trainer.load_corpus(corpus_iter(), pattern=PATTERN)
     print(f"[genc] corpus cached [{time.time()-t0:.0f}s]", flush=True)
 
     print(f"[genc] staging {len(shards)} fresh shards ({args.max_chars:,} cap each)...", flush=True)
     for s in shards:
         batches = list(iter_capped_from_path(s, args.max_chars))
         trainer.add_holdout_shard(Path(s).stem, (doc for batch in batches for doc in batch),
-                                  pattern=SPLIT_PATTERN)
+                                  pattern=PATTERN)
     trainer.finalize_holdout()
     trainer.set_wordlist(list(words))
     names = trainer.get_holdout_names()
@@ -148,8 +167,9 @@ def main():
         print(f"[genc] trajectory: evaluating {len(sets)} kept-set prefixes "
               f"(every {args.trajectory} rounds) on {len(names)} fresh shards...", flush=True)
         t0 = time.time()
-        res = trainer.evaluate_many(V, [[tuple(k) for k in s] for s in sets],
-                                    num_threads=args.threads, forced_pairs=[])
+        res = trainer.evaluate_many(V, [[tuple(k) for k in s] + BASE_BLOCKS for s in sets],
+                                    num_threads=args.threads, forced_pairs=FORCED,
+                                    block_trailing_space=BTS, block_leading_space=BLS)
         print(f"[genc] evaluated [{time.time()-t0:.0f}s]", flush=True)
         n = len(names)
         b_base, b_infl, b_ps = res[0]
@@ -168,8 +188,9 @@ def main():
 
     print(f"[genc] training + measuring baseline (0 pairs) and kept ({len(kept)} pairs)...", flush=True)
     t0 = time.time()
-    res = trainer.evaluate_many(V, [[], [tuple(k) for k in kept]],
-                                num_threads=args.threads, forced_pairs=[])
+    res = trainer.evaluate_many(V, [BASE_BLOCKS, [tuple(k) for k in kept] + BASE_BLOCKS],
+                                num_threads=args.threads, forced_pairs=FORCED,
+                                block_trailing_space=BTS, block_leading_space=BLS)
     print(f"[genc] evaluated [{time.time()-t0:.0f}s]", flush=True)
     (b_base, b_infl, b_ps), (k_base, k_infl, k_ps) = res
 

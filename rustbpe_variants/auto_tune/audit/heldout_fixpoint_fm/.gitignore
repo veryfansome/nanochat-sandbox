@@ -1,0 +1,7 @@
+# Transient per-run scratch + safety snapshots — regenerable, NOT part of the audit
+# record. The committed record is checkpoint.json + ledger.md + lineage.jsonl.
+backup_*/
+*.prerun.*
+propose.md
+loo_words.md
+inspect_r*.md
