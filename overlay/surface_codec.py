@@ -61,6 +61,10 @@ def surface_encode(text, enc, sre, id2len, K_max):
     ws_off = [b for b, _ in ws]
     pretoks = [m.group(0) for m in sre.finditer(folded)]
     out, pending, goff = [], 0, 0
+    # Two-pointer over the SORTED word-start offsets: tokens are emitted in
+    # increasing global byte order, so each word-start is visited once total
+    # (O(tokens + word_starts), not the O(tokens·word_starts) of a per-token scan).
+    wi, W = 0, len(ws_off)
     for i, pt in enumerate(pretoks):
         ptb = pt.encode("utf-8")
         if pt == " " and i + 1 < len(pretoks) and not pretoks[i + 1][:1].isspace():
@@ -70,11 +74,15 @@ def surface_encode(text, enc, sre, id2len, K_max):
         acc = 0
         for k, tid in enumerate(enc.encode_ordinary(pt)):
             lo, hi = goff + acc, goff + acc + id2len[tid]
-            owned = [o for o in ws_off if lo <= o < hi]
+            while wi < W and ws_off[wi] < lo:        # skip any word-start before this token
+                wi += 1
+            start = wi
+            while wi < W and ws_off[wi] < hi:        # the word-starts this token owns
+                wi += 1
             cap_bits, cap_mask = [0] * K_max, [0] * K_max
-            for s, o in enumerate(owned[:K_max]):
-                cap_mask[s] = 1
-                cap_bits[s] = 1 if capped[o] else 0
+            for s in range(start, min(wi, start + K_max)):
+                cap_mask[s - start] = 1
+                cap_bits[s - start] = 1 if capped[ws_off[s]] else 0
             out.append((tid, pending if k == 0 else 0, cap_bits, cap_mask))
             acc += id2len[tid]
         pending = 0
@@ -98,8 +106,15 @@ def surface_decode(stream, enc):
     byte_to_ci = {b: ci for b, ci in ws}
     ws_off = [b for b, _ in ws]
     chars = list(folded)
+    wi, W = 0, len(ws_off)                            # two-pointer (spans are byte-ordered)
     for lo, hi, cap_bits in spans:
-        for s, o in enumerate(o for o in ws_off if lo <= o < hi):
-            if s < len(cap_bits) and cap_bits[s] and o in byte_to_ci:
+        while wi < W and ws_off[wi] < lo:
+            wi += 1
+        start = wi
+        while wi < W and ws_off[wi] < hi:
+            wi += 1
+        for s in range(start, wi):
+            o = ws_off[s]
+            if s - start < len(cap_bits) and cap_bits[s - start] and o in byte_to_ci:
                 chars[byte_to_ci[o]] = chars[byte_to_ci[o]].upper()
     return "".join(chars)
