@@ -6,6 +6,10 @@ __pycache__/
 results/
 wandb/
 
+# lambda_ab.sh orchestrator: local instance state + any host logs tee'd locally
+runs/.lambda_ab.state
+runs/*.log
+
 # rustbpe build artifacts (cargo target dirs; per-crate uv.lock from maturin builds)
 # The crate sources (Cargo.toml, Cargo.lock, src/, pyproject.toml, README.md) are tracked;
 # everything cargo / maturin produces during a build is not.

@@ -91,6 +91,24 @@ tmux new -d -s sr "set -o pipefail; cd ~/sandbox && export PATH=\$HOME/.local/bi
 
 The tokenizer is the only thing that must be in `$VBASE` ahead of time; the run self-provisions everything else. (Pinning the block/merge list into the variant's `pairs.py` + committing is the cleaner alternative to rsyncing a baked tokenizer — then the host bake is reproducible from code. See `rustbpe_variants/<variant>/README.md`.)
 
+## Orchestrated A/B — `runs/lambda_ab.sh`
+
+`lambda_ab.sh` runs the **whole surface-factoring d24 A/B lifecycle** end-to-end and **idempotently**, wrapping `lambda.sh` + `speedrun.sh`: provision (8x A100 40GB) → bootstrap (`setup.sh` + Rust + the `rustbpe_force_merges` crate, which the surface arm imports via `tools/stack_triple`) → sync the cached `force_merges` + `surface_triple` tokenizers (they live outside `sandbox/`, so plain bootstrap misses them) → preflight (8 GPUs, venv, both tokenizers, crate, surface smoke) → train **both arms** in one tmux session → poll → download results **+ the model checkpoints** → verify everything is local → terminate.
+
+Two arms, both at d24 on the same commit/config (only the tokenizer + overlay differ):
+- **`d24_force_merges_ab`** — baseline: the adopted `force_merges` tokenizer, no overlay.
+- **`d24_surface_factoring_ab`** — `OVERLAY=surface_factoring` + `EVAL_MODULE=wrappers.base_eval_surface` (surface-aware CORE/load). Both eval `--eval core,bpb` (no `sample`).
+
+```bash
+bash runs/lambda_ab.sh                  # full pipeline (resumable; reuses live instance, skips finished arms)
+STAGE=download bash runs/lambda_ab.sh   # run a single stage: provision|bootstrap|sync|verify|train|poll|download|verifydl|terminate
+AUTO_TERMINATE=1 YES=1 bash runs/lambda_ab.sh   # don't prompt at provision/terminate
+```
+
+**Idempotency** is the point: a live instance + completed stages (host markers `~/.ab_setup_done`, `~/sandbox/.ab_done`) + finished arms (`results/<tag>/eval.csv`) are detected and skipped. So **fix → push → re-run** and only the unfinished work re-executes. The instance is **never terminated until `verifydl` confirms both arms' `eval.csv` + checkpoint are local** — a crash leaves it up; resume, don't re-provision.
+
+Gotchas: (1) the long `poll` stage blocks the local terminal for ~hours — run the orchestrator itself under a local `tmux`/`nohup`, or split it (`STAGE=train` now, `STAGE=poll` … `terminate` later) — the *training* runs in the host's tmux and survives regardless. (2) `LAMBDA_INSTANCE_TYPE` defaults to `gpu_8x_a100_sxm4`; if that name is wrong for current capacity the provision stage prints the available types and exits — set the right one. (3) If the surface arm OOMs at `DEVICE_BATCH_SIZE=8`, drop to 4 (`base_train` holds total batch constant, so it stays comparable — note it); first-step OOM is the cheap ~$3-8 kind.
+
 ## Cost expectations
 
 One d24 base-only speedrun (`USE_SFT=0`). Trio = baseline + zloss + mtp sequential. Per-run hours include `base_train` + `base_eval` (CORE on full per-task budget takes ~45 min on 8xA100). Trio cost includes ~$18 recurring overhead (bootstrap + inspection). Probe with a single run first; prices fluctuate.

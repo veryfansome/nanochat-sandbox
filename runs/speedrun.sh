@@ -160,8 +160,11 @@ torchrun --standalone --nproc_per_node="$NPROC" -m "$TRAIN_MODULE" -- \
 
 # wrappers.base_eval (not scripts.base_eval directly) so the prefix-safety
 # patch is applied + boundary-crossing summary printed. See wrappers/_patches.py.
-torchrun --standalone --nproc_per_node="$NPROC" -m wrappers.base_eval -- \
-    --model-tag="$MODEL_TAG" --device-batch-size="$DEVICE_BATCH_SIZE"
+# EVAL_MODULE overrides it (default wrappers.base_eval); surface-factoring sets
+# EVAL_MODULE=wrappers.base_eval_surface for surface-aware CORE scoring + load.
+# EVAL_ARGS appends extra base_eval flags (e.g. "--eval core,bpb").
+torchrun --standalone --nproc_per_node="$NPROC" -m "${EVAL_MODULE:-wrappers.base_eval}" -- \
+    --model-tag="$MODEL_TAG" --device-batch-size="$DEVICE_BATCH_SIZE" ${EVAL_ARGS:-}
 
 # Archive base-stage artifacts to sandbox/results/$MODEL_TAG/ BEFORE SFT (or
 # the next run) overwrites them. Eval CSV path doesn't include $MODEL_TAG
