@@ -102,13 +102,37 @@ def check_core_lm(model):
           "memorized continuation's full rendering.")
 
 
+def check_surface_aware_boundary():
+    """F3: MC/schema continuation boundaries are over (base,space,cap), not base IDs
+    alone — so options differing ONLY in case or factored spacing keep a non-empty
+    distinguishing slice. A base-only boundary folds them into the shared prefix
+    (empty/NaN, silently dropping the surface NLL); the surface-aware one diverges
+    exactly where the surface bit differs."""
+    from nanochat.core_eval import find_common_length
+    from overlay.surface_core_eval import _encode_prompt, _surface_keys
+    for label, a_txt, b_txt in [
+        ("case-only",  "one of the dogs ran in the park", "one of the dogs ran in The Park"),
+        ("space-only", "the box: apples",                "the box:apples"),
+    ]:
+        a, b = _encode_prompt(a_txt), _encode_prompt(b_txt)
+        base_start = find_common_length([a[0], b[0]], 'left')               # base IDs only
+        surf_start = find_common_length([_surface_keys(a), _surface_keys(b)], 'left')
+        assert base_start == len(a[0]) == len(b[0]), \
+            f"{label}: base IDs should be identical (surface folds away) — got {base_start}/{len(a[0])}"
+        assert surf_start < len(a[0]), \
+            f"{label}: surface-aware boundary must diverge where the surface bit differs (got {surf_start})"
+    print("[PASS] rung4c CORE (F3): case-only + space-only options — base-only boundary folds "
+          "them whole (empty slice), surface-aware boundary keeps the distinguishing slice.")
+
+
 def main():
     print(f"surface CORE smoke (rung 4c) — vocab={ENC.n_vocab}, K_max={KMAX}\n")
     model = _train()
     check_core_mc(model)
     check_core_lm(model)
+    check_surface_aware_boundary()
     check_kmax_inference(model)
-    print("\nALL 3 CHECKS PASSED.")
+    print("\nALL 4 CHECKS PASSED.")
 
 
 if __name__ == "__main__":

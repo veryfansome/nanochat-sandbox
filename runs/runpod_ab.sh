@@ -7,12 +7,12 @@
 # Stages (resumable; re-run any time):
 #   provision  → reuse the live pod from state, else deploy 8x H100
 #   bootstrap  → runpod.sh bootstrap (apt rsync/git + rsync sandbox + setup.sh + wandb)
-#   sync       → rsync the cached force_merges + surface_triple TOKENIZERS up
+#   sync       → rsync the cached force_merges + surface_only TOKENIZERS up
 #                + re-rsync sandbox/ so code fixes propagate each retrigger
 #   verify     → crate-free preflight (8 GPUs, venv, both tokenizers load + a
 #                surface encode/decode round-trip, overlay imports)
 #   train      → both arms in one tmux session, each SKIPPED if results/<tag>/eval.csv
-#                exists: A) baseline force_merges  B) surface (OVERLAY + base_eval_surface)
+#                exists: A) surface-only (OVERLAY + base_eval_surface)  B) force_merges sibling  C) vanilla baseline
 #   poll       → wait for ~/sandbox/.ab_done (tails progress)
 #   download   → runpod.sh pull (results/+report) + rsync CHECKPOINTS + per-arm logs
 #   verifydl   → assert both arms' eval.csv + checkpoint local; print the CORE numbers
@@ -48,11 +48,13 @@ fi
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30${RUNPOD_SSH_KEY:+ -i $RUNPOD_SSH_KEY -o IdentitiesOnly=yes}"
 
 HW_ENV="${HW_ENV:-USE_FP8=0 WINDOW_PATTERN=L DEVICE_BATCH_SIZE=16}"
-SURF_TAG="d24_surface_factoring_ab"        # arm 1 (run FIRST, per request)
-BASE_TAG="d24_force_merges_ab"             # arm 2 (the adopted force_merges baseline)
-BASELINE_TAG="d24_baseline_ab"            # arm 3 (vanilla nanochat: standard tokenizer, no overlay)
+# Surface-only factoring A/B: the DECISIVE test is surface-only (arm 1) vs the vanilla
+# baseline (arm 3); force_merges (arm 2) is an optional SIBLING reference, NOT stacked.
+SURF_TAG="d24_surface_only_ab"             # arm 1 (run FIRST): surface-only + overlay
+BASE_TAG="d24_force_merges_ab"             # arm 2: force_merges sibling (reference)
+BASELINE_TAG="d24_baseline_ab"             # arm 3: vanilla baseline = the control for arm 1
 FM_VARIANT="force_merges"
-SURF_VARIANT="surface_triple"
+SURF_VARIANT="surface_only"
 
 log()  { echo "==> $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -74,7 +76,7 @@ stage_provision() {
         log "state pod $POD_ID is '$st' — deploying a new one"
     fi
     log "RunPod availability:"; bash "$RUNPOD" types --available >&2 || true
-    confirm "Deploy 8x H100 on RunPod (~\$21.52/hr, ~\$200 for the 2-arm d24 A/B)?" || die "aborted"
+    confirm "Deploy 8x H100 on RunPod (~\$21.52/hr, ~\$300 for the 3-arm d24 A/B)?" || die "aborted"
     read -r POD_ID POD_IP POD_PORT < <(bash "$RUNPOD" launch | tail -1)
     [ -n "$POD_ID" ] || die "launch failed"
     _save; log "pod $POD_ID up at $POD_IP:$POD_PORT"
@@ -118,19 +120,19 @@ stage_verify() {
     _ssh 'set -e; export PATH="$HOME/.local/bin:$PATH"; cd ~/sandbox
         n=$(nvidia-smi -L | wc -l); echo "GPUs: $n"; [ "$n" -ge 8 ] || { echo FAIL_GPUS; exit 1; }
         test -d .venv || { echo FAIL_VENV; exit 1; }
-        for v in force_merges surface_triple; do
+        for v in force_merges surface_only; do
             test -f ~/.cache/nanochat-variants/$v/tokenizer/token_bytes.pt || { echo "FAIL_TOK_$v"; exit 1; }
         done
         uv run python - <<"PY"
 import os
-from tools.stack_triple import CFG_TRIPLE          # crate-free (lazy import)
+from tools.stack_fm_spaceless import SPACELESS_BODY   # surface-only pattern (crate-free)
 from nanochat.tokenizer import RustBPETokenizer
 from overlay.surface_tokenizer import SurfaceTokenizer
 import overlay.surface_factoring, overlay.surface_core_eval, overlay.surface_checkpoint  # noqa
-enc = RustBPETokenizer.from_directory(os.path.expanduser("~/.cache/nanochat-variants/surface_triple/tokenizer")).enc
-tok = SurfaceTokenizer(enc, CFG_TRIPLE["spaceless_pattern"], kmax=3)
+enc = RustBPETokenizer.from_directory(os.path.expanduser("~/.cache/nanochat-variants/surface_only/tokenizer")).enc
+tok = SurfaceTokenizer(enc, SPACELESS_BODY, kmax=1)
 s = "Of The Rings in the city"; assert tok.decode(tok.encode(s)) == s
-print("PREFLIGHT OK: surface tokenizer round-trips, overlay imports, no crate needed.")
+print("PREFLIGHT OK: surface-only tokenizer round-trips, overlay imports, no crate needed.")
 PY'
     log "preflight passed"
 }
@@ -144,22 +146,22 @@ export PATH="\$HOME/.local/bin:\$PATH"
 
 # --- arm 1/3: surface factoring (FIRST, per request) ---
 if [ -f results/$SURF_TAG/eval.csv ]; then echo "[ab] $SURF_TAG done — skip"; else
-  echo "[ab] arm 1/3: surface factoring"
+  echo "[ab] arm 1/3: surface-only (the test arm)"
   NANOCHAT_BASE_DIR="\$HOME/.cache/nanochat-variants/$SURF_VARIANT" \\
     OVERLAY=surface_factoring EVAL_MODULE=wrappers.base_eval_surface EVAL_ARGS="--eval core,bpb" $HW_ENV \\
     MODEL_TAG=$SURF_TAG WANDB_RUN=$SURF_TAG bash runs/speedrun.sh 2>&1 | tee runs/$SURF_TAG.log
 fi
 
-# --- arm 2/3: force_merges baseline ---
+# --- arm 2/3: force_merges sibling (reference, NOT the baseline) ---
 if [ -f results/$BASE_TAG/eval.csv ]; then echo "[ab] $BASE_TAG done — skip"; else
-  echo "[ab] arm 2/3: force_merges baseline"
+  echo "[ab] arm 2/3: force_merges sibling (reference, not the baseline)"
   NANOCHAT_BASE_DIR="\$HOME/.cache/nanochat-variants/$FM_VARIANT" EVAL_ARGS="--eval core,bpb" $HW_ENV \\
     MODEL_TAG=$BASE_TAG WANDB_RUN=$BASE_TAG bash runs/speedrun.sh 2>&1 | tee runs/$BASE_TAG.log
 fi
 
 # --- arm 3/3: vanilla nanochat baseline (default base dir + standard tokenizer, no overlay) ---
 if [ -f results/$BASELINE_TAG/eval.csv ]; then echo "[ab] $BASELINE_TAG done — skip"; else
-  echo "[ab] arm 3/3: vanilla baseline"
+  echo "[ab] arm 3/3: vanilla baseline (the control for arm 1)"
   EVAL_ARGS="--eval core,bpb" $HW_ENV \\
     MODEL_TAG=$BASELINE_TAG WANDB_RUN=$BASELINE_TAG bash runs/speedrun.sh 2>&1 | tee runs/$BASELINE_TAG.log
 fi
@@ -232,7 +234,7 @@ stage_verifydl() {
         { [ -f "$csv" ] && [ -n "$ckpt" ]; } || ok=0
     done
     [ "$ok" = "1" ] || { log "artifacts INCOMPLETE — NOT terminating. Re-run download (or fix the failed arm)."; return 1; }
-    log "all artifacts local. A/B is in results/{$BASE_TAG,$SURF_TAG}/."
+    log "all artifacts local. Decisive A/B: results/$SURF_TAG (surface-only) vs results/$BASELINE_TAG (vanilla); $BASE_TAG is the force_merges sibling."
 }
 
 stage_terminate() {

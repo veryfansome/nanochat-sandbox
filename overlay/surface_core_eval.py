@@ -70,6 +70,15 @@ def _stack(streams, K, bos, device):
     return (base.to(device), space.to(device), capb.to(device), capm.to(device))
 
 
+def _surface_keys(stream):
+    """Per-position identity over ALL FOUR streams (base + space + cap) — so the
+    common-prefix/suffix boundary treats options differing ONLY in case or factored
+    spacing as DISTINCT there, keeping their distinguishing surface NLL in the scored
+    slice (a base-IDs-only boundary folds them into the shared region → empty/NaN)."""
+    base, space, capb, capm = stream
+    return [(base[t], space[t], tuple(capb[t]), tuple(capm[t])) for t in range(len(base))]
+
+
 @torch.no_grad()
 def joint_per_token(model, base, space, capb, capm):
     """(B,T) per-token λ-free joint NLL via the model's loss_reduction='none' path.
@@ -154,16 +163,20 @@ def surface_evaluate_example(idx, model, tokenizer, data, device, task_meta):
     if task_type == 'multiple_choice':
         prompts = render_prompts_mc(item, cd, fewshot)
         streams = [_encode_prompt(p) for p in prompts]
-        base_streams = [s[0] for s in streams]
-        start = find_common_length(base_streams, 'left')     # common prefix (shared context)
+        end_idxs = [len(s[0]) for s in streams]
+        # common prefix over (base,space,cap), NOT base IDs alone — so case/space-only
+        # differences stay in the scored slice (F3). Clamp so no option is empty-sliced.
+        start = find_common_length([_surface_keys(s) for s in streams], 'left')
+        start = max(1, min(start, min(end_idxs) - 1))
         start_idxs = [start] * len(streams)
-        end_idxs = [len(b) for b in base_streams]
     elif task_type == 'schema':
         prompts = render_prompts_schema(item, cd, fewshot)
         streams = [_encode_prompt(p) for p in prompts]
-        base_streams = [s[0] for s in streams]
-        suf = find_common_length(base_streams, 'right')      # common suffix (shared continuation)
-        end_idxs = [len(b) for b in base_streams]
+        end_idxs = [len(s[0]) for s in streams]
+        # common suffix over (base,space,cap), NOT base IDs alone (F3). Clamp so no
+        # option is empty-sliced.
+        suf = find_common_length([_surface_keys(s) for s in streams], 'right')
+        suf = min(suf, min(end_idxs) - 1)
         start_idxs = [e - suf for e in end_idxs]
     else:
         raise ValueError(f"Unsupported task type: {task_type}")

@@ -24,6 +24,7 @@ Usage (same flags as scripts.base_train):
 """
 import os
 import runpy
+import sys
 
 import nanochat.gpt as gpt_mod
 import nanochat.dataloader as dl_mod
@@ -48,6 +49,19 @@ assert _tok.get_vocab_size() == _tok.enc.n_vocab
 SURFACE_TOK = SurfaceTokenizer(_tok.enc, SPACELESS_BODY, kmax=KMAX)
 print(f"[surface] tokenizer vocab={SURFACE_TOK.n_vocab:,}, K_max={KMAX}, "
       f"λ={os.environ.get('SURFACE_LAMBDA', '0.5')}")
+
+# --- 2.5) disable base_train's in-training CORE metric + sampling ------------
+# Both run the STANDARD scorer / generate on the surface model with base-only inputs
+# (no surface streams) → out-of-distribution → a misleading `core_metric` and broken
+# samples in WandB. The valid surface CORE is the POST-training base_eval_surface;
+# surface-aware generation is still TODO. Default both OFF (the caller can override by
+# passing either flag explicitly, e.g. once a surface-aware in-training scorer exists).
+if not any(a.startswith("--core-metric-every") for a in sys.argv):
+    sys.argv.append("--core-metric-every=-1")
+if not any(a.startswith("--sample-every") for a in sys.argv):
+    sys.argv.append("--sample-every=-1")
+print("[surface] in-training CORE + sampling DISABLED (OOD for the surface model; "
+      "post-training base_eval_surface is the valid CORE)")
 
 # --- 3) patch GPT + dataloaders + bpb BEFORE base_train imports them ---------
 gpt_mod.GPT = SurfaceFactoringGPT

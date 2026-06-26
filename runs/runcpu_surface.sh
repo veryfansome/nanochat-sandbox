@@ -2,13 +2,14 @@
 # CPU / macOS MECHANISM check for the surface-factoring harness. Mirrors
 # runs/runcpu.sh, but (a) trains the surface-only tokenizer instead of the
 # stock one, (b) routes training through wrappers.train_surface_factoring, and
-# (c) SKIPS base_eval (CORE) — a surface-aware base_eval is still TODO, and the
-# saved checkpoint carries surface params that won't load into a vanilla GPT.
+# (c) SKIPS base_eval (CORE) — CORE is expensive on CPU (this is a mechanism check,
+# not an A/B). The surface-aware CORE path (wrappers/base_eval_surface.py +
+# overlay/surface_checkpoint.py) IS built; it's for the GPU A/B, not this CPU run.
 #
 # This is NOT a scientific A/B (see runs/runcpu.sh header) — it only confirms the
 # surface overlay + dual-stream dataloader + joint loss + surface bpb survive a
-# few thousand real training iterations. For the A/B, use a GPU speedrun once the
-# surface-aware eval/checkpoint-load path lands.
+# few thousand real training iterations. For the A/B, use a GPU speedrun (the
+# surface-aware CORE path — base_eval_surface + surface_checkpoint — is built).
 #
 # Usage:   bash runs/runcpu_surface.sh
 #   reproducibility A/B (new seed + new tag):
@@ -94,4 +95,4 @@ echo
 echo "==> surface runcpu complete (model tag: $MODEL_TAG)."
 echo "    artifacts: $ARCHIVE_DIR/{train.log, bpb_trajectory.txt, *.md report, meta.json}"
 echo "    checkpoint kept: $VARIANT_BASE/base_checkpoints/$MODEL_TAG/"
-echo "    (base_eval/CORE skipped — needs the surface-aware eval + checkpoint-load path.)"
+echo "    (base_eval/CORE skipped — CPU mechanism check; the surface-aware CORE path exists for the GPU A/B.)"
