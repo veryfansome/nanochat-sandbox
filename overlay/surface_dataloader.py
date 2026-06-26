@@ -3,8 +3,10 @@ Surface-factoring dataloader + bpb eval for the harness.
 
 Mirrors nanochat's BOS-aligned best-fit dataloader, but tokenizes each document
 with a `SurfaceTokenizer` (dual stream) and packs ALL FOUR streams in lockstep:
-base ids, space bits, cap bits[K], cap mask[K]. It yields the BASE `(inputs,
-targets)` exactly like upstream (so the rest of base_train is untouched) and
+base ids, space bits, cap bits[K], cap mask[K] (K = tok.kmax = 1 for the canonical
+surface-only tokenizer — one cap bit per single-word token, like the space bit; the
+K-indexed cap arrays generalize the deprecated triple's K_max=3). It yields the BASE
+`(inputs, targets)` exactly like upstream (so the rest of base_train is untouched) and
 stashes the four surface streams — already shifted to align with
 `inputs=row[:,:-1]` / `targets=row[:,1:]` — in `overlay.surface_context`, where
 `SurfaceFactoringGPT.forward` reads them.

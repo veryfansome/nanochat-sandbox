@@ -5,6 +5,11 @@ production overlay — it exists to prove the model-side spec in
 ideas/surface_factoring/README.md is implementable and the pieces fit, before
 building the real overlay/dataloader/harness and running runcpu.sh.
 
+NOTE: production surface is now surface-only (baseline vocab, K_max=1 — one cap bit
+per single-word token, no force_merges). This reference deliberately uses a 2-phrase
+(K>1) tokenizer fixture to keep the GENERAL multi-slot cap machinery exercised by the
+smokes; it is not the production tokenizer.
+
 Provides:
   - build_tiny_tokenizer(): a tiny spaceless + case-folded + 2-phrase tokenizer
     (rustbpe_force_merges), trained inline on a small corpus — no data files.

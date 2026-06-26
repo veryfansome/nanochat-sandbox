@@ -1,8 +1,10 @@
 """
 SurfaceTokenizer — the production dual-stream tokenizer for surface factoring.
 
-Wraps a trained triple (force_merges + spaceless + case-fold) tokenizer and the
-surface codec into one object the dataloader/eval/generation can use:
+Wraps a trained surface-only tokenizer (the base rustbpe vocab tokenized with the
+SPACELESS pattern + a case-folded corpus; NO force_merges / phrase merges, vocab
+32768, K_max=1) and the surface codec into one object the dataloader/eval/
+generation can use:
 
     tok = SurfaceTokenizer.from_directory(tok_dir, SPACELESS_PATTERN, kmax=K)
     stream = tok.encode(text)          # [(base_id, space_bit, cap_bits[K], cap_mask[K]), ...]
@@ -10,10 +12,10 @@ surface codec into one object the dataloader/eval/generation can use:
     nbytes = tok.byte_count(stream)    # Σ base-token bytes + Σ space_bit  (the bpb denominator)
 
 The underlying tokenizer must have been trained with the SPACELESS pattern (so a
-leading space is its own pretoken and can be factored to a bit) — see
-tools/stack_fm_spaceless.py / tools/stack_triple.py for the build. `kmax` is the
-cap-slot width; if omitted it is derived from a sample via the codec's
-compute_kmax (pass a representative `sample_texts`).
+leading space is its own pretoken and can be factored to a bit) — build it with
+wrappers/tok_train_surface.py (pattern = tools.stack_fm_spaceless.SPACELESS_BODY).
+`kmax` is the cap-slot width (1 for surface-only — single-word tokens); if omitted
+it is derived from a sample via the codec's compute_kmax (pass `sample_texts`).
 """
 from __future__ import annotations
 

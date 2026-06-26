@@ -35,7 +35,10 @@ import sys
 
 import regex
 import tiktoken
-import rustbpe_force_merges
+# NOTE: rustbpe_force_merges (the variant crate, needs a Rust build) is imported
+# LAZILY inside train_fm — only tokenizer TRAINING needs it. Importing this module
+# for build_config / the patterns does NOT, so the surface train/eval path (which
+# loads a pre-baked tokenizer) needs no Rust toolchain on the GPU host.
 
 from nanochat.tokenizer import SPECIAL_TOKENS, RustBPETokenizer
 from nanochat.dataset import parquets_iter_batched
@@ -94,6 +97,7 @@ def train_fm(pattern, forced, vocab, max_chars, label):
                 if n > max_chars:
                     return
     print(f"[{label}] training (vocab={vocab}, {len(forced)} forced)...", file=sys.stderr)
+    import rustbpe_force_merges  # lazy: training-only (see module-top note)
     tok = rustbpe_force_merges.Tokenizer()
     tok.train_from_iterator(
         text_iter(), vocab - len(SPECIAL_TOKENS), pattern=pattern,

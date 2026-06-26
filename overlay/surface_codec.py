@@ -2,7 +2,8 @@
 Surface-factoring dual-stream CODEC — the production encode/decode that turns
 text into `(base_id, space_bit, cap_bits[K], cap_mask[K])` per token and back,
 losslessly. Tokenizer-agnostic: every function takes `(enc, sre, id2len)` so the
-same logic drives the tiny smoke tokenizer and the real triple tokenizer.
+same logic drives the tiny smoke tokenizer and the real surface-only tokenizer
+(K_max=1; the K>1 multi-slot path is the generalization the deprecated triple needed).
 
 Contract (see ../ideas/surface_factoring/README.md "Architecture"):
   - leading SPACE before a word is factored out as a per-token `space_bit`;

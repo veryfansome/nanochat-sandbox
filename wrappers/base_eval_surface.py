@@ -15,7 +15,7 @@ needs surface-aware autoregressive decode (a separate build); the base fallback
 would emit base tokens with no surface bits and decode wrong.
 
 Usage:
-    NANOCHAT_BASE_DIR=~/.cache/nanochat-variants/surface_triple \
+    NANOCHAT_BASE_DIR=~/.cache/nanochat-variants/surface_only \
       uv run python -m wrappers.base_eval_surface \
       --model-tag=d6_surface_factoring --eval core --max-per-task=500 --device-batch-size=1
 """
@@ -29,18 +29,18 @@ import nanochat.loss_eval as le_mod
 import nanochat.dataloader as dl_mod
 from nanochat.tokenizer import get_tokenizer
 
-from tools.stack_triple import FOLDED_PAIRS, CFG_TRIPLE
+from tools.stack_fm_spaceless import SPACELESS_BODY
 from overlay.surface_tokenizer import SurfaceTokenizer
 from overlay.surface_checkpoint import surface_build_model
 from overlay.surface_core_eval import surface_evaluate_example, set_surface_tokenizer
 from overlay.surface_dataloader import surface_data_loader, surface_evaluate_bpb
 
 # K_max for the scorer's tokenizer (the checkpoint also carries it for the model load).
-KMAX = int(os.environ.get("SURFACE_KMAX",
-           str(max(2, max(len((a + b).split()) for a, b in FOLDED_PAIRS)))))
+# surface-only tokens are single words → K_max = 1 (a checkpoint's surface_config wins).
+KMAX = int(os.environ.get("SURFACE_KMAX", "1"))
 os.environ["SURFACE_KMAX"] = str(KMAX)
 
-SURFACE_TOK = SurfaceTokenizer(get_tokenizer().enc, CFG_TRIPLE["spaceless_pattern"], kmax=KMAX)
+SURFACE_TOK = SurfaceTokenizer(get_tokenizer().enc, SPACELESS_BODY, kmax=KMAX)
 set_surface_tokenizer(SURFACE_TOK)
 print(f"[surface-eval] vocab={SURFACE_TOK.n_vocab:,}, K_max={KMAX}", file=sys.stderr)
 

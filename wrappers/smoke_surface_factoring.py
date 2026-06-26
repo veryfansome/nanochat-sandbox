@@ -5,6 +5,10 @@ Validates that the model-side spec is implementable and the pieces fit BEFORE
 building the real overlay/dataloader/harness and running runcpu.sh. Self-
 contained, no data files, no GPU, runs in seconds.
 
+These smokes use a 2-phrase (K>1) tokenizer fixture to exercise the GENERAL
+multi-slot cap machinery the overlay retains; production surface is surface-only
+(K_max=1 — one cap bit per single-word token, no force_merges).
+
   Rung 0  encoder property tests (no model): round-trip, byte accounting (the
           bpb denominator invariant), per-occurrence cap-mask correctness.
   Rung 1  unit tests: loss decomposition, mask actually masks, embedding
@@ -92,7 +96,8 @@ def check_byte_accounting():
 
 
 def check_cap_mask():
-    """Per-occurrence cap: the SAME phrase token carries different cap_bits by
+    """Per-occurrence cap on the GENERAL K>1 path (phrase fixture; production
+    surface-only is K_max=1): the SAME phrase token carries different cap_bits by
     occurrence; a continuation token carries cap=0."""
     def phrase_caps(text):
         for tid, sb, cb, cm in surface_encode(text, ENC, SRE, ID2LEN, KMAX):
@@ -114,8 +119,9 @@ def check_cap_mask():
 
 
 def check_cap_injectivity():
-    """Slot-specific cap embedding: 'Of the' ([1,0]) and 'of The' ([0,1]) — same
-    base token, asymmetric cap — must produce DIFFERENT trunk inputs. A shared
+    """Slot-specific cap embedding on the GENERAL K>1 path (production surface-only is
+    K_max=1, where this collapse can't arise): 'Of the' ([1,0]) and 'of The' ([0,1]) —
+    same base token, asymmetric cap — must produce DIFFERENT trunk inputs. A shared
     0/1 cap embedding (masked sum) would collapse them."""
     m = _mini()
     a = encode_batch(["Of the"])
@@ -190,7 +196,7 @@ class _NaiveSurfaceGPT(GPT):
         super().__init__(config)
         self.surface_emb = torch.nn.Embedding(2, config.n_embd)
         self.space_head = torch.nn.Linear(config.n_embd, 1)
-        self.cap_head = torch.nn.Linear(config.n_embd, 3)
+        self.cap_head = torch.nn.Linear(config.n_embd, 3)   # width arbitrary for accounting; prod is K_max=1
 
 
 class _ProperSurfaceGPT(_NaiveSurfaceGPT):

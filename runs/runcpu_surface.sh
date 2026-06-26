@@ -1,6 +1,6 @@
 #!/bin/bash
 # CPU / macOS MECHANISM check for the surface-factoring harness. Mirrors
-# runs/runcpu.sh, but (a) trains the surface "triple" tokenizer instead of the
+# runs/runcpu.sh, but (a) trains the surface-only tokenizer instead of the
 # stock one, (b) routes training through wrappers.train_surface_factoring, and
 # (c) SKIPS base_eval (CORE) — a surface-aware base_eval is still TODO, and the
 # saved checkpoint carries surface params that won't load into a vanilla GPT.
@@ -29,7 +29,7 @@ source .venv/bin/activate
 
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 mkdir -p "$NANOCHAT_BASE_DIR"
-VARIANT_BASE="$HOME/.cache/nanochat-variants/surface_triple"
+VARIANT_BASE="$HOME/.cache/nanochat-variants/surface_only"
 export WANDB_DIR="$VARIANT_BASE"
 MODEL_TAG="${MODEL_TAG:-d6_surface_factoring}"
 # Real wandb run name by default (so the val/bpb curve is captured + comparable
@@ -47,7 +47,7 @@ mkdir -p "$ARCHIVE_DIR"
 echo "==> 1/3 ensure pretraining data (downloads to $NANOCHAT_BASE_DIR)"
 python -m nanochat.dataset -n 8
 
-echo "==> 2/3 train the surface triple tokenizer -> $VARIANT_BASE/tokenizer/"
+echo "==> 2/3 train the surface-only tokenizer -> $VARIANT_BASE/tokenizer/"
 SURF_TOK="$VARIANT_BASE/tokenizer/tokenizer.pkl"
 if [ -f "$SURF_TOK" ] && [ "${FORCE_RETRAIN_TOKENIZER:-0}" != "1" ]; then
     echo "    cached at $SURF_TOK (set FORCE_RETRAIN_TOKENIZER=1 to redo)"

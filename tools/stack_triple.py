@@ -26,7 +26,9 @@ import os
 import sys
 
 import tiktoken
-import rustbpe_force_merges
+# rustbpe_force_merges imported lazily in _train (tokenizer-training only); see the
+# note in tools/stack_fm_spaceless.py. Importing this module for FOLDED_PAIRS /
+# CFG_TRIPLE needs no Rust build.
 
 from nanochat.tokenizer import SPECIAL_TOKENS, RustBPETokenizer
 from nanochat.dataset import parquets_iter_batched
@@ -58,6 +60,7 @@ def _train(pattern, forced, vocab, max_chars, fold, label):
                 if n > max_chars:
                     return
     print(f"[{label}] training (vocab={vocab}, {len(forced)} forced, fold={fold})...", file=sys.stderr)
+    import rustbpe_force_merges  # lazy: training-only (see module-top note)
     tok = rustbpe_force_merges.Tokenizer()
     tok.train_from_iterator(text_iter(), vocab - len(SPECIAL_TOKENS), pattern=pattern,
                             forced_pairs=forced, block_trailing_space=True, block_leading_space=True)

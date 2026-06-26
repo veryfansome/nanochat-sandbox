@@ -79,19 +79,36 @@ def check_core_mc(model):
 
 
 def check_kmax_inference(model):
-    """K_max recoverable from cap_emb.weight (the pre-persistence checkpoint fallback)."""
-    inferred = model.state_dict()["cap_emb.weight"].shape[0] // 2
-    assert inferred == KMAX, f"K_max inference wrong: {inferred} != {KMAX}"
-    print(f"[PASS] K_max inferable from cap_emb.weight (shape[0]//2 = {inferred}) "
-          "— surface_build_model fallback for checkpoints without surface_config.")
+    """cap_emb is now _SHARD-padded, so shape[0]//2 no longer reveals K_max — it comes
+    from meta surface_config / SURFACE_KMAX env. Verify the padded shape + the model's K."""
+    from overlay.surface_factoring import _pad
+    rows = model.state_dict()["cap_emb.weight"].shape[0]
+    assert rows == _pad(2 * KMAX), f"cap_emb rows {rows} != _pad(2*{KMAX})={_pad(2 * KMAX)}"
+    assert model.surface_kmax == KMAX, f"model.surface_kmax {model.surface_kmax} != {KMAX}"
+    print(f"[PASS] cap_emb padded to {rows} rows (=_pad(2·{KMAX})); K_max={model.surface_kmax} "
+          "comes from meta surface_config / SURFACE_KMAX env, not the padded shape.")
+
+
+def check_core_lm(model):
+    """LM path: now feeds the prompt's surface INPUT streams so the trunk runs
+    IN-DISTRIBUTION (the bug ran it base-only/OOD), then content-argmax. The model
+    overfit 'one of the dogs ran in the park', so it must predict that continuation."""
+    item = {"context": "one of the dogs ran in", "continuation": " the park"}
+    task_meta = {"task_type": "language_modeling", "num_fewshot": 0, "continuation_delimiter": ""}
+    ok = surface_evaluate_example(0, model, ENC, [item], "cpu", task_meta)
+    assert ok, "surface LM scorer mispredicted the memorized continuation (OOD trunk / bad alignment?)"
+    print("[PASS] LM CORE: surface_evaluate_example feeds the surface input streams "
+          "(in-distribution) + LOSSLESS content+space+cap exact-match — predicts the "
+          "memorized continuation's full rendering.")
 
 
 def main():
     print(f"surface CORE smoke (rung 4c) — vocab={ENC.n_vocab}, K_max={KMAX}\n")
     model = _train()
     check_core_mc(model)
+    check_core_lm(model)
     check_kmax_inference(model)
-    print("\nALL 2 CHECKS PASSED.")
+    print("\nALL 3 CHECKS PASSED.")
 
 
 if __name__ == "__main__":

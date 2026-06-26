@@ -3,11 +3,16 @@
 Design: ../ideas/surface_factoring/README.md (esp. "Architecture" + "Training
 integration"). The tokenizer factors leading SPACE and first-letter CASE out of
 token identity into per-token side-channel labels; this overlay predicts them.
+Canonical config is surface-only — K_max=1 (one cap bit per single-word token,
+conditioned exactly like the space bit); the K>1 multi-slot cap path
+(cap_bits[K]/cap_mask[K], per-word-start slots, _cap_compose's slot sum) is a
+generalization kept from the deprecated triple (phrase tokens spanning multiple
+word-starts) and is no longer the target.
 
 Per position the model is fed `(base_id, space_bit, cap_bits[K], cap_mask[K])`
 and predicts the NEXT position's content token (head-1 = the existing lm_head)
-and surface label (a space head + a per-word-start cap head, conditioned on the
-next base token). The surface label rides the INPUT too — added to `wte` and to
+and surface label (a space head + a cap head, conditioned on the next base
+token). The surface label rides the INPUT too — added to `wte` and to
 the per-layer value embeddings — so the trunk is information-equivalent to
 baseline (whose `" The"`/`"the"` are distinct tokens).
 
@@ -30,6 +35,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.gpt import GPT, norm, COMPUTE_DTYPE, has_ve
+from overlay.surface_lambda import current as _current_lambda   # optional dynamic-λ schedule
+
+
+class _CastLinear(nn.Linear):
+    """Like nanochat.gpt.Linear (casts the fp32 master weight to the activation
+    dtype in forward, replacing autocast — required under torch.compile/inductor,
+    which won't promote a bf16 activation × fp32 weight matmul) but ALSO casts the
+    bias, since the surface heads use one (nanochat's bias-free Linear drops it)."""
+    def forward(self, x):
+        b = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(dtype=x.dtype), b)
+
+
+# nanochat's distributed AdamW (optim.py) reduce_scatters every param with >=1024
+# elements along dim 0, asserting shape[0] % world_size == 0; params <1024 elements
+# take a safe all_reduce path instead. The surface params have tiny leading dims
+# (space=2, cap=2K, heads=1/K) but are >=1024 elements, so on >1 GPU they hit the
+# assert. Pad each leading dim up to a FIXED multiple of 8 (covers world_size in
+# {1,2,4,8}; fixed — not world_size-derived — so the checkpoint shape is identical
+# across GPU counts and loads under base_eval at world_size=1). Padded rows are never
+# indexed and padded head outputs are sliced off before the loss => zero gradient =>
+# inert (they only weight-decay).
+_SHARD = 8
+def _pad(n: int) -> int:
+    return ((n + _SHARD - 1) // _SHARD) * _SHARD
 
 
 def _kmax_from_env() -> int:
@@ -50,16 +80,20 @@ class SurfaceFactoringGPT(GPT):
         K, d = self.surface_kmax, config.n_embd
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        # input-side surface embeddings (added to wte; slot-specific cap emb)
-        self.space_emb = nn.Embedding(2, d)
-        self.cap_emb = nn.Embedding(2 * K, d)            # index = slot*2 + bit
+        # input-side surface embeddings (added to wte; slot-specific cap emb). Leading
+        # dims padded to _SHARD for the distributed AdamW reduce_scatter (see _pad);
+        # logical widths are 2 (space bit) and 2K (cap slot*2+bit); padded rows unused.
+        self.space_emb = nn.Embedding(_pad(2), d)
+        self.cap_emb = nn.Embedding(_pad(2 * K), d)      # index = slot*2 + bit (< 2K)
         # surface-conditioned value embeddings, per ve-layer (full info-equivalence)
         ve_layers = [str(i) for i in range(config.n_layer) if has_ve(i, config.n_layer)]
-        self.space_value_embeds = nn.ModuleDict({i: nn.Embedding(2, kv_dim) for i in ve_layers})
-        self.cap_value_embeds = nn.ModuleDict({i: nn.Embedding(2 * K, kv_dim) for i in ve_layers})
-        # output heads (token-conditioned: take [h, wte(next_base)])
-        self.space_head = nn.Linear(2 * d, 1)
-        self.cap_head = nn.Linear(2 * d, K)
+        self.space_value_embeds = nn.ModuleDict({i: nn.Embedding(_pad(2), kv_dim) for i in ve_layers})
+        self.cap_value_embeds = nn.ModuleDict({i: nn.Embedding(_pad(2 * K), kv_dim) for i in ve_layers})
+        # output heads (token-conditioned: take [h, wte(next_base)]); _CastLinear so the
+        # bf16-activation × fp32-weight matmul is dtype-consistent under compile. Output
+        # widths padded to _SHARD (logical 1 for space, K for cap); extras sliced off.
+        self.space_head = _CastLinear(2 * d, _pad(1))
+        self.cap_head = _CastLinear(2 * d, _pad(K))
 
     # ---- param accounting (must include the new params) -------------------- #
     def _surface_modules(self):
@@ -145,12 +179,19 @@ class SurfaceFactoringGPT(GPT):
 
     def init_weights(self):
         super().init_weights()
-        for emb in [self.space_emb, self.cap_emb, *self.space_value_embeds.values(),
-                    *self.cap_value_embeds.values()]:
+        surf_embs = [self.space_emb, self.cap_emb, *self.space_value_embeds.values(),
+                     *self.cap_value_embeds.values()]
+        for emb in surf_embs:
             nn.init.normal_(emb.weight, mean=0.0, std=0.02)
         for head in [self.space_head, self.cap_head]:
             nn.init.normal_(head.weight, mean=0.0, std=0.02)
             nn.init.zeros_(head.bias)
+        # Match nanochat: cast the surface embeddings to COMPUTE_DTYPE (like wte +
+        # value_embeds, gpt.py) so their adds with the bf16 base embeddings are
+        # dtype-consistent. Heads stay fp32 (the _CastLinear casts per-forward).
+        if COMPUTE_DTYPE != torch.float16:
+            for emb in surf_embs:
+                emb.to(dtype=COMPUTE_DTYPE)
 
     # ---- surface input composition ---------------------------------------- #
     def _cap_compose(self, table, cap_bits, cap_mask):
@@ -171,7 +212,8 @@ class SurfaceFactoringGPT(GPT):
     # ---- forward (copied from GPT.forward + surface injections) ------------ #
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean',
                 space_x=None, cap_bits_x=None, cap_mask_x=None,
-                space_y=None, cap_bits_y=None, cap_mask_y=None):
+                space_y=None, cap_bits_y=None, cap_mask_y=None,
+                return_surface_logits=False):
         # Harness path: upstream base_train calls model(x, y) with no surface
         # kwargs. Pull the current batch's surface streams from the out-of-band
         # context the surface dataloader set (see overlay/surface_context.py).
@@ -225,12 +267,19 @@ class SurfaceFactoringGPT(GPT):
                                   ignore_index=-1, reduction='none').view(B, T)
 
         # Surface heads, conditioned on the next base token (teacher-forced = targets).
+        # .float() the logits (like the content path) so the BCE runs in fp32 against
+        # the fp32 targets — the _CastLinear heads emit in the activation dtype (bf16).
         nxt = self.transformer.wte(targets.clamp_min(0))
         cond = torch.cat([x, nxt], dim=-1)
-        space_logit = self.space_head(cond).squeeze(-1)              # (B,T)
+        # slice off the _SHARD padding to the logical widths (1 for space, K for cap)
+        space_logit = self.space_head(cond)[..., 0].float()          # (B,T)
+        cap_logit = self.cap_head(cond)[..., :self.surface_kmax].float()   # (B,T,K)
+        if return_surface_logits:
+            # eval (lossless exact-match): raw content + surface-head logits so the
+            # caller can argmax content + threshold space/cap. No targets-y / loss path.
+            return logits, space_logit, cap_logit
         space_nll = F.binary_cross_entropy_with_logits(space_logit, space_y.float(),
                                                        reduction='none')
-        cap_logit = self.cap_head(cond)                              # (B,T,K)
         cap_nll = (F.binary_cross_entropy_with_logits(cap_logit, cap_bits_y.float(),
                                                       reduction='none') * cap_mask_y.float()
                    ).sum(dim=-1)                                     # (B,T)
@@ -245,4 +294,6 @@ class SurfaceFactoringGPT(GPT):
         denom = v.sum().clamp_min(1.0)
         content_mean = (content * v).sum() / denom
         surface_mean = ((space_nll + cap_nll) * v).sum() / denom
-        return content_mean + self.surface_lambda * surface_mean
+        # λ is static by default; with SURFACE_LAMBDA_SCHED set it decays over training
+        # (favor content as the easy surface heads converge). See overlay/surface_lambda.py.
+        return content_mean + _current_lambda(self.surface_lambda) * surface_mean

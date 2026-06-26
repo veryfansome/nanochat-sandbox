@@ -92,6 +92,35 @@ def pick_min_continuation(joint, start_idxs, end_idxs):
 
 
 @torch.no_grad()
+def content_preds(model, base, space, capb, capm):
+    """(B,T) content-only next-token argmax with the trunk fed the surface INPUT
+    streams so it runs IN-DISTRIBUTION (targets=None -> the forward returns the
+    vocab-cropped content logits). Position t predicts token t+1 (forward_model
+    alignment)."""
+    logits = model(base, space_x=space, cap_bits_x=capb, cap_mask_x=capm)
+    return logits.argmax(dim=-1)
+
+
+@torch.no_grad()
+def lossless_lm_match(model, base, space, capb, capm, start, end):
+    """Teacher-forced LOSSLESS exact-match for an LM continuation: argmax content +
+    threshold the space/cap heads, require ALL THREE streams (content + space + cap) to
+    match the gold at every continuation position [start:end]. Because the tokenizer is
+    lossless, matching all three == matching the exact rendered text — tokenizer-
+    independent and apples-to-apples with a standard tokenizer (whose tokens ARE the
+    text). Position t predicts token t+1, so [start-1:end-1] covers the continuation."""
+    tgt = torch.roll(base, -1, dims=1)   # next-content targets condition the surface heads
+    clogits, slogit, kloglt = model(base, tgt, space_x=space, cap_bits_x=capb,
+                                    cap_mask_x=capm, return_surface_logits=True)
+    sl = slice(start - 1, end - 1)
+    c_ok = (clogits[0, sl].argmax(dim=-1) == base[0, start:end]).all()
+    s_ok = ((slogit[0, sl] > 0).long() == space[0, start:end]).all()
+    m = capm[0, start:end].bool()        # only active cap slots are part of the rendering
+    k_ok = (((kloglt[0, sl] > 0).long() == capb[0, start:end]) | ~m).all()
+    return bool((c_ok & s_ok & k_ok).item())
+
+
+@torch.no_grad()
 def surface_evaluate_example(idx, model, tokenizer, data, device, task_meta):
     """Surface-aware drop-in for nanochat.core_eval.evaluate_example."""
     assert _SURFACE_TOK is not None, "set_surface_tokenizer() must be called first"
@@ -107,18 +136,20 @@ def surface_evaluate_example(idx, model, tokenizer, data, device, task_meta):
         fewshot = [data[i] for i in rng.sample(avail, num_fewshot)]
 
     if task_type == 'language_modeling':
-        # content-only argmax on the base stream (baseline-comparable; the surface
-        # bits are a side channel). Prefix-safe: find_common_length, not a strict
-        # prefix assert (surface/phrase tokenization need not be prefix-stable).
+        # LOSSLESS exact-match (content + space + cap = exact rendered text). Feed the
+        # prompt's known surface INPUT streams so the trunk runs IN-DISTRIBUTION (the old
+        # base-only forward_model omitted them → OOD → tanked squad/lambada), then require
+        # all three OUTPUT streams to match — NOT content-only, which was lenient on
+        # space/case and not apples-to-apples with the standard tokenizer's token==text.
         prompts = render_prompts_lm(item, cd, fewshot)
         without = _encode_prompt(prompts[0])[0]
-        wth = _encode_prompt(prompts[1])[0]
+        sh = _encode_prompt(prompts[1])
+        wth = sh[0]
         start = find_common_length([without, wth], 'left')
         end = len(wth)
         assert start < end, "continuation empty after surface encode"
-        ids = torch.tensor([wth], dtype=torch.long, device=device)
-        _, preds = forward_model(model, ids)            # surface forward(idx) -> logits (base fallback)
-        return torch.all(preds[0, start - 1:end - 1] == ids[0, start:end]).item()
+        base, space, capb, capm = _stack([sh], _SURFACE_TOK.kmax, _SURFACE_TOK.bos, device)
+        return lossless_lm_match(model, base, space, capb, capm, start, end)
 
     if task_type == 'multiple_choice':
         prompts = render_prompts_mc(item, cd, fewshot)

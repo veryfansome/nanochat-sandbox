@@ -43,11 +43,16 @@ def surface_build_model(checkpoint_dir, step, device, phase):
 
     surface = meta_data.get("surface_config")           # sibling of model_config; None for vanilla ckpts
     if surface is None and any(k.startswith("cap_emb") for k in model_data):
-        # checkpoint predates the surface_config persistence patch: it's a surface
-        # model, so infer K_max from cap_emb.weight = Embedding(2·K_max, d).
-        kmax = model_data["cap_emb.weight"].shape[0] // 2
+        # Surface model but no surface_config in meta (predates the persistence patch).
+        # cap_emb is _SHARD-padded, so K_max is NOT recoverable from its shape — require
+        # SURFACE_KMAX in the env.
+        kmax_env = os.environ.get("SURFACE_KMAX")
+        assert kmax_env is not None, (
+            "surface checkpoint lacks surface_config in meta and SURFACE_KMAX is unset; "
+            "K_max is unrecoverable (cap_emb is _SHARD-padded). Set SURFACE_KMAX.")
+        kmax = int(kmax_env)
         surface = {"K_max": kmax, "lambda": float(os.environ.get("SURFACE_LAMBDA", "0.5"))}
-        log0(f"surface_config absent from meta; inferred K_max={kmax} from cap_emb.weight")
+        log0(f"surface_config absent from meta; using SURFACE_KMAX={kmax} from env")
     with torch.device("meta"):
         if surface is not None:
             os.environ["SURFACE_KMAX"] = str(surface["K_max"])
