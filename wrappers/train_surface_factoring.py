@@ -54,6 +54,20 @@ print(f"[surface] tokenizer vocab={SURFACE_TOK.n_vocab:,}, K_max={KMAX}, "
 gpt_mod.GPT = SurfaceFactoringGPT
 le_mod.evaluate_bpb = surface_evaluate_bpb
 
+# Persist K_max/λ in the checkpoint meta (a SIBLING of model_config — never inside
+# it, or GPTConfig(**) would TypeError) so the eval path can rebuild SurfaceFactoringGPT.
+import nanochat.checkpoint_manager as cm_mod  # noqa: E402
+_orig_save_checkpoint = cm_mod.save_checkpoint
+
+
+def _save_with_surface(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    meta_data = {**meta_data, "surface_config": {
+        "K_max": KMAX, "lambda": float(os.environ.get("SURFACE_LAMBDA", "0.5"))}}
+    return _orig_save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank)
+
+
+cm_mod.save_checkpoint = _save_with_surface
+
 
 def _train_loader(tokenizer, B, T, split="train", device="cuda", resume_state_dict=None, **kw):
     # ignore the standard `tokenizer`; use the surface tokenizer captured above
@@ -80,5 +94,18 @@ for _attr in ("recompile_limit", "cache_size_limit"):
     if hasattr(torch._dynamo.config, _attr):
         setattr(torch._dynamo.config, _attr, 128)
 
-# --- 5) hand off to the upstream training loop, unchanged --------------------
+# --- 5) optional seed override -----------------------------------------------
+# nanochat hardcodes torch.manual_seed(42) in compute_init (common.py), which per
+# its own comment seeds ONLY the model weight init (the dataloader order is
+# seed-independent). Override it so SURFACE_SEED gives a fresh init for a
+# reproducibility A/B. It's the only global manual_seed call, so substituting the
+# value is surgical.
+_seed = os.environ.get("SURFACE_SEED")
+if _seed is not None:
+    import torch
+    _orig_manual_seed = torch.manual_seed
+    torch.manual_seed = lambda s, _o=_orig_manual_seed, _v=int(_seed): _o(_v)
+    print(f"[surface] seed override: model init seeded with SURFACE_SEED={_seed} (was 42)")
+
+# --- 6) hand off to the upstream training loop, unchanged --------------------
 runpy.run_module("scripts.base_train", run_name="__main__")

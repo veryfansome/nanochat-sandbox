@@ -11,7 +11,12 @@
 # surface-aware eval/checkpoint-load path lands.
 #
 # Usage:   bash runs/runcpu_surface.sh
+#   reproducibility A/B (new seed + new tag):
+#     SURFACE_SEED=1 MODEL_TAG=d6_surface_factoring_s1 WANDB_RUN=d6_surface_factoring_s1 bash runs/runcpu_surface.sh
 # Env:     SURFACE_LAMBDA (default 0.5), NUM_ITERS (default 5000),
+#          SURFACE_SEED (override model-init seed; default nanochat's 42),
+#          MODEL_TAG / WANDB_RUN (default d6_surface_factoring; set both for a
+#          distinct run that won't clobber the prior checkpoint/results/wandb),
 #          NANOCHAT_BASE_DIR (default ~/.cache/nanochat), MAX_CHARS (tok train)
 
 set -euo pipefail
@@ -50,7 +55,7 @@ else
     python -m wrappers.tok_train_surface --max-chars="${MAX_CHARS:-2000000000}"
 fi
 
-echo "==> 3/3 surface-factoring training (depth 6, $NUM_ITERS iters, λ=$SURFACE_LAMBDA, wandb=$WANDB_RUN)"
+echo "==> 3/3 surface-factoring training (depth 6, $NUM_ITERS iters, λ=$SURFACE_LAMBDA, seed=${SURFACE_SEED:-42}, tag=$MODEL_TAG, wandb=$WANDB_RUN)"
 # Run with NANOCHAT_BASE_DIR pointed at the variant base so get_tokenizer /
 # get_token_bytes resolve to the surface tokenizer; data is symlinked there by
 # setup_variant_base during tok_train_surface. tee stdout so the val/bpb curve is
