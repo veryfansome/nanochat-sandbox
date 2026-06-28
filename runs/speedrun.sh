@@ -40,6 +40,13 @@
 #               this doubles grad-accum steps (total batch size held constant
 #               by base_train), so wall-clock per training step roughly
 #               doubles. Lower = OOM-safe, slower; higher = more memory.
+#   EXTRA_TRAIN_ARGS  extra flags appended to the base_train torchrun line (default:
+#               empty). E.g. EXTRA_TRAIN_ARGS="--num-iterations=1850" for a reduced
+#               COOLED schedule (warmdown stays proportional via --warmdown-ratio,
+#               default 0.65) — used by the λ-screen (runs/runpod_lambda_screen.sh).
+#               --num-iterations takes precedence over --target-param-data-ratio for
+#               the step count; batch/LR/weight-decay still derive from ratio=8, so it
+#               is the d24 recipe run for fewer (cooled) steps, not a truncated schedule.
 #   USE_SFT     run chat_sft + chat_eval after base_train (default: 0). This
 #               *differs* from upstream's speedrun: our default workflow is
 #               overlay A/B, where neither overlay touches SFT, so chat_eval
@@ -153,10 +160,17 @@ wait $DATASET_PID
 # scripts.base_train. $FP8_FLAG is "" or "--fp8" — bash word-splitting drops
 # the arg cleanly when empty. --window-pattern and --device-batch-size are
 # env-controlled for non-H100 hardware compatibility.
+# EVAL_ONLY=1 skips training and evaluates an EXISTING checkpoint (recovery when training
+# finished but the post-train eval crashed — avoids a full retrain). The dataset/tokenizer
+# steps above are idempotent no-ops when already present.
+if [ "${EVAL_ONLY:-0}" = "1" ]; then
+    echo "==> EVAL_ONLY=1: skipping training, evaluating the existing $MODEL_TAG checkpoint"
+else
 torchrun --standalone --nproc_per_node="$NPROC" -m "$TRAIN_MODULE" -- \
     --depth="$DEPTH" --target-param-data-ratio=8 --device-batch-size="$DEVICE_BATCH_SIZE" $FP8_FLAG \
     --window-pattern="$WINDOW_PATTERN" \
-    --model-tag="$MODEL_TAG" --run="$WANDB_RUN"
+    --model-tag="$MODEL_TAG" --run="$WANDB_RUN" ${EXTRA_TRAIN_ARGS:-}
+fi
 
 # wrappers.base_eval (not scripts.base_eval directly) so the prefix-safety
 # patch is applied + boundary-crossing summary printed. See wrappers/_patches.py.

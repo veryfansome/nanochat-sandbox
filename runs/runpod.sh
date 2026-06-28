@@ -8,6 +8,9 @@
 #
 # Subcommands (each prints machine-parseable results on the last stdout line):
 #   types [--available]            list H100/A100 8x availability + price
+#   datacenters                    storage-capable DCs + 8xGPU stock (where a volume can live)
+#   volumes                        list existing network volumes (id/name/size/dc)
+#   create-volume <name> <gb> <dc> create a network volume; prints its id
 #   launch                         deploy an 8xH100 pod; prints "<podId> <ip> <port>"
 #   host       <podId>             re-resolve "<ip> <port>" (survives restarts)
 #   ssh        <podId>             interactive ssh into the pod
@@ -16,9 +19,10 @@
 #   terminate  <podId>             terminate (stops billing)
 #   status     <podId> | list
 #
-# Auth: RUNPOD_API_KEY (in ~/.lambda.env, auto-sourced).
+# Auth: RUNPOD_API_KEY (in ~/.lambda.env, auto-sourced). GraphQL for no-volume deploy +
+# host/status/terminate; REST (rest.runpod.io/v1) for volumes + volume-attached deploy.
 # Env:
-#   RUNPOD_GPU_TYPE     default "NVIDIA H100 80GB HBM3"  (8x H100 SXM, stock High)
+#   RUNPOD_GPU_TYPE     default "NVIDIA H100 80GB HBM3"  (8x H100 SXM)
 #   RUNPOD_GPU_COUNT    default 8
 #   RUNPOD_CLOUD        SECURE | COMMUNITY | ALL  (default SECURE)
 #   RUNPOD_IMAGE        default runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
@@ -27,6 +31,12 @@
 #   RUNPOD_PUBKEY_FILE  ssh public key to inject (default: ~/.ssh/id_ed25519.pub then id_rsa.pub)
 #   WANDB_API_KEY       required for bootstrap (piped to host, never on argv)
 #   NANOCHAT_COMMIT     optional pin forwarded to the host setup.sh
+#   --- NETWORK VOLUME (persist checkpoints across termination; no fragile 4GB download) ---
+#   RUNPOD_VOLUME_ID    if set, deploy via REST with this network volume attached. The
+#                       volume is DATACENTER-PINNED, so deploys are constrained to its DC
+#                       (only storage-capable DCs have it; run `datacenters` to see stock).
+#   RUNPOD_DATACENTER   the volume's datacenter id (REQUIRED with RUNPOD_VOLUME_ID), e.g. US-GA-2
+#   RUNPOD_VOLUME_MOUNT mount path on the pod (default /workspace — RunPod's only supported path)
 
 set -euo pipefail
 SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,6 +70,20 @@ gql() {
     curl -sS -X POST "$GQL" -H "Content-Type: application/json" -d "$q"
 }
 
+# rest METHOD PATH [JSON_BODY] → raw JSON. The newer REST API (Bearer auth) — used for
+# network volumes (GET/POST /networkvolumes) and volume-attached pod deploy (POST /pods),
+# which the GraphQL podFindAndDeployOnDemand can't do (no networkVolumeId field there).
+REST_BASE="https://rest.runpod.io/v1"
+rest() {
+    local method="$1" path="$2" body="${3:-}"
+    if [ -n "$body" ]; then
+        curl -sS -X "$method" "$REST_BASE$path" -H "Authorization: Bearer $RUNPOD_API_KEY" \
+            -H "Content-Type: application/json" -d "$body"
+    else
+        curl -sS -X "$method" "$REST_BASE$path" -H "Authorization: Bearer $RUNPOD_API_KEY"
+    fi
+}
+
 _pubkey() {
     local f="${RUNPOD_PUBKEY_FILE:-${RUNPOD_SSH_KEY:+$RUNPOD_SSH_KEY.pub}}"
     [ -n "$f" ] && [ -f "$f" ] || die "no ssh public key (set RUNPOD_PUBKEY_FILE, or RUNPOD_SSH_KEY with a .pub beside it)"
@@ -82,9 +106,31 @@ cmd_types() {
         | jq -r ".data.gpuTypes[]? | select(.displayName|test(\"H100|A100\")) $sel | \"\(.displayName) | ${GPU_COUNT}x stock:\(.lowestPrice.stockStatus // \"none\") \$\(.lowestPrice.uninterruptablePrice // \"-\")/hr | id=\(.id)\""
 }
 
-cmd_launch() {
+# poll a just-created pod id → RUNNING + a public SSH port, wait for sshd, then print
+# "<id> <ip> <port>" (the parseable last line). Shared by the GraphQL + REST deploy paths.
+_await_ssh() {
+    local id="$1"
+    log "pod id: $id — polling for RUNNING + a public SSH port (2-5 min)"
+    local ip="" port="" st="" tries=0
+    while :; do
+        st=$(gql "query{ pod(input:{podId:\"$id\"}){ desiredStatus } }" 2>/dev/null | jq -r '.data.pod.desiredStatus // "?"' 2>/dev/null || echo "?")
+        # reset + `|| true`: before the port is ready _host emits nothing and `read` hits
+        # EOF (non-zero) → under set -e that would abort launch and orphan the pod.
+        ip=""; port=""; read -r ip port < <(_host "$id") || true
+        echo "    status=$st ssh=${ip:+$ip:$port}" >&2
+        [ -n "${ip:-}" ] && [ -n "${port:-}" ] && break
+        tries=$((tries+1)); [ "$tries" -gt 60 ] && die "pod never exposed a public SSH port (check the RunPod console for $id)"
+        sleep 10
+    done
+    log "waiting for sshd at $ip:$port"
+    for _ in $(seq 1 30); do _ssh_to "$ip" "$port" true 2>/dev/null && break; sleep 10; done
+    echo "$id $ip $port"     # last line: parseable
+}
+
+# GraphQL on-demand deploy (NO network volume). Prints the pod id.
+_deploy_gql() {
     local pubkey; pubkey=$(_pubkey | tr -d '\n')   # ssh keys are quote/backslash-free → embed directly
-    log "deploying ${GPU_COUNT}x '$GPU_TYPE' ($CLOUD), disk=${DISK_GB}GB, image=$IMAGE"
+    log "deploying ${GPU_COUNT}x '$GPU_TYPE' ($CLOUD), disk=${DISK_GB}GB, image=$IMAGE (no volume)"
     local m id
     m=$(gql "mutation{ podFindAndDeployOnDemand(input:{
             cloudType:$CLOUD gpuCount:$GPU_COUNT gpuTypeId:\"$GPU_TYPE\"
@@ -95,20 +141,61 @@ cmd_launch() {
         }){ id } }")
     id=$(echo "$m" | jq -r '.data.podFindAndDeployOnDemand.id // empty')
     [ -n "$id" ] || { echo "$m" | jq -r '.errors[0].message // .' >&2; die "deploy failed"; }
-    log "pod id: $id — polling for RUNNING + a public SSH port (2-5 min)"
-    local ip="" port="" st="" tries=0
-    while :; do
-        st=$(gql "query{ pod(input:{podId:\"$id\"}){ desiredStatus } }" | jq -r '.data.pod.desiredStatus // "?"')
-        read -r ip port < <(_host "$id")
-        echo "    status=$st ssh=${ip:+$ip:$port}" >&2
-        [ -n "${ip:-}" ] && [ -n "${port:-}" ] && break
-        tries=$((tries+1)); [ "$tries" -gt 60 ] && die "pod never exposed a public SSH port (check the RunPod console for $id)"
-        sleep 10
+    echo "$id"
+}
+
+# REST deploy WITH a network volume (mounts at $RUNPOD_VOLUME_MOUNT, pins the pod to the
+# volume's datacenter). Prints the pod id. Required because the GraphQL deploy has no
+# networkVolumeId field.
+_deploy_rest() {
+    local pubkey; pubkey=$(_pubkey | tr -d '\n')
+    : "${RUNPOD_DATACENTER:?RUNPOD_DATACENTER required with RUNPOD_VOLUME_ID (the volume datacenter id, e.g. US-GA-2)}"
+    local mount="${RUNPOD_VOLUME_MOUNT:-/workspace}"
+    log "deploying ${GPU_COUNT}x '$GPU_TYPE' ($CLOUD) in $RUNPOD_DATACENTER, volume $RUNPOD_VOLUME_ID @ $mount, disk=${DISK_GB}GB"
+    local body r id
+    body=$(jq -n --arg name "$POD_NAME" --arg img "$IMAGE" --arg cloud "$CLOUD" \
+        --argjson gc "$GPU_COUNT" --arg gt "$GPU_TYPE" --arg dc "$RUNPOD_DATACENTER" \
+        --arg vol "$RUNPOD_VOLUME_ID" --arg mount "$mount" --argjson disk "$DISK_GB" --arg pk "$pubkey" \
+        '{name:$name, imageName:$img, cloudType:$cloud, computeType:"GPU",
+          gpuCount:$gc, gpuTypeIds:[$gt], dataCenterIds:[$dc],
+          networkVolumeId:$vol, volumeMountPath:$mount, volumeInGb:0,
+          containerDiskInGb:$disk, ports:["22/tcp"], env:{PUBLIC_KEY:$pk}}')
+    r=$(rest POST /pods "$body")
+    id=$(echo "$r" | jq -r '.id // empty')
+    [ -n "$id" ] || { echo "$r" | jq -r '.error // .message // .' >&2; die "deploy (REST + volume) failed"; }
+    echo "$id"
+}
+
+cmd_launch() {
+    local id
+    if [ -n "${RUNPOD_VOLUME_ID:-}" ]; then id=$(_deploy_rest); else id=$(_deploy_gql); fi
+    _await_ssh "$id"
+}
+
+cmd_datacenters() {
+    log "storage-capable datacenters + ${GPU_COUNT}x '$GPU_TYPE' stock (a network volume can only live where storage=true):"
+    local dc st
+    for dc in $(gql 'query{ dataCenters { id storageSupport } }' | jq -r '.data.dataCenters[]? | select(.storageSupport==true) | .id'); do
+        st=$(gql "query{ gpuTypes(input:{id:\"$GPU_TYPE\"}){ lowestPrice(input:{gpuCount:$GPU_COUNT, dataCenterId:\"$dc\"}){ stockStatus uninterruptablePrice } } }" \
+            | jq -r '.data.gpuTypes[0].lowestPrice | "stock=\(.stockStatus // "none") $\(.uninterruptablePrice // "-")/hr"' 2>/dev/null)
+        printf '  %-10s %s\n' "$dc" "$st" >&2
     done
-    # wait for sshd to actually accept (image start + key injection)
-    log "waiting for sshd at $ip:$port"
-    for _ in $(seq 1 30); do _ssh_to "$ip" "$port" true 2>/dev/null && break; sleep 10; done
-    echo "$id $ip $port"     # last line: parseable
+}
+
+cmd_volumes() {
+    rest GET /networkvolumes | jq -r 'if type=="array" then (.[] | "id=\(.id)  name=\(.name)  size=\(.size)GB  dc=\(.dataCenterId)") elif .error then "ERROR: \(.error)" else . end'
+}
+
+cmd_create_volume() {
+    local name="${1:?create-volume <name> <sizeGB> <dataCenterId>}" size="${2:?<sizeGB>}" dc="${3:?<dataCenterId>}"
+    local body r id
+    body=$(jq -n --arg n "$name" --argjson s "$size" --arg dc "$dc" '{name:$n, size:$s, dataCenterId:$dc}')
+    r=$(rest POST /networkvolumes "$body")
+    id=$(echo "$r" | jq -r '.id // empty')
+    [ -n "$id" ] || { echo "$r" | jq -r '.error // .message // .' >&2; die "volume create failed"; }
+    log "created network volume id=$id ($name, ${size}GB, $dc)."
+    log "→ add to ~/.lambda.env:  export RUNPOD_VOLUME_ID=$id ; export RUNPOD_DATACENTER=$dc"
+    echo "$id"
 }
 
 cmd_host()   { local id="${1:?host <podId>}"; _host "$id"; }
@@ -174,7 +261,9 @@ case "${1:-}" in
 esac
 CMD="$1"; shift
 case "$CMD" in
-    types) cmd_types "$@";; launch) cmd_launch "$@";; host) cmd_host "$@";;
+    types) cmd_types "$@";; datacenters) cmd_datacenters "$@";;
+    volumes) cmd_volumes "$@";; create-volume) cmd_create_volume "$@";;
+    launch) cmd_launch "$@";; host) cmd_host "$@";;
     ssh) cmd_ssh "$@";; bootstrap) cmd_bootstrap "$@";; pull) cmd_pull "$@";;
     terminate) cmd_terminate "$@";; status) cmd_status "$@";; list) cmd_list "$@";;
     *) die "unknown command: $CMD";;

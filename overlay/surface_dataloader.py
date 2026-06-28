@@ -21,9 +21,15 @@ import math
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from nanochat.dataloader import _document_batches
+from nanochat.common import print0
 from overlay.surface_context import set_surface
+
+# Last component split from surface_evaluate_bpb (so a logger / wandb hook can read it
+# without changing the float return contract). {joint, content, overhead} bits/byte.
+LAST_BPB_COMPONENTS: dict = {}
 
 
 def _encode_doc(tok, text):
@@ -109,19 +115,36 @@ def surface_data_loader(*args, **kwargs):
 
 
 @torch.no_grad()
-def surface_evaluate_bpb(model, batches, steps, token_bytes):
+def surface_evaluate_bpb(model, batches, steps, token_bytes, return_components=False):
     """nanochat.loss_eval.evaluate_bpb with the surface byte denominator:
-    per target token, bytes = token_bytes[base_y] + space_y (factored space)."""
+    per target token, bytes = token_bytes[base_y] + space_y (factored space).
+
+    ALSO splits the JOINT bpb (= val/bpb, what base_train logs) into its CONTENT stream
+    vs the space+cap SURFACE OVERHEAD, so a run logs the two trajectories. The split is
+    free of the cross-tokenizer confound (it's within one model): content = CE of the raw
+    content logits vs the content targets; overhead = joint - content (the heads' cost of
+    predicting the side channels). Surface is a low-entropy task that should converge fast
+    and plateau — so the OVERHEAD trajectory flattening while CONTENT keeps descending is
+    the signal that λ can be decayed (see overlay/surface_lambda.py); a λ change that lowers
+    content while raising overhead is the capacity tradeoff made visible.
+
+    The JOINT return value is unchanged (backward-identical val/bpb). The components are
+    also stashed in LAST_BPB_COMPONENTS and returned when return_components=True. Costs one
+    extra (content-only) forward per eval batch — eval is infrequent, so this is cheap."""
     from overlay.surface_context import get_surface
     device = model.get_device()
-    total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
+    total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)     # joint
+    content_nats = torch.tensor(0.0, dtype=torch.float32, device=device)   # content stream only
     total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
     it = iter(batches)
     for _ in range(steps):
         x, y = next(it)
         sc = get_surface()                         # set by the surface val loader
         space_y = sc["space_y"] if sc is not None else torch.zeros_like(y)
-        loss2d = model(x, y, loss_reduction='none').reshape(-1)
+        loss2d = model(x, y, loss_reduction='none').reshape(-1)            # joint per-token NLL
+        clogits, _, _ = model(x, y, return_surface_logits=True)            # raw content logits
+        content2d = F.cross_entropy(clogits.reshape(-1, clogits.size(-1)), y.reshape(-1),
+                                    ignore_index=-1, reduction='none')
         y = y.reshape(-1)
         sp = space_y.reshape(-1)
         valid = y >= 0
@@ -130,10 +153,23 @@ def surface_evaluate_bpb(model, batches, steps, token_bytes):
                                  torch.zeros_like(y, dtype=token_bytes.dtype))
         # add the factored leading-space byte where the target is a real (counted) token
         num_bytes2d = base_bytes + (sp * (base_bytes > 0)).to(token_bytes.dtype)
-        total_nats += (loss2d * (num_bytes2d > 0)).sum()
+        gate = (num_bytes2d > 0)
+        total_nats += (loss2d * gate).sum()
+        content_nats += (content2d * gate).sum()
         total_bytes += num_bytes2d.sum()
     if (dist.is_initialized() and dist.get_world_size() > 1):
         dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(content_nats, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
-    total_nats, total_bytes = total_nats.item(), total_bytes.item()
-    return float('inf') if total_bytes == 0 else total_nats / (math.log(2) * total_bytes)
+    total_nats, content_nats, total_bytes = total_nats.item(), content_nats.item(), total_bytes.item()
+    if total_bytes == 0:
+        return (float('inf'), float('inf'), float('inf')) if return_components else float('inf')
+    denom = math.log(2) * total_bytes
+    joint_bpb = total_nats / denom
+    content_bpb = content_nats / denom
+    overhead_bpb = joint_bpb - content_bpb
+    LAST_BPB_COMPONENTS.clear()
+    LAST_BPB_COMPONENTS.update(joint=joint_bpb, content=content_bpb, overhead=overhead_bpb)
+    print0(f"  [surface bpb] joint {joint_bpb:.5f} = content {content_bpb:.5f} "
+           f"+ overhead {overhead_bpb:.5f}")
+    return (joint_bpb, content_bpb, overhead_bpb) if return_components else joint_bpb

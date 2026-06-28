@@ -125,6 +125,41 @@ def check_surface_aware_boundary():
           "them whole (empty slice), surface-aware boundary keeps the distinguishing slice.")
 
 
+def check_incorrect_logging(model):
+    """The incorrect-answer logger writes one JSONL row per WRONG example (MC + LM),
+    nothing for a correct one, and self-disables cleanly."""
+    import json
+    import tempfile
+    from overlay import surface_core_eval as sce
+    p = os.path.join(tempfile.mkdtemp(), "incorrect.jsonl")
+    sce.set_incorrect_log(p)
+    mc_meta = {"task_type": "multiple_choice", "num_fewshot": 0, "continuation_delimiter": ""}
+    lm_meta = {"task_type": "language_modeling", "num_fewshot": 0, "continuation_delimiter": ""}
+    choices = [" the park", " a house", " to school"]
+    correct = {"query": "one of the dogs ran in", "choices": choices, "gold": 0}
+    wrong = {"query": "one of the dogs ran in", "choices": choices, "gold": 2}
+    lm_wrong_item = {"context": "one of the dogs ran in", "continuation": " a house"}  # memorized "the park"
+    assert surface_evaluate_example(0, model, ENC, [correct], "cpu", mc_meta)          # correct -> no row
+    assert not surface_evaluate_example(0, model, ENC, [wrong], "cpu", mc_meta)        # wrong -> 1 MC row
+    lm_wrong = not surface_evaluate_example(0, model, ENC, [lm_wrong_item], "cpu", lm_meta)
+    if sce._LOG_FH:
+        sce._LOG_FH.flush()
+    rows = [json.loads(l) for l in open(p)]
+    mc_rows = [r for r in rows if "scores" in r]
+    lm_rows = [r for r in rows if "content_ok" in r]
+    assert len(mc_rows) == 1 and mc_rows[0]["gold"] == 2 and "pred" in mc_rows[0] \
+        and len(mc_rows[0]["scores"]) == 3, f"MC incorrect row malformed: {mc_rows}"
+    assert len(lm_rows) == (1 if lm_wrong else 0), f"LM row count != wrongness: {lm_rows}"
+    if lm_wrong:
+        assert {"gold", "pred", "content_ok", "space_ok", "cap_ok"} <= set(lm_rows[0])
+    sce.set_incorrect_log("")                                                          # disable
+    surface_evaluate_example(0, model, ENC, [wrong], "cpu", mc_meta)
+    assert len(list(open(p))) == len(rows), "disable did not stop logging"
+    sce.set_incorrect_log(None)                                                        # reset for cleanliness
+    print(f"[PASS] incorrect-answer logging: wrong MC + {'LM ' if lm_wrong else ''}→ rows written "
+          "(correct omitted, fields present, disable honored).")
+
+
 def main():
     print(f"surface CORE smoke (rung 4c) — vocab={ENC.n_vocab}, K_max={KMAX}\n")
     model = _train()
@@ -132,7 +167,8 @@ def main():
     check_core_lm(model)
     check_surface_aware_boundary()
     check_kmax_inference(model)
-    print("\nALL 4 CHECKS PASSED.")
+    check_incorrect_logging(model)
+    print("\nALL 5 CHECKS PASSED.")
 
 
 if __name__ == "__main__":

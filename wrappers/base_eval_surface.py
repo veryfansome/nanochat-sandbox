@@ -32,7 +32,7 @@ from nanochat.tokenizer import get_tokenizer
 from tools.stack_fm_spaceless import SPACELESS_BODY
 from overlay.surface_tokenizer import SurfaceTokenizer
 from overlay.surface_checkpoint import surface_build_model
-from overlay.surface_core_eval import surface_evaluate_example, set_surface_tokenizer
+from overlay.surface_core_eval import surface_evaluate_example, set_surface_tokenizer, set_incorrect_log
 from overlay.surface_dataloader import surface_data_loader, surface_evaluate_bpb
 
 # K_max for the scorer's tokenizer (the checkpoint also carries it for the model load).
@@ -43,6 +43,25 @@ os.environ["SURFACE_KMAX"] = str(KMAX)
 SURFACE_TOK = SurfaceTokenizer(get_tokenizer().enc, SPACELESS_BODY, kmax=KMAX)
 set_surface_tokenizer(SURFACE_TOK)
 print(f"[surface-eval] vocab={SURFACE_TOK.n_vocab:,}, K_max={KMAX}", file=sys.stderr)
+
+
+# log every INCORRECT answer (default path under the base dir; set SURFACE_EVAL_INCORRECT_LOG
+# to override the path, or to "" to disable). idx + the seed-1337 shuffle recovers the question.
+def _model_tag():
+    for i, a in enumerate(sys.argv):
+        if a == "--model-tag" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith("--model-tag="):
+            return a.split("=", 1)[1]
+    return "model"
+
+
+_base = os.environ.get("NANOCHAT_BASE_DIR", os.path.expanduser("~/.cache/nanochat"))
+_incorrect_log = os.environ.get("SURFACE_EVAL_INCORRECT_LOG",
+                                os.path.join(_base, "base_eval", f"incorrect_{_model_tag()}.jsonl"))
+set_incorrect_log(_incorrect_log)
+if _incorrect_log:
+    print(f"[surface-eval] logging incorrect answers → {_incorrect_log}", file=sys.stderr)
 
 # --- patches ---------------------------------------------------------------- #
 cm_mod.build_model = surface_build_model           # K_max-aware load (load_model -> build_model)

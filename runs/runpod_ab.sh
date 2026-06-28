@@ -7,12 +7,12 @@
 # Stages (resumable; re-run any time):
 #   provision  → reuse the live pod from state, else deploy 8x H100
 #   bootstrap  → runpod.sh bootstrap (apt rsync/git + rsync sandbox + setup.sh + wandb)
-#   sync       → rsync the cached force_merges + surface_only TOKENIZERS up
+#   sync       → rsync the cached surface_only TOKENIZER up
 #                + re-rsync sandbox/ so code fixes propagate each retrigger
 #   verify     → crate-free preflight (8 GPUs, venv, both tokenizers load + a
 #                surface encode/decode round-trip, overlay imports)
 #   train      → both arms in one tmux session, each SKIPPED if results/<tag>/eval.csv
-#                exists: A) surface-only (OVERLAY + base_eval_surface)  B) force_merges sibling  C) vanilla baseline
+#                exists: the surface-only arm (OVERLAY + base_eval_surface)
 #   poll       → wait for ~/sandbox/.ab_done (tails progress)
 #   download   → runpod.sh pull (results/+report) + rsync CHECKPOINTS + per-arm logs
 #   verifydl   → assert both arms' eval.csv + checkpoint local; print the CORE numbers
@@ -48,12 +48,12 @@ fi
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30${RUNPOD_SSH_KEY:+ -i $RUNPOD_SSH_KEY -o IdentitiesOnly=yes}"
 
 HW_ENV="${HW_ENV:-USE_FP8=0 WINDOW_PATTERN=L DEVICE_BATCH_SIZE=16}"
-# Surface-only factoring A/B: the DECISIVE test is surface-only (arm 1) vs the vanilla
-# baseline (arm 3); force_merges (arm 2) is an optional SIBLING reference, NOT stacked.
-SURF_TAG="d24_surface_only_ab"             # arm 1 (run FIRST): surface-only + overlay
-BASE_TAG="d24_force_merges_ab"             # arm 2: force_merges sibling (reference)
-BASELINE_TAG="d24_baseline_ab"             # arm 3: vanilla baseline = the control for arm 1
-FM_VARIANT="force_merges"
+# 1-ARM run: surface-only ONLY. Compared OFFLINE to the ARCHIVED d24 numbers from the
+# (deprecated-triple) A/B, which used the SAME commit + speedrun config: vanilla baseline
+# CORE 0.2604, force_merges 0.2758. Pin that commit so the cross-run comparison holds.
+# (Re-add fresh vanilla/fm arms later for a same-run A/B if wanted.)
+export NANOCHAT_COMMIT="${NANOCHAT_COMMIT:-dc54a1a}"
+SURF_TAG="d24_surface_only_ab"
 SURF_VARIANT="surface_only"
 
 log()  { echo "==> $*" >&2; }
@@ -66,7 +66,9 @@ _save() { printf 'POD_ID=%q\nPOD_IP=%q\nPOD_PORT=%q\n' "$POD_ID" "$POD_IP" "$POD
 _have() { [ -n "$POD_ID" ]; }
 _refresh() { local ip port; read -r ip port < <(bash "$RUNPOD" host "$POD_ID" 2>/dev/null) || true; [ -n "${ip:-}" ] && { POD_IP="$ip"; POD_PORT="$port"; _save; } || true; }
 _ssh()   { ssh $SSH_OPTS -p "$POD_PORT" "root@$POD_IP" "$@"; }
-_rsync() { rsync -a -e "ssh $SSH_OPTS -p $POD_PORT" "$@"; }
+# --no-owner --no-group: network volumes reject chown, which breaks plain `rsync -a` (exit
+# 23) when writing to /workspace. Root + single-user → owner/group preservation is irrelevant.
+_rsync() { rsync -a --no-owner --no-group -e "ssh $SSH_OPTS -p $POD_PORT" "$@"; }
 
 stage_provision() {
     _load
@@ -76,7 +78,7 @@ stage_provision() {
         log "state pod $POD_ID is '$st' — deploying a new one"
     fi
     log "RunPod availability:"; bash "$RUNPOD" types --available >&2 || true
-    confirm "Deploy 8x H100 on RunPod (~\$21.52/hr, ~\$300 for the 3-arm d24 A/B)?" || die "aborted"
+    confirm "Deploy 8x H100 on RunPod (~\$21.52/hr, ~\$110 for the 1-arm surface-only d24 run)?" || die "aborted"
     read -r POD_ID POD_IP POD_PORT < <(bash "$RUNPOD" launch | tail -1)
     [ -n "$POD_ID" ] || die "launch failed"
     _save; log "pod $POD_ID up at $POD_IP:$POD_PORT"
@@ -93,25 +95,17 @@ stage_bootstrap() {
 stage_sync() {
     _load; _have || die "no pod (run provision)"; _refresh
     log "re-rsync sandbox/ (propagate code fixes; python only)"
+    # --delete: also exclude pod-only runtime artifacts so a resync doesn't wipe per-arm
+    # logs / the in-flight tee target on a full-pipeline re-run.
     _rsync --delete --exclude=.venv --exclude=__pycache__ --exclude=results --exclude='*.pyc' \
         --exclude=target --exclude=.git --exclude=audit --exclude='*.so' \
-        --exclude='runs/.runpod_ab.state' "$SANDBOX_DIR/" "root@$POD_IP:~/sandbox/"
-    for v in "$FM_VARIANT" "$SURF_VARIANT"; do
-        local src="$HOME/.cache/nanochat-variants/$v/tokenizer"
-        [ -f "$src/tokenizer.pkl" ] || die "local tokenizer missing: $src"
-        log "rsync tokenizer $v → pod"
-        _ssh "mkdir -p ~/.cache/nanochat-variants/$v/tokenizer"
-        _rsync "$src/" "root@$POD_IP:~/.cache/nanochat-variants/$v/tokenizer/"
-    done
-    # standard tokenizer for the vanilla baseline arm (default ~/.cache/nanochat)
-    local std="$HOME/.cache/nanochat/tokenizer"
-    if [ -f "$std/tokenizer.pkl" ]; then
-        log "rsync standard tokenizer → pod (vanilla baseline arm)"
-        _ssh "mkdir -p ~/.cache/nanochat/tokenizer"
-        _rsync "$std/" "root@$POD_IP:~/.cache/nanochat/tokenizer/"
-    else
-        log "no local standard tokenizer — the vanilla baseline arm will train it on the pod"
-    fi
+        --exclude='runs/.runpod_ab.state' --exclude='runs/*.log' --exclude='runs/.ab_train.sh' \
+        --exclude='runs/ab_orchestrator.log' --exclude='.ab_done' "$SANDBOX_DIR/" "root@$POD_IP:~/sandbox/"
+    local src="$HOME/.cache/nanochat-variants/$SURF_VARIANT/tokenizer"
+    [ -f "$src/tokenizer.pkl" ] || die "local surface-only tokenizer missing: $src (bake: uv run python -m wrappers.tok_train_surface)"
+    log "rsync tokenizer $SURF_VARIANT → pod"
+    _ssh "mkdir -p ~/.cache/nanochat-variants/$SURF_VARIANT/tokenizer"
+    _rsync "$src/" "root@$POD_IP:~/.cache/nanochat-variants/$SURF_VARIANT/tokenizer/"
 }
 
 stage_verify() {
@@ -120,7 +114,7 @@ stage_verify() {
     _ssh 'set -e; export PATH="$HOME/.local/bin:$PATH"; cd ~/sandbox
         n=$(nvidia-smi -L | wc -l); echo "GPUs: $n"; [ "$n" -ge 8 ] || { echo FAIL_GPUS; exit 1; }
         test -d .venv || { echo FAIL_VENV; exit 1; }
-        for v in force_merges surface_only; do
+        for v in surface_only; do
             test -f ~/.cache/nanochat-variants/$v/tokenizer/token_bytes.pt || { echo "FAIL_TOK_$v"; exit 1; }
         done
         uv run python - <<"PY"
@@ -144,30 +138,16 @@ set -eo pipefail
 cd ~/sandbox
 export PATH="\$HOME/.local/bin:\$PATH"
 
-# --- arm 1/3: surface factoring (FIRST, per request) ---
+# --- surface-only (the only arm; compared offline to the archived d24 numbers) ---
 if [ -f results/$SURF_TAG/eval.csv ]; then echo "[ab] $SURF_TAG done — skip"; else
-  echo "[ab] arm 1/3: surface-only (the test arm)"
+  echo "[ab] surface-only training + eval (core,bpb)"
   NANOCHAT_BASE_DIR="\$HOME/.cache/nanochat-variants/$SURF_VARIANT" \\
     OVERLAY=surface_factoring EVAL_MODULE=wrappers.base_eval_surface EVAL_ARGS="--eval core,bpb" $HW_ENV \\
     MODEL_TAG=$SURF_TAG WANDB_RUN=$SURF_TAG bash runs/speedrun.sh 2>&1 | tee runs/$SURF_TAG.log
 fi
 
-# --- arm 2/3: force_merges sibling (reference, NOT the baseline) ---
-if [ -f results/$BASE_TAG/eval.csv ]; then echo "[ab] $BASE_TAG done — skip"; else
-  echo "[ab] arm 2/3: force_merges sibling (reference, not the baseline)"
-  NANOCHAT_BASE_DIR="\$HOME/.cache/nanochat-variants/$FM_VARIANT" EVAL_ARGS="--eval core,bpb" $HW_ENV \\
-    MODEL_TAG=$BASE_TAG WANDB_RUN=$BASE_TAG bash runs/speedrun.sh 2>&1 | tee runs/$BASE_TAG.log
-fi
-
-# --- arm 3/3: vanilla nanochat baseline (default base dir + standard tokenizer, no overlay) ---
-if [ -f results/$BASELINE_TAG/eval.csv ]; then echo "[ab] $BASELINE_TAG done — skip"; else
-  echo "[ab] arm 3/3: vanilla baseline (the control for arm 1)"
-  EVAL_ARGS="--eval core,bpb" $HW_ENV \\
-    MODEL_TAG=$BASELINE_TAG WANDB_RUN=$BASELINE_TAG bash runs/speedrun.sh 2>&1 | tee runs/$BASELINE_TAG.log
-fi
-
 touch ~/sandbox/.ab_done
-echo "[ab] ALL 3 ARMS DONE"
+echo "[ab] SURFACE-ONLY ARM DONE"
 REMOTE
 }
 
@@ -176,7 +156,7 @@ stage_train() {
     if _ssh "test -f ~/sandbox/.ab_done" 2>/dev/null; then log "training already complete (.ab_done)"; return 0; fi
     if _ssh "tmux has-session -t ab" 2>/dev/null; then log "tmux 'ab' already running — poll to watch"; return 0; fi
     _write_remote_train
-    log "launching both arms in tmux 'ab' (HW_ENV: $HW_ENV)"
+    log "launching the surface-only arm in tmux 'ab' (HW_ENV: $HW_ENV)"
     _ssh "tmux new-session -d -s ab 'bash ~/sandbox/runs/.ab_train.sh 2>&1 | tee ~/sandbox/runs/ab_orchestrator.log'"
 }
 
@@ -200,7 +180,7 @@ stage_poll() {
             log "tmux check missed ($miss/3) — likely transient ssh; retrying in 30s"
             sleep 30; continue
         fi
-        local p; p=$(_ssh "grep -hoE 'step [0-9]+/[0-9]+' ~/sandbox/runs/${SURF_TAG}.log ~/sandbox/runs/${BASE_TAG}.log ~/sandbox/runs/${BASELINE_TAG}.log 2>/dev/null | tail -1" || true)
+        local p; p=$(_ssh "grep -hoE 'step [0-9]+/[0-9]+' ~/sandbox/runs/${SURF_TAG}.log 2>/dev/null | tail -1" || true)
         log "still training${p:+ — $p} ($(date -u +%H:%M:%SZ))"; sleep 300
     done
 }
@@ -210,9 +190,7 @@ stage_download() {
     log "pull results/ + report"; bash "$RUNPOD" pull "$POD_ID"
     # each arm's checkpoint lives under ITS base dir (variant or default ~/.cache/nanochat)
     for entry in \
-        "~/.cache/nanochat-variants/$SURF_VARIANT|$SURF_TAG" \
-        "~/.cache/nanochat-variants/$FM_VARIANT|$BASE_TAG" \
-        "~/.cache/nanochat|$BASELINE_TAG"; do
+        "~/.cache/nanochat-variants/$SURF_VARIANT|$SURF_TAG"; do
         local bdir="${entry%%|*}" tag="${entry##*|}"
         local rmt="$bdir/base_checkpoints/$tag/"
         if _ssh "test -d $rmt" 2>/dev/null; then
@@ -225,7 +203,7 @@ stage_download() {
 
 stage_verifydl() {
     local ok=1; echo "" >&2; log "verifying local artifacts"
-    for tag in "$SURF_TAG" "$BASE_TAG" "$BASELINE_TAG"; do
+    for tag in "$SURF_TAG"; do
         local d="$SANDBOX_DIR/results/$tag" csv="$SANDBOX_DIR/results/$tag/eval.csv" ckpt
         ckpt=$(ls "$d"/checkpoint/model_*.pt 2>/dev/null | head -1 || true)
         local core; core=$(grep -rhoE "CORE metric: [0-9.]+" "$d" 2>/dev/null | grep -oE "[0-9.]+" | head -1 || true)
@@ -234,7 +212,7 @@ stage_verifydl() {
         { [ -f "$csv" ] && [ -n "$ckpt" ]; } || ok=0
     done
     [ "$ok" = "1" ] || { log "artifacts INCOMPLETE — NOT terminating. Re-run download (or fix the failed arm)."; return 1; }
-    log "all artifacts local. Decisive A/B: results/$SURF_TAG (surface-only) vs results/$BASELINE_TAG (vanilla); $BASE_TAG is the force_merges sibling."
+    log "surface-only artifacts local in results/$SURF_TAG/. Compare CORE/bpb OFFLINE to the archived d24_baseline_ab (vanilla 0.2604) + d24_force_merges_ab (0.2758) — same commit."
 }
 
 stage_terminate() {
