@@ -109,17 +109,18 @@ for _attr in ("recompile_limit", "cache_size_limit"):
         setattr(torch._dynamo.config, _attr, 128)
 
 # --- 5) optional seed override -----------------------------------------------
-# nanochat hardcodes torch.manual_seed(42) in compute_init (common.py), which per
-# its own comment seeds ONLY the model weight init (the dataloader order is
-# seed-independent). Override it so SURFACE_SEED gives a fresh init for a
-# reproducibility A/B. It's the only global manual_seed call, so substituting the
-# value is surgical.
+# nanochat's compute_init (common.py) seeds the model weight init (the dataloader order is
+# seed-independent). It calls BOTH torch.manual_seed(42) AND torch.cuda.manual_seed(42), and
+# init_weights draws from the CUDA generator — so we must patch BOTH or ranks diverge (rank 0
+# keeps 42 while the others get the override). manual_seed → manual_seed_all covers the rest.
 _seed = os.environ.get("SURFACE_SEED")
 if _seed is not None:
     import torch
-    _orig_manual_seed = torch.manual_seed
-    torch.manual_seed = lambda s, _o=_orig_manual_seed, _v=int(_seed): _o(_v)
-    print(f"[surface] seed override: model init seeded with SURFACE_SEED={_seed} (was 42)")
+    _v = int(_seed)
+    _om, _ocm = torch.manual_seed, torch.cuda.manual_seed
+    torch.manual_seed = lambda s, _o=_om, _x=_v: _o(_x)
+    torch.cuda.manual_seed = lambda s, _o=_ocm, _x=_v: _o(_x)
+    print(f"[surface] seed override: model init seeded with SURFACE_SEED={_v} (was 42)")
 
 # --- 5.5) optional dynamic-λ schedule: tick once per OPTIMIZER step ----------
 # Patch the optimizer step() so overlay/surface_lambda advances per real step

@@ -1,44 +1,46 @@
 #!/bin/bash
-# runs/runpod_ab.sh — IDEMPOTENT orchestrator for the surface-factoring d24 A/B on
-# RunPod (8x H100 SXM). Same design as runs/lambda_ab.sh, RunPod-native: a pod is
-# a container reached as root over an exposed SSH port, and NO Rust/crate build is
-# needed (the surface train/eval path is crate-free; we rsync pre-baked tokenizers).
+# runs/runpod_ab.sh — IDEMPOTENT orchestrator for a full-d24 A/B on RunPod (8x H100),
+# with PERSISTED artifacts on a network volume. Two arms at a shared NEW init seed:
+#   surface_only (SURFACE_LAMBDA=0.1, K_max=1)  vs  vanilla baseline
+# Both train the full compute-optimal d24 (target-param-data-ratio=8 — NO --num-iterations),
+# eval core+bpb, and write checkpoints + logs + results to the network VOLUME so they
+# survive pod termination and power future analysis (the surface-only checkpoint was lost
+# to a failed download last time — the volume fixes that). The volume's shared climbmix
+# corpus is symlinked into each variant's base dir, so the ~15GB corpus is NOT re-downloaded.
 #
-# Stages (resumable; re-run any time):
-#   provision  → reuse the live pod from state, else deploy 8x H100
-#   bootstrap  → runpod.sh bootstrap (apt rsync/git + rsync sandbox + setup.sh + wandb)
-#   sync       → rsync the cached surface_only TOKENIZER up
-#                + re-rsync sandbox/ so code fixes propagate each retrigger
-#   verify     → crate-free preflight (8 GPUs, venv, both tokenizers load + a
-#                surface encode/decode round-trip, overlay imports)
-#   train      → both arms in one tmux session, each SKIPPED if results/<tag>/eval.csv
-#                exists: the surface-only arm (OVERLAY + base_eval_surface)
+# Stages (resumable; re-run any time — only unfinished work re-executes):
+#   provision  → reuse the live pod from state, else deploy 8x H100 + the volume
+#   bootstrap  → runpod.sh bootstrap (apt + rsync sandbox + setup.sh + wandb)
+#   sync       → rsync sandbox/ + stage BOTH tokenizers (surface_only + canonical baseline)
+#                onto the volume + symlink each variant's base_data_climbmix → shared corpus
+#   verify     → preflight (8 GPUs, venv, both tokenizers, surface round-trip)
+#   train      → both arms in one tmux 'ab', each skipped if results/<tag>/eval.csv exists
+#                (or EVAL-ONLY recovery if its checkpoint is already on the volume)
 #   poll       → wait for ~/sandbox/.ab_done (tails progress)
-#   download   → runpod.sh pull (results/+report) + rsync CHECKPOINTS + per-arm logs
-#   verifydl   → assert both arms' eval.csv + checkpoint local; print the CORE numbers
-#   terminate  → terminate the pod (prompts unless AUTO_TERMINATE=1)
+#   download   → pull both arms' eval.csv + report + log to local results/<tag>/
+#   verifydl   → assert both eval.csv LOCAL + both checkpoints + logs ON THE VOLUME
+#   terminate  → terminate the pod (prompts unless AUTO_TERMINATE=1) — NEVER before verifydl
 #
-# Never terminates before verifydl passes. Fix code → re-run; only unfinished work
-# re-executes (live pod + host markers + per-arm eval.csv are detected & skipped).
+# Requires a network volume: RUNPOD_VOLUME_ID + RUNPOD_DATACENTER in ~/.lambda.env (the
+# pod is pinned to the volume's datacenter). Create one with `runpod.sh create-volume`.
 #
 # Usage:
 #   bash runs/runpod_ab.sh                  # full pipeline (run under local tmux — poll blocks ~hrs)
-#   STAGE=download bash runs/runpod_ab.sh   # one stage: provision|bootstrap|sync|verify|train|poll|download|verifydl|terminate
+#   STAGE=download bash runs/runpod_ab.sh   # one stage
+#   SEED=7 bash runs/runpod_ab.sh           # the new paired seed (default 7; ≠42)
 #   AUTO_TERMINATE=1 YES=1 bash runs/runpod_ab.sh
 #
-# Env: ~/.lambda.env needs RUNPOD_API_KEY + WANDB_API_KEY (+ an ssh key — see runpod.sh).
-#   HW_ENV  default "USE_FP8=0 WINDOW_PATTERN=L DEVICE_BATCH_SIZE=16" — the SAFE H100
-#           config (no FA3/fp8 dependence). For ~25% speedup try
-#           HW_ENV="USE_FP8=1 WINDOW_PATTERN=SSSL DEVICE_BATCH_SIZE=16" IF FA3 is
-#           present AND fp8 plays nice with the surface heads — but both arms must
-#           share it, and changing it after one arm finished means clearing BOTH
-#           results/<tag>/ and redoing (else the A/B isn't apples-to-apples).
+# Env: ~/.lambda.env needs RUNPOD_API_KEY + WANDB_API_KEY + RUNPOD_VOLUME_ID + RUNPOD_DATACENTER.
+#   SEED     new init seed, shared by both arms (default 7). Tags get _s${SEED}.
+#   HW_ENV   default "USE_FP8=0 WINDOW_PATTERN=L DEVICE_BATCH_SIZE=16" (safe; fp8-off — the
+#            fidelity-matching config for the prior d24 runs). Both arms share it.
 
 set -euo pipefail
 SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SANDBOX_DIR"
 RUNPOD="$SANDBOX_DIR/runs/runpod.sh"
 STATE_FILE="$SANDBOX_DIR/runs/.runpod_ab.state"
+[ -f "$HOME/.lambda.env" ] && { set +u; . "$HOME/.lambda.env"; set -u; }   # RUNPOD_VOLUME_ID + RUNPOD_DATACENTER + keys
 RUNPOD_SSH_KEY="${RUNPOD_SSH_KEY:-}"
 if [ -z "$RUNPOD_SSH_KEY" ]; then
     for c in "$HOME/.ssh/lambda_cloud_ed25519" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
@@ -48,13 +50,22 @@ fi
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30${RUNPOD_SSH_KEY:+ -i $RUNPOD_SSH_KEY -o IdentitiesOnly=yes}"
 
 HW_ENV="${HW_ENV:-USE_FP8=0 WINDOW_PATTERN=L DEVICE_BATCH_SIZE=16}"
-# 1-ARM run: surface-only ONLY. Compared OFFLINE to the ARCHIVED d24 numbers from the
-# (deprecated-triple) A/B, which used the SAME commit + speedrun config: vanilla baseline
-# CORE 0.2604, force_merges 0.2758. Pin that commit so the cross-run comparison holds.
-# (Re-add fresh vanilla/fm arms later for a same-run A/B if wanted.)
-export NANOCHAT_COMMIT="${NANOCHAT_COMMIT:-dc54a1a}"
-SURF_TAG="d24_surface_only_ab"
-SURF_VARIANT="surface_only"
+SEED="${SEED:-7}"                       # new paired init seed (≠ the prior runs' 42)
+SURF_LAMBDA="${SURF_LAMBDA:-0.1}"
+export NANOCHAT_COMMIT="${NANOCHAT_COMMIT:-dc54a1a}"    # same pin as the prior d24 runs
+[ -n "${RUNPOD_VOLUME_ID:-}" ] || { echo "ERROR: RUNPOD_VOLUME_ID unset — this run needs a network volume (set it + RUNPOD_DATACENTER in ~/.lambda.env; create with runpod.sh create-volume)" >&2; exit 1; }
+MOUNT="${RUNPOD_VOLUME_MOUNT:-/workspace}"
+SHARED_DATA="$MOUNT/shared/base_data_climbmix"
+
+# --- the two arms: tag | variant (base-dir name) | per-arm train/eval env ---
+SURF_TAG="d24_surf_lam$(echo "$SURF_LAMBDA" | tr '.' 'p')_s${SEED}"
+BASE_TAG="d24_baseline_s${SEED}"
+ARM_TAG=("$SURF_TAG" "$BASE_TAG")
+ARM_VARIANT=("surface_only" "baseline")
+ARM_ENV=("OVERLAY=surface_factoring SURFACE_LAMBDA=$SURF_LAMBDA SURFACE_SEED=$SEED EVAL_MODULE=wrappers.base_eval_surface" \
+         "SEED=$SEED")
+# local tokenizer dir staged for each variant (surface-only baked; baseline = canonical 32768)
+ARM_LOCALTOK=("$HOME/.cache/nanochat-variants/surface_only/tokenizer" "$HOME/.cache/nanochat/tokenizer")
 
 log()  { echo "==> $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -66,9 +77,9 @@ _save() { printf 'POD_ID=%q\nPOD_IP=%q\nPOD_PORT=%q\n' "$POD_ID" "$POD_IP" "$POD
 _have() { [ -n "$POD_ID" ]; }
 _refresh() { local ip port; read -r ip port < <(bash "$RUNPOD" host "$POD_ID" 2>/dev/null) || true; [ -n "${ip:-}" ] && { POD_IP="$ip"; POD_PORT="$port"; _save; } || true; }
 _ssh()   { ssh $SSH_OPTS -p "$POD_PORT" "root@$POD_IP" "$@"; }
-# --no-owner --no-group: network volumes reject chown, which breaks plain `rsync -a` (exit
-# 23) when writing to /workspace. Root + single-user → owner/group preservation is irrelevant.
+# --no-owner --no-group: network volumes reject chown → plain `rsync -a` fails (exit 23).
 _rsync() { rsync -a --no-owner --no-group -e "ssh $SSH_OPTS -p $POD_PORT" "$@"; }
+_vbase() { echo "$MOUNT/nanochat-variants/$1"; }
 
 stage_provision() {
     _load
@@ -77,11 +88,10 @@ stage_provision() {
         if [ "$st" = "RUNNING" ]; then log "reusing live pod $POD_ID"; _refresh; return 0; fi
         log "state pod $POD_ID is '$st' — deploying a new one"
     fi
-    log "RunPod availability:"; bash "$RUNPOD" types --available >&2 || true
-    confirm "Deploy 8x H100 on RunPod (~\$21.52/hr, ~\$110 for the 1-arm surface-only d24 run)?" || die "aborted"
+    confirm "Deploy 8x H100 + volume $RUNPOD_VOLUME_ID @ $RUNPOD_DATACENTER for the 2-arm full-d24 A/B (seed $SEED; ~\$200, ~9-10 hr)?" || die "aborted"
     read -r POD_ID POD_IP POD_PORT < <(bash "$RUNPOD" launch | tail -1)
     [ -n "$POD_ID" ] || die "launch failed"
-    _save; log "pod $POD_ID up at $POD_IP:$POD_PORT"
+    _save; log "pod $POD_ID up at $POD_IP:$POD_PORT (volume @ $MOUNT)"
 }
 
 stage_bootstrap() {
@@ -89,66 +99,80 @@ stage_bootstrap() {
     if _ssh "test -f ~/.ab_setup_done" 2>/dev/null; then log "host already bootstrapped — skipping setup.sh"; return 0; fi
     bash "$RUNPOD" bootstrap "$POD_ID"
     _ssh "touch ~/.ab_setup_done"
-    log "bootstrap complete (no Rust/crate — surface path is crate-free)"
+    log "bootstrap complete (crate-free)"
 }
 
 stage_sync() {
     _load; _have || die "no pod (run provision)"; _refresh
-    log "re-rsync sandbox/ (propagate code fixes; python only)"
-    # --delete: also exclude pod-only runtime artifacts so a resync doesn't wipe per-arm
-    # logs / the in-flight tee target on a full-pipeline re-run.
+    log "re-rsync sandbox/ (propagate code; python only)"
     _rsync --delete --exclude=.venv --exclude=__pycache__ --exclude=results --exclude='*.pyc' \
         --exclude=target --exclude=.git --exclude=audit --exclude='*.so' \
         --exclude='runs/.runpod_ab.state' --exclude='runs/*.log' --exclude='runs/.ab_train.sh' \
         --exclude='runs/ab_orchestrator.log' --exclude='.ab_done' "$SANDBOX_DIR/" "root@$POD_IP:~/sandbox/"
-    local src="$HOME/.cache/nanochat-variants/$SURF_VARIANT/tokenizer"
-    [ -f "$src/tokenizer.pkl" ] || die "local surface-only tokenizer missing: $src (bake: uv run python -m wrappers.tok_train_surface)"
-    log "rsync tokenizer $SURF_VARIANT → pod"
-    _ssh "mkdir -p ~/.cache/nanochat-variants/$SURF_VARIANT/tokenizer"
-    _rsync "$src/" "root@$POD_IP:~/.cache/nanochat-variants/$SURF_VARIANT/tokenizer/"
+    local i tag variant vbase src
+    for i in 0 1; do
+        variant="${ARM_VARIANT[$i]}"; src="${ARM_LOCALTOK[$i]}"; vbase="$(_vbase "$variant")"
+        [ -f "$src/tokenizer.pkl" ] || die "local tokenizer missing for $variant: $src"
+        log "stage tokenizer $variant → $vbase/tokenizer [volume]"
+        _ssh "mkdir -p '$vbase/tokenizer'"
+        _rsync "$src/" "root@$POD_IP:$vbase/tokenizer/"
+        # symlink the variant's corpus dir → the shared corpus (download once, reuse forever)
+        _ssh "mkdir -p '$SHARED_DATA' '$vbase'; [ -L '$vbase/base_data_climbmix' ] || [ -d '$vbase/base_data_climbmix' ] || ln -s '$SHARED_DATA' '$vbase/base_data_climbmix'"
+    done
+    log "shared corpus: $(_ssh "ls '$SHARED_DATA'/*.parquet 2>/dev/null | wc -l") shards present (no re-download)"
 }
 
 stage_verify() {
     _load; _have || die "no pod (run provision)"; _refresh
-    log "crate-free preflight (GPUs / venv / tokenizers load + round-trip / overlay imports)"
-    _ssh 'set -e; export PATH="$HOME/.local/bin:$PATH"; cd ~/sandbox
-        n=$(nvidia-smi -L | wc -l); echo "GPUs: $n"; [ "$n" -ge 8 ] || { echo FAIL_GPUS; exit 1; }
+    log "preflight (GPUs / venv / both tokenizers / surface round-trip)"
+    local vsurf vbase_b; vsurf="$(_vbase surface_only)"; vbase_b="$(_vbase baseline)"
+    _ssh "set -e; export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/sandbox
+        n=\$(nvidia-smi -L | wc -l); echo \"GPUs: \$n\"; [ \"\$n\" -ge 8 ] || { echo FAIL_GPUS; exit 1; }
         test -d .venv || { echo FAIL_VENV; exit 1; }
-        for v in surface_only; do
-            test -f ~/.cache/nanochat-variants/$v/tokenizer/token_bytes.pt || { echo "FAIL_TOK_$v"; exit 1; }
-        done
-        uv run python - <<"PY"
+        test -f $vsurf/tokenizer/token_bytes.pt   || { echo FAIL_TOK_surface; exit 1; }
+        test -f $vbase_b/tokenizer/token_bytes.pt || { echo FAIL_TOK_baseline; exit 1; }
+        SURF_TOK=$vsurf/tokenizer uv run python - <<'PY'
 import os
-from tools.stack_fm_spaceless import SPACELESS_BODY   # surface-only pattern (crate-free)
+from tools.stack_fm_spaceless import SPACELESS_BODY
 from nanochat.tokenizer import RustBPETokenizer
 from overlay.surface_tokenizer import SurfaceTokenizer
 import overlay.surface_factoring, overlay.surface_core_eval, overlay.surface_checkpoint  # noqa
-enc = RustBPETokenizer.from_directory(os.path.expanduser("~/.cache/nanochat-variants/surface_only/tokenizer")).enc
+enc = RustBPETokenizer.from_directory(os.environ['SURF_TOK']).enc
 tok = SurfaceTokenizer(enc, SPACELESS_BODY, kmax=1)
-s = "Of The Rings in the city"; assert tok.decode(tok.encode(s)) == s
-print("PREFLIGHT OK: surface-only tokenizer round-trips, overlay imports, no crate needed.")
-PY'
+s = 'Of The Rings in the city'
+assert tok.decode(tok.encode(s)) == s
+print('PREFLIGHT OK: surface tokenizer round-trips, overlay imports, both tokenizers staged.')
+PY"
     log "preflight passed"
 }
 
 _write_remote_train() {
-    _ssh "cat > ~/sandbox/runs/.ab_train.sh" <<REMOTE
-#!/bin/bash
+    local body="" i tag variant env vbase
+    for i in 0 1; do
+        tag="${ARM_TAG[$i]}"; variant="${ARM_VARIANT[$i]}"; env="${ARM_ENV[$i]}"; vbase="$(_vbase "$variant")"
+        body+='
+mkdir -p '"$vbase"'/logs '"$vbase"'/results
+if [ -f results/'"$tag"'/eval.csv ]; then echo "[ab] '"$tag"' done — skip";
+elif ls '"$vbase"'/base_checkpoints/'"$tag"'/model_*.pt >/dev/null 2>&1; then
+  echo "[ab] '"$tag"' checkpoint on volume but no eval.csv — EVAL-ONLY recovery"
+  NANOCHAT_BASE_DIR='"$vbase"' '"$env"' EVAL_ONLY=1 EVAL_ARGS="--eval core,bpb" '"$HW_ENV"' MODEL_TAG='"$tag"' WANDB_RUN='"$tag"' bash runs/speedrun.sh 2>&1 | tee -a runs/'"$tag"'.log
+else
+  echo "[ab] training '"$tag"' (variant='"$variant"', seed='"$SEED"', full d24)"
+  NANOCHAT_BASE_DIR='"$vbase"' '"$env"' EVAL_ARGS="--eval core,bpb" '"$HW_ENV"' MODEL_TAG='"$tag"' WANDB_RUN='"$tag"' bash runs/speedrun.sh 2>&1 | tee runs/'"$tag"'.log
+fi
+cp -f runs/'"$tag"'.log '"$vbase"'/logs/'"$tag"'.log 2>/dev/null || true
+mkdir -p '"$vbase"'/results/'"$tag"' && cp -rf results/'"$tag"'/. '"$vbase"'/results/'"$tag"'/ 2>/dev/null || true
+'
+    done
+    local script='#!/bin/bash
 set -eo pipefail
 cd ~/sandbox
-export PATH="\$HOME/.local/bin:\$PATH"
-
-# --- surface-only (the only arm; compared offline to the archived d24 numbers) ---
-if [ -f results/$SURF_TAG/eval.csv ]; then echo "[ab] $SURF_TAG done — skip"; else
-  echo "[ab] surface-only training + eval (core,bpb)"
-  NANOCHAT_BASE_DIR="\$HOME/.cache/nanochat-variants/$SURF_VARIANT" \\
-    OVERLAY=surface_factoring EVAL_MODULE=wrappers.base_eval_surface EVAL_ARGS="--eval core,bpb" $HW_ENV \\
-    MODEL_TAG=$SURF_TAG WANDB_RUN=$SURF_TAG bash runs/speedrun.sh 2>&1 | tee runs/$SURF_TAG.log
-fi
-
+export PATH=~/.local/bin:$PATH
+'"$body"'
 touch ~/sandbox/.ab_done
-echo "[ab] SURFACE-ONLY ARM DONE"
-REMOTE
+echo "[ab] BOTH ARMS DONE"
+'
+    printf '%s' "$script" | _ssh "cat > ~/sandbox/runs/.ab_train.sh"
 }
 
 stage_train() {
@@ -156,7 +180,7 @@ stage_train() {
     if _ssh "test -f ~/sandbox/.ab_done" 2>/dev/null; then log "training already complete (.ab_done)"; return 0; fi
     if _ssh "tmux has-session -t ab" 2>/dev/null; then log "tmux 'ab' already running — poll to watch"; return 0; fi
     _write_remote_train
-    log "launching the surface-only arm in tmux 'ab' (HW_ENV: $HW_ENV)"
+    log "launching both arms [$SURF_TAG, $BASE_TAG] in tmux 'ab' (seed $SEED; HW_ENV: $HW_ENV)"
     _ssh "tmux new-session -d -s ab 'bash ~/sandbox/runs/.ab_train.sh 2>&1 | tee ~/sandbox/runs/ab_orchestrator.log'"
 }
 
@@ -167,20 +191,17 @@ stage_poll() {
     while :; do
         _refresh
         if _ssh "test -f ~/sandbox/.ab_done" 2>/dev/null; then log "training complete"; return 0; fi
-        # tmux gone WITHOUT .ab_done => a failed arm — but require 3 consecutive
-        # misses so a transient ssh blip over the ~15h run isn't a false alarm.
         if _ssh "tmux has-session -t ab" 2>/dev/null; then
             miss=0
         else
             miss=$((miss + 1))
             if [ "$miss" -ge 3 ]; then
                 _ssh "tail -n 30 ~/sandbox/runs/ab_orchestrator.log 2>/dev/null" >&2 || true
-                die "tmux 'ab' gone for 3 checks without .ab_done — an arm failed. Fix + re-run (train resumes the unfinished arm)."
+                die "tmux 'ab' gone for 3 checks without .ab_done — an arm failed. Fix + re-run (resumes the unfinished arm)."
             fi
-            log "tmux check missed ($miss/3) — likely transient ssh; retrying in 30s"
-            sleep 30; continue
+            log "tmux check missed ($miss/3) — likely transient ssh; retrying in 30s"; sleep 30; continue
         fi
-        local p; p=$(_ssh "grep -hoE 'step [0-9]+/[0-9]+' ~/sandbox/runs/${SURF_TAG}.log 2>/dev/null | tail -1" || true)
+        local p; p=$(_ssh "for t in $SURF_TAG $BASE_TAG; do grep -hoE 'step [0-9]+/[0-9]+' ~/sandbox/runs/\$t.log 2>/dev/null | tail -1; done | tail -1" || true)
         log "still training${p:+ — $p} ($(date -u +%H:%M:%SZ))"; sleep 300
     done
 }
@@ -188,37 +209,39 @@ stage_poll() {
 stage_download() {
     _load; _have || die "no pod (run provision)"; _refresh
     log "pull results/ + report"; bash "$RUNPOD" pull "$POD_ID"
-    # each arm's checkpoint lives under ITS base dir (variant or default ~/.cache/nanochat)
-    for entry in \
-        "~/.cache/nanochat-variants/$SURF_VARIANT|$SURF_TAG"; do
-        local bdir="${entry%%|*}" tag="${entry##*|}"
-        local rmt="$bdir/base_checkpoints/$tag/"
-        if _ssh "test -d $rmt" 2>/dev/null; then
-            mkdir -p "$SANDBOX_DIR/results/$tag/checkpoint/"; log "rsync checkpoint $tag"
-            _rsync "root@$POD_IP:$rmt" "$SANDBOX_DIR/results/$tag/checkpoint/"
-        else log "no checkpoint for $tag yet"; fi
+    local i tag
+    for i in 0 1; do
+        tag="${ARM_TAG[$i]}"
+        mkdir -p "$SANDBOX_DIR/results/$tag"
+        _rsync "root@$POD_IP:~/sandbox/results/$tag/" "$SANDBOX_DIR/results/$tag/" 2>/dev/null || true
         _rsync "root@$POD_IP:~/sandbox/runs/$tag.log" "$SANDBOX_DIR/results/$tag/" 2>/dev/null || true
     done
+    log "checkpoints persist on the volume (not downloaded — DOWNLOAD_CKPT pull is manual if ever needed)"
 }
 
 stage_verifydl() {
-    local ok=1; echo "" >&2; log "verifying local artifacts"
-    for tag in "$SURF_TAG"; do
-        local d="$SANDBOX_DIR/results/$tag" csv="$SANDBOX_DIR/results/$tag/eval.csv" ckpt
-        ckpt=$(ls "$d"/checkpoint/model_*.pt 2>/dev/null | head -1 || true)
-        local core; core=$(grep -rhoE "CORE metric: [0-9.]+" "$d" 2>/dev/null | grep -oE "[0-9.]+" | head -1 || true)
-        printf '  %-26s eval.csv:%s checkpoint:%s CORE:%s\n' "$tag" \
-            "$([ -f "$csv" ] && echo yes || echo NO)" "$([ -n "$ckpt" ] && echo yes || echo NO)" "${core:-?}" >&2
-        { [ -f "$csv" ] && [ -n "$ckpt" ]; } || ok=0
+    _load; _have || die "no pod (verifydl needs the live pod to check the volume)"; _refresh
+    local ok=1; echo "" >&2; log "verifying: eval.csv LOCAL + checkpoint & log ON THE VOLUME"
+    local i tag variant vbase csv coreloc ckpt vlog
+    for i in 0 1; do
+        tag="${ARM_TAG[$i]}"; variant="${ARM_VARIANT[$i]}"; vbase="$(_vbase "$variant")"
+        csv="$SANDBOX_DIR/results/$tag/eval.csv"
+        ckpt=$(_ssh "ls $vbase/base_checkpoints/$tag/model_*.pt 2>/dev/null | head -1" || true)
+        vlog=$(_ssh "ls $vbase/logs/$tag.log 2>/dev/null" || true)
+        coreloc=$(grep -rhoE "CORE metric: [0-9.]+" "$SANDBOX_DIR/results/$tag" 2>/dev/null | grep -oE "[0-9.]+" | head -1 || true)
+        printf '  %-26s eval.csv(local):%s  checkpoint(vol):%s  log(vol):%s  CORE:%s\n' "$tag" \
+            "$([ -f "$csv" ] && echo yes || echo NO)" "$([ -n "$ckpt" ] && echo yes || echo NO)" \
+            "$([ -n "$vlog" ] && echo yes || echo NO)" "${coreloc:-?}" >&2
+        { [ -f "$csv" ] && [ -n "$ckpt" ] && [ -n "$vlog" ]; } || ok=0
     done
-    [ "$ok" = "1" ] || { log "artifacts INCOMPLETE — NOT terminating. Re-run download (or fix the failed arm)."; return 1; }
-    log "surface-only artifacts local in results/$SURF_TAG/. Compare CORE/bpb OFFLINE to the archived d24_baseline_ab (vanilla 0.2604) + d24_force_merges_ab (0.2758) — same commit."
+    [ "$ok" = "1" ] || { log "artifacts INCOMPLETE — NOT terminating. Re-run download / fix the failed arm."; return 1; }
+    log "both arms verified: eval.csv local + checkpoints + logs persisted on volume $RUNPOD_VOLUME_ID."
 }
 
 stage_terminate() {
     _load; _have || { log "no pod in state"; return 0; }
-    stage_verifydl || die "refusing to terminate: artifacts not verified local"
-    [ "${AUTO_TERMINATE:-0}" = "1" ] || confirm "Artifacts verified. Terminate $POD_ID (stops billing)?" || { log "left pod $POD_ID up"; return 0; }
+    stage_verifydl || die "refusing to terminate: artifacts not verified"
+    [ "${AUTO_TERMINATE:-0}" = "1" ] || confirm "Artifacts verified (checkpoints persist on the volume). Terminate $POD_ID?" || { log "left pod $POD_ID up"; return 0; }
     bash "$RUNPOD" terminate "$POD_ID"; : > "$STATE_FILE"; log "terminated $POD_ID. Done."
 }
 
