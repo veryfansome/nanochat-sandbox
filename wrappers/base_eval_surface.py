@@ -100,4 +100,8 @@ else:
         elif a.startswith("--eval="):
             sys.argv[i] = "--eval=" + _strip_sample(a.split("=", 1)[1])
 
+# FineWeb-Edu corpus override for val-bpb (no-op unless NANOCHAT_DATASET=fineweb)
+from overlay.dataset_fineweb import maybe_repoint
+maybe_repoint()
+
 runpy.run_module("scripts.base_eval", run_name="__main__")

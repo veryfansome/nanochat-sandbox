@@ -142,4 +142,7 @@ if os.environ.get("SURFACE_LAMBDA_SCHED", "none") != "none":
           f"horizon={os.environ.get('SURFACE_LAMBDA_HORIZON', 'UNSET!')}")
 
 # --- 6) hand off to the upstream training loop, unchanged --------------------
+# FineWeb-Edu corpus override (no-op unless NANOCHAT_DATASET=fineweb)
+from overlay.dataset_fineweb import maybe_repoint
+maybe_repoint()
 runpy.run_module("scripts.base_train", run_name="__main__")

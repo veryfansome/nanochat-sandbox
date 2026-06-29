@@ -137,8 +137,10 @@ python -m nanochat.report reset
 
 # -----------------------------------------------------------------------------
 # Tokenizer + data
-python -m nanochat.dataset -n 8
-python -m nanochat.dataset -n 170 &
+# wrappers.download_dataset applies the FineWeb override (NANOCHAT_DATASET=fineweb) before
+# nanochat.dataset's __main__ — so a FineWeb run downloads FineWeb, not ClimbMix. No-op for ClimbMix.
+python -m wrappers.download_dataset -n 8
+python -m wrappers.download_dataset -n 170 &
 DATASET_PID=$!
 
 TOKENIZER_FILE="$NANOCHAT_BASE_DIR/tokenizer/tokenizer.pkl"  # RustBPETokenizer save format (default)

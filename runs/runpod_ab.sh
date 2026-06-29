@@ -52,20 +52,30 @@ SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30${RUNPOD_
 HW_ENV="${HW_ENV:-USE_FP8=0 WINDOW_PATTERN=L DEVICE_BATCH_SIZE=16}"
 SEED="${SEED:-7}"                       # new paired init seed (≠ the prior runs' 42)
 SURF_LAMBDA="${SURF_LAMBDA:-0.1}"
+DATASET="${DATASET:-climbmix}"          # corpus: climbmix | fineweb (FineWeb-Edu via karpathy/fineweb-edu-100b-shuffle)
 export NANOCHAT_COMMIT="${NANOCHAT_COMMIT:-dc54a1a}"    # same pin as the prior d24 runs
 [ -n "${RUNPOD_VOLUME_ID:-}" ] || { echo "ERROR: RUNPOD_VOLUME_ID unset — this run needs a network volume (set it + RUNPOD_DATACENTER in ~/.lambda.env; create with runpod.sh create-volume)" >&2; exit 1; }
 MOUNT="${RUNPOD_VOLUME_MOUNT:-/workspace}"
-SHARED_DATA="$MOUNT/shared/base_data_climbmix"
+
+# --- corpus selection: data subdir on the volume, tag/variant SUFFIX (isolates FineWeb's
+#     volume artifacts from the ClimbMix run's — no overwrite), tokenizers, and #shards to
+#     stage (0 = corpus already on the volume; >0 = download that many train shards + val) ---
+case "$DATASET" in
+  climbmix) DATA_SUBDIR="base_data_climbmix"; SFX="";    NTRAIN_SHARDS=0
+            ARM_LOCALTOK=("$HOME/.cache/nanochat-variants/surface_only/tokenizer" "$HOME/.cache/nanochat/tokenizer") ;;
+  fineweb)  DATA_SUBDIR="base_data_fineweb";  SFX="_fw"; NTRAIN_SHARDS=170   # = speedrun.sh's `-n 170` (so its download skips)
+            ARM_LOCALTOK=("$HOME/.cache/nanochat-variants/surface_only_fineweb/tokenizer" "$HOME/.cache/nanochat-variants/baseline_fineweb/tokenizer") ;;
+  *) echo "ERROR: unknown DATASET=$DATASET (climbmix|fineweb)" >&2; exit 1 ;;
+esac
+SHARED_DATA="$MOUNT/shared/$DATA_SUBDIR"
 
 # --- the two arms: tag | variant (base-dir name) | per-arm train/eval env ---
-SURF_TAG="d24_surf_lam$(echo "$SURF_LAMBDA" | tr '.' 'p')_s${SEED}"
-BASE_TAG="d24_baseline_s${SEED}"
+SURF_TAG="d24_surf${SFX}_lam$(echo "$SURF_LAMBDA" | tr '.' 'p')_s${SEED}"
+BASE_TAG="d24_baseline${SFX}_s${SEED}"
 ARM_TAG=("$SURF_TAG" "$BASE_TAG")
-ARM_VARIANT=("surface_only" "baseline")
-ARM_ENV=("OVERLAY=surface_factoring SURFACE_LAMBDA=$SURF_LAMBDA SURFACE_SEED=$SEED EVAL_MODULE=wrappers.base_eval_surface" \
-         "SEED=$SEED")
-# local tokenizer dir staged for each variant (surface-only baked; baseline = canonical 32768)
-ARM_LOCALTOK=("$HOME/.cache/nanochat-variants/surface_only/tokenizer" "$HOME/.cache/nanochat/tokenizer")
+ARM_VARIANT=("surface_only${SFX}" "baseline${SFX}")        # per-arm volume dir; SFX isolates FineWeb from ClimbMix
+ARM_ENV=("NANOCHAT_DATASET=$DATASET OVERLAY=surface_factoring SURFACE_LAMBDA=$SURF_LAMBDA SURFACE_SEED=$SEED EVAL_MODULE=wrappers.base_eval_surface" \
+         "NANOCHAT_DATASET=$DATASET SEED=$SEED")
 
 log()  { echo "==> $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -88,7 +98,7 @@ stage_provision() {
         if [ "$st" = "RUNNING" ]; then log "reusing live pod $POD_ID"; _refresh; return 0; fi
         log "state pod $POD_ID is '$st' — deploying a new one"
     fi
-    confirm "Deploy 8x H100 + volume $RUNPOD_VOLUME_ID @ $RUNPOD_DATACENTER for the 2-arm full-d24 A/B (seed $SEED; ~\$200, ~9-10 hr)?" || die "aborted"
+    confirm "Deploy 8x H100 + volume $RUNPOD_VOLUME_ID @ $RUNPOD_DATACENTER for the 2-arm full-d24 $DATASET A/B (seed $SEED; ~\$200, ~9-10 hr)?" || die "aborted"
     read -r POD_ID POD_IP POD_PORT < <(bash "$RUNPOD" launch | tail -1)
     [ -n "$POD_ID" ] || die "launch failed"
     _save; log "pod $POD_ID up at $POD_IP:$POD_PORT (volume @ $MOUNT)"
@@ -117,15 +127,26 @@ stage_sync() {
         _ssh "mkdir -p '$vbase/tokenizer'"
         _rsync "$src/" "root@$POD_IP:$vbase/tokenizer/"
         # symlink the variant's corpus dir → the shared corpus (download once, reuse forever)
-        _ssh "mkdir -p '$SHARED_DATA' '$vbase'; [ -L '$vbase/base_data_climbmix' ] || [ -d '$vbase/base_data_climbmix' ] || ln -s '$SHARED_DATA' '$vbase/base_data_climbmix'"
+        _ssh "mkdir -p '$SHARED_DATA' '$vbase'; [ -L '$vbase/$DATA_SUBDIR' ] || [ -d '$vbase/$DATA_SUBDIR' ] || ln -s '$SHARED_DATA' '$vbase/$DATA_SUBDIR'"
     done
-    log "shared corpus: $(_ssh "ls '$SHARED_DATA'/*.parquet 2>/dev/null | wc -l") shards present (no re-download)"
+    # corpus must exist on the volume; the dataloader does NOT auto-download. ClimbMix is assumed
+    # already present (NTRAIN_SHARDS=0); FineWeb is downloaded here (on the pod, fast network).
+    if [ "$NTRAIN_SHARDS" -gt 0 ]; then
+        local have; have=$(_ssh "ls '$SHARED_DATA'/*.parquet 2>/dev/null | wc -l" | tr -d ' ')
+        if [ "${have:-0}" -lt "$((NTRAIN_SHARDS + 1))" ]; then
+            log "downloading $DATASET corpus → $SHARED_DATA ($NTRAIN_SHARDS train + val shards) [on pod]"
+            _ssh "set -e; export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/sandbox; NANOCHAT_DATASET=$DATASET NANOCHAT_BASE_DIR='$MOUNT/shared' uv run python -m wrappers.download_dataset -n $NTRAIN_SHARDS"
+        else
+            log "$DATASET corpus already staged ($have shards on volume)"
+        fi
+    fi
+    log "shared corpus: $(_ssh "ls '$SHARED_DATA'/*.parquet 2>/dev/null | wc -l") shards present"
 }
 
 stage_verify() {
     _load; _have || die "no pod (run provision)"; _refresh
     log "preflight (GPUs / venv / both tokenizers / surface round-trip)"
-    local vsurf vbase_b; vsurf="$(_vbase surface_only)"; vbase_b="$(_vbase baseline)"
+    local vsurf vbase_b; vsurf="$(_vbase "${ARM_VARIANT[0]}")"; vbase_b="$(_vbase "${ARM_VARIANT[1]}")"
     _ssh "set -e; export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/sandbox
         n=\$(nvidia-smi -L | wc -l); echo \"GPUs: \$n\"; [ \"\$n\" -ge 8 ] || { echo FAIL_GPUS; exit 1; }
         test -d .venv || { echo FAIL_VENV; exit 1; }
@@ -143,6 +164,20 @@ s = 'Of The Rings in the city'
 assert tok.decode(tok.encode(s)) == s
 print('PREFLIGHT OK: surface tokenizer round-trips, overlay imports, both tokenizers staged.')
 PY"
+    if [ "$DATASET" = "fineweb" ]; then
+        log "preflight: FineWeb override repoints + val shard present on volume"
+        _ssh "set -e; export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/sandbox; NANOCHAT_DATASET=fineweb NANOCHAT_BASE_DIR='$vsurf' uv run python - <<'PY'
+import os
+import overlay.dataset_fineweb as fw
+assert fw.maybe_repoint(), 'override did not repoint'
+import nanochat.dataset as ds
+assert ds.MAX_SHARD == 1822 and ds.DATA_DIR.endswith('base_data_fineweb'), (ds.MAX_SHARD, ds.DATA_DIR)
+from nanochat.dataset import list_parquet_files
+f = [os.path.basename(p) for p in list_parquet_files()]
+assert f and f[-1] == 'shard_01822.parquet', f'val resolves to {f[-1] if f else None}'
+print(f'FINEWEB PREFLIGHT OK: override repoints, val=shard_01822, {len(f)} shards on volume')
+PY"
+    fi
     log "preflight passed"
 }
 

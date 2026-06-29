@@ -27,6 +27,7 @@ from collections import Counter
 import torch
 
 from nanochat.dataset import parquets_iter_batched
+from overlay.dataset_fineweb import maybe_repoint
 from nanochat.tokenizer import RustBPETokenizer
 from overlay.surface_tokenizer import SurfaceTokenizer
 from overlay.surface_core_eval import set_surface_tokenizer, _encode_prompt
@@ -95,6 +96,7 @@ def main():
     ap.add_argument("--freq-chars", type=int, default=40_000_000)
     ap.add_argument("--device", default="cuda"); ap.add_argument("--kmax", type=int, default=1)
     args = ap.parse_args()
+    maybe_repoint()                              # honor NANOCHAT_DATASET=fineweb → base_data_fineweb
     device = torch.device(args.device if torch.cuda.is_available() or args.device != "cuda" else "cpu")
     os.environ["SURFACE_KMAX"] = str(args.kmax)
 

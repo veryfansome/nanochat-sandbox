@@ -57,4 +57,8 @@ def _cleanup_with_summary():
 
 common.compute_cleanup = _cleanup_with_summary
 
+# FineWeb-Edu corpus override for val-bpb (no-op unless NANOCHAT_DATASET=fineweb)
+from overlay.dataset_fineweb import maybe_repoint
+maybe_repoint()
+
 runpy.run_module("scripts.base_eval", run_name="__main__")

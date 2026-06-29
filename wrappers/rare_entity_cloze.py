@@ -24,6 +24,7 @@ import argparse
 import glob
 import math
 import os
+import random
 from collections import Counter
 
 import regex
@@ -80,6 +81,52 @@ def extract_rare_entities(docs, wf, max_freq, n, ctx_chars=240, min_ctx=80):
     return out[:n]
 
 
+# lowercase 1-2-word span (≥4 chars/word to skip stopwords) — the CASE control: surface's cap-bit
+# discount does NOT apply to lowercase, so a rarity/pooling effect persists here but a cap-bit one vanishes
+_SPAN_LOWER = regex.compile(r"(?<![\p{L}'])\p{Ll}{4,}(?: \p{Ll}{4,})?")
+
+
+def extract_band(docs, wf, span_re, lo, hi, n, ctx_chars=240, min_ctx=80, drop_ss=True):
+    """Spans whose rarest word freq ∈ [lo, hi]. drop_ss drops sentence-start (titlecase only).
+    Returns n: rarest-first when lo==0 (rare band), most-common-first otherwise (common band)."""
+    out = []
+    for doc in docs:
+        for m in span_re.finditer(doc):
+            words = [w.lower() for w in _WORD.findall(m.group())]
+            if not words:
+                continue
+            mn = min(wf.get(w, 0) for w in words)
+            if not (lo <= mn <= hi):
+                continue
+            start = m.start()
+            pre = doc[max(0, start - 2):start]
+            ss = pre.endswith((". ", ".\n", "\n", "? ", "! ")) or start == 0
+            if drop_ss and ss:
+                continue
+            ctx = doc[max(0, start - ctx_chars):start]
+            if len(regex.sub(r"\s", "", ctx)) < min_ctx:
+                continue
+            out.append({"entity": m.group(), "context": ctx, "min_word_freq": mn,
+                        "n_words": len(words), "kind": "entity" if len(words) >= 2 else "term"})
+            if len(out) >= n * 10:
+                break
+        if len(out) >= n * 10:
+            break
+    out.sort(key=lambda d: d["min_word_freq"])         # ascending freq
+    return out[:n] if lo == 0 else out[::-1][:n]       # rare band: rarest; common band: most common
+
+
+def boot_ci(surf_bits, base_bits, byts, B=2000, seed=0):
+    """Bootstrap 95% CI on Δbpb = Σsurf/Σbytes − Σbase/Σbytes, resampling spans with replacement."""
+    rng = random.Random(seed); n = len(byts); out = []
+    for _ in range(B):
+        s = [rng.randrange(n) for _ in range(n)]
+        sb = sum(surf_bits[j] for j in s); bb = sum(base_bits[j] for j in s); by = sum(byts[j] for j in s)
+        out.append(sb / by - bb / by)
+    out.sort()
+    return out[int(0.025 * B)], out[int(0.975 * B)]
+
+
 def _load_val(val_docs, doc_cap):
     from nanochat.dataset import parquets_iter_batched
     docs = []
@@ -125,9 +172,16 @@ def main():
                     help="entity source: climbmix (local val) | fineweb (karpathy last shard). "
                          "rarity is always measured vs ClimbMix train = the s7 models' training corpus")
     ap.add_argument("--device", default="cuda"); ap.add_argument("--kmax", type=int, default=1)
+    ap.add_argument("--control", action="store_true",
+                    help="2x2 rarity×case control (rare/common × titlecase/lowercase) + bootstrap CI — "
+                         "separates surface's cap-bit discount from a rarity/pooling effect")
+    ap.add_argument("--common-min-freq", type=int, default=1000, help="freq floor for the COMMON band")
     args = ap.parse_args()
+    from overlay.dataset_fineweb import maybe_repoint
+    maybe_repoint()                              # NANOCHAT_DATASET=fineweb → rarity counted over FineWeb train
 
-    print(f"counting word frequencies over ~{args.freq_chars/1e6:.0f}M chars (ClimbMix train) ...")
+    _corpus = os.environ.get("NANOCHAT_DATASET", "climbmix")
+    print(f"counting word frequencies over ~{args.freq_chars/1e6:.0f}M chars ({_corpus} train) ...")
     wf = word_freq(args.freq_chars)
     docs = (_load_fineweb if args.source == "fineweb" else _load_val)(args.val_docs, args.doc_cap)
     ents = extract_rare_entities(docs, wf, args.max_freq, args.n, min_ctx=args.min_ctx)
@@ -180,6 +234,35 @@ def main():
         t = torch.tensor([full], device=device)
         ce = model(t[:, :-1], t[:, 1:], loss_reduction='none').reshape(-1)
         return ce[len(cids) - 1:].sum().item() / LN2, len(ent.encode())
+
+    if args.control:
+        cells = [("rare-titlecase", _SPAN, 0, args.max_freq, True),
+                 ("common-titlecase", _SPAN, args.common_min_freq, 10 ** 9, True),
+                 ("rare-lowercase", _SPAN_LOWER, 0, args.max_freq, False),
+                 ("common-lowercase", _SPAN_LOWER, args.common_min_freq, 10 ** 9, False)]
+        cell_ents = []
+        for name, sre, lo, hi, dss in cells:
+            ce = extract_band(docs, wf, sre, lo, hi, args.n, min_ctx=args.min_ctx, drop_ss=dss)
+            cell_ents.append((name, ce))
+            fr = sorted(e["min_word_freq"] for e in ce)
+            print(f"[{name:>16}] {len(ce):>4} spans  freq {fr[0] if fr else 0}..{fr[-1] if fr else 0} "
+                  f"median {fr[len(fr) // 2] if fr else 0}  ({sum(1 for e in ce if e['kind'] == 'entity')} two-word)")
+        s = surface_build_model(args.surf_ckpt, _step(args.surf_ckpt), device, "eval")[0]; s.eval()
+        surf_sc = {nm: [surf_cloze(s, e["context"], e["entity"]) for e in ce] for nm, ce in cell_ents}
+        del s
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        bm = cm.build_model(args.base_ckpt, _step(args.base_ckpt), device, "eval")[0]; bm.eval()
+        base_sc = {nm: [base_cloze(bm, e["context"], e["entity"]) for e in ce] for nm, ce in cell_ents}
+        print(f"\n{'cell':>16} {'surf bpb':>9} {'base bpb':>9} {'Δ(s-b)':>9} {'95% CI (Δ)':>22}")
+        for name, _ in cell_ents:
+            sb = [x[0] for x in surf_sc[name]]; by = [x[1] for x in surf_sc[name]]; bb = [x[0] for x in base_sc[name]]
+            d = sum(sb) / sum(by) - sum(bb) / sum(by)
+            lo_ci, hi_ci = boot_ci(sb, bb, by)
+            print(f"{name:>16} {sum(sb) / sum(by):>9.4f} {sum(bb) / sum(by):>9.4f} {d:>+9.4f}   [{lo_ci:+.4f}, {hi_ci:+.4f}]")
+        print("\ncap-bit hypothesis ⇒ Δ<0 on BOTH titlecase cells, ~0 (CI spans 0) on lowercase.")
+        print("rarity/pooling hypothesis ⇒ Δ<0 on BOTH rare cells, ~0 on common.")
+        return
 
     s = surface_build_model(args.surf_ckpt, _step(args.surf_ckpt), device, "eval")[0]; s.eval()
     sb = sbb = 0.0

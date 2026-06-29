@@ -31,4 +31,8 @@ if _seed is not None:
     torch.cuda.manual_seed = lambda s, _o=_ocm, _x=_v: _o(_x)
     print(f"[base_train] seed override: model init seeded with SEED={_v} (was 42)")
 
+# FineWeb-Edu corpus override (no-op unless NANOCHAT_DATASET=fineweb)
+from overlay.dataset_fineweb import maybe_repoint
+maybe_repoint()
+
 runpy.run_module("scripts.base_train", run_name="__main__")
