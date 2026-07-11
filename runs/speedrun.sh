@@ -132,8 +132,10 @@ echo "==> nanochat:     $(git -C ../nanochat rev-parse --short HEAD)"
 echo
 
 # -----------------------------------------------------------------------------
-# Init the per-run report
-python -m nanochat.report reset
+# Init the per-run report. Guarded: upstream removed nanochat.report (commit
+# f10bd75, "delete the whole report thing"), so this is a no-op on new nanochat
+# while staying compatible with older pins that still have it.
+if python -c "import nanochat.report" 2>/dev/null; then python -m nanochat.report reset; else echo "==> nanochat.report absent (removed upstream) — skipping report reset"; fi
 
 # -----------------------------------------------------------------------------
 # Tokenizer + data
@@ -226,8 +228,9 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Final report (markdown)
-python -m nanochat.report generate
+# Final report (markdown). Guarded — nanochat.report removed upstream (see above);
+# eval.csv + meta.json are archived independently, so losing the markdown is fine.
+if python -c "import nanochat.report" 2>/dev/null; then python -m nanochat.report generate; else echo "==> nanochat.report absent — skipping markdown report (eval.csv + meta already archived)"; fi
 
 echo
 echo "==> $RUN_TAG run complete (model tag: $MODEL_TAG). Report: $NANOCHAT_BASE_DIR/report/"
