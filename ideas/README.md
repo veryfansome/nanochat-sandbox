@@ -8,6 +8,7 @@ Curated catalog of experiments. Each entry has its own folder with a design doc;
 |------|---------|-------------|
 | [MTP](mtp/README.md) — multi-token prediction | capability + sample efficiency | pure model-side (forward/loss) |
 | [z-loss](zloss/README.md) | training stability + small quality gain | pure model-side (forward/loss) |
+| [Semantic Tube Prediction](semantic-tube/README.md) — JEPA straightening loss on hidden-state trajectories | sample efficiency | pure model-side (forward/loss + hidden-state hook). **Published as fine-tuning, not pretraining — regime mismatch is the open question.** |
 | [Deep supervision](deep-supervision/README.md) — intermediate-layer aux losses | capability (depth-axis signal density) | pure model-side (forward/loss) |
 | [Token-level loss weighting](token-loss-weighting/README.md) — entropy / focal / RHO-Loss | sample efficiency (reshape per-token signal) | pure model-side (forward/loss) |
 | [Differential attention](diff-attention/README.md) | capability + scaling | architecture subclass |
