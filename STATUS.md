@@ -43,6 +43,8 @@ Sequential trio on a single Lambda instance; baseline included SFT (subsequently
 
 - **`auto_tune` (held-out-Pareto block-list tokenizer, r194) is a strong-but-borderline positive on a single-seed d24 A/B.** CORE +5.59% / val/bpb tied (slight persistent edge −0.0002) / zero compute cost, against the *same* baseline as force_merges and nearly matching it (+5.81%) — while keeping the **pristine** regex (0/48706 boundary-crossing ⇒ bpb exactly comparable, no prefix caveat). The catch vs force_merges: the sign test is **not** significant (14/7/1, p ≈ 0.095) and ~79% of the CORE delta is boolq + agi_lsat. A second seed is the cheap next step before adopt/reject. Full breakdown in §d24 auto_tune results below.
 
+- **STP (Semantic Tube Prediction, λ=0.02) is not a pretraining capability win at d24 (single seed).** Base CORE +0.0201 (0.2745 vs 0.2544), but 77% is boolq+commonsense_qa; counterfactual controls on the checkpoints show commonsense_qa is letter-prior artifact (stem_swap: STP 0.155→0.140 vs baseline 0.065→0.033) and boolq is partly-real-but-below-baseline (passage_swap drop 0.158 vs 0.121). val/bpb +0.0018 worse; post-SFT MMLU a wash (36.79 vs 36.78). The mechanism engages (tube_cos −0.49→+0.20) via a real STP-specific ~17× effective-rank reduction (eff_rank 1.56 vs matched baseline 26.0; anisotropy — hidden_var stays high at 0.65 vs 0.035, not variance-collapse). Full breakdown in §d24 STP results below; design + reproduction in [`ideas/semantic-tube/README.md`](ideas/semantic-tube/README.md).
+
 ### Eval-path bug in zloss (now fixed)
 
 The original `ZLossGPT.forward` added the scalar z-loss term to the CE tensor on every code path, including `loss_reduction='none'` (the path `nanochat/loss_eval.py` uses for val/bpb). That inflated val/bpb by a constant offset of `z_coeff·E[lse²] / mean_bytes / ln 2` ≈ 0.004 — exactly the originally-observed regression. Fix: `forward` now branches on `loss_reduction != 'mean'`. **Smoke check `(e)` was added to enforce this contract** — the lesson was already documented in [`overlay/README.md`](overlay/README.md), but text-only lessons aren't enforcement. MTP got the contract right because it was written *after* the lesson landed; zloss missed it because the rule postdated its first implementation. The d24 CORE result for zloss is unaffected by this bug — CORE is computed by a separate pipeline.
@@ -102,6 +104,20 @@ Single-instance run 2026-06-14 with the **r194 block list** (129 mangled stem+su
 - **Single seed.** A second seed is the cheap next step to move this from "strong-but-borderline" to adopt/reject. Worth the confirmation: the persistent bpb edge + pristine-regex cleanliness + the headline matching force_merges all point positive.
 
 Reproduce: `uv run python -m tools.compare_runs d24_baseline d24_autotune_r194`
+
+## d24 STP results (RunPod 8×H100 EUR-IS-3, ~$135 + ~$2 controls)
+
+Full-d24 STP (`OVERLAY=stp STP_COEFF=0.02 STP_DIAG=1 USE_SFT=1`) vs vanilla baseline, `runs/runpod_stp_ab.sh`, nanochat `92d63d4`, ClimbMix, fp8-off, identical tokenizer/corpus/init, single seed, SFT on both arms. Tags `d24_stp_lam0p02_971d280` / `d24_baseline_971d280` (wandb `veryfansome/nanochat`).
+
+- **Base CORE**: STP 0.2745 vs baseline 0.2544 (**+0.0201**). Decomposition: boolq +0.2117 + commonsense_qa +0.1300 = +0.0155 = **77%** of the aggregate; the other 20 tasks net +0.0046 (piqa +0.029, lambada +0.015; winograd −0.029, jeopardy −0.022, squad −0.013).
+- **val/bpb**: STP 0.2741 vs baseline 0.2723 (**+0.0018, worse**).
+- **Post-SFT ChatCORE**: STP 0.2389 vs baseline 0.2220; MMLU wash (36.79 vs 36.78); the gap is HumanEval (12.5% vs 4.2%, ~1 problem) + GSM8K (~2% both).
+- **Counterfactual controls** (`base_eval --controls 1`, 500/task, on the saved checkpoints), clean→corrupted centered:
+  - commonsense_qa (stem_swap): STP 0.155→0.140, baseline 0.065→0.033 → STP's advantage is content-insensitive = **letter-prior artifact**.
+  - boolq (passage_swap): STP −0.095→−0.253, baseline −0.184→−0.305 → STP relies on the passage *more* than baseline (drop 0.158 vs 0.121), but both arms sit below the boolq majority baseline and STP's edge shrinks ~40% under swap.
+- **STP geometry** (STP_DIAG during training; eff_rank/hidden_var recomputed on both final checkpoints, matched): eff_rank STP **1.56** vs baseline **26.0** (STP-specific ~17× reduction); hidden_var STP 0.65 vs baseline 0.035 (variance concentrated on few axes — anisotropy, not variance-collapse); tube_cos STP −0.49→+0.20 (the optimized quantity moves; coupled to the eff_rank concentration).
+
+Local artifacts: `results/{d24_stp_lam0p02_971d280,d24_baseline_971d280}/eval.csv`, `results/controls_{stp,baseline}/base_model_005568.csv`. Checkpoints on RunPod volume `cvpyt64b6z`.
 
 ## d24 combined (force_merges + r194) results — PROVISIONAL (ran on wrong vocab size)
 

@@ -1,6 +1,6 @@
 # Semantic Tube Prediction (STP)
 
-Status: **implemented; smoke passing (incl. under `torch.compile`); not yet A/B'd.** Pure model-side overlay (forward/loss) + a hidden-state hook. **Key caveat: STP is published as a *fine-tuning* regularizer, not a pretraining one — see "Regime mismatch" below. This is the load-bearing open question, not a detail.**
+Status: **d24 A/B done (2026-07-12) — not a pretraining capability win at λ=0.02.** See "d24 A/B result" below. Overlay implemented; smoke passing (incl. under `torch.compile`). **Caveat carried through: STP is published as a *fine-tuning* regularizer, not a pretraining one — see "Regime mismatch" below.**
 Target repo: `nanochat` (Karpathy) — kept **pristine**, never edited.
 
 Paper: Huang, LeCun, Balestriero, *Semantic Tube Prediction: Beating LLM Data Efficiency with JEPA*, [arXiv 2602.22617](https://arxiv.org/abs/2602.22617) (ICML 2026). Code: [github.com/galilai-group/llm-jepa](https://github.com/galilai-group/llm-jepa) (`stp.py`, `--linear=random_span`).
@@ -14,6 +14,20 @@ Paper: Huang, LeCun, Balestriero, *Semantic Tube Prediction: Beating LLM Data Ef
 Run the smoke: `uv run python -m wrappers.smoke_stp` (from a worktree, prefix `PYTHONPATH=<path-to-nanochat>` since the `.pth` bootstrap resolves `../nanochat` relative to the main checkout, not the worktree).
 
 Env knobs (read at `__init__`, stored as instance attributes — never `GPTConfig` fields): `STP_COEFF` (λ, default `0.02`), `STP_SPANS` (triples sampled per row, default `1`), `STP_MAX_SPAN` (span window width, default `256`; set ≥ `sequence_len` for whole-row sampling), `STP_DIAG` (`0`/`1`, default `0` — the diagnostic instrument, see below). Capture them in `MODEL_TAG` (e.g. `d24_stp_002`).
+
+## d24 A/B result (2026-07-12)
+
+Full-d24 STP (`OVERLAY=stp STP_COEFF=0.02 STP_DIAG=1 USE_SFT=1`) vs vanilla baseline (`USE_SFT=1`), via [`../../runs/runpod_stp_ab.sh`](../../runs/runpod_stp_ab.sh) on RunPod 8×H100 (EUR-IS-3), nanochat `92d63d4`, ClimbMix, fp8-off (`USE_FP8=0 WINDOW_PATTERN=L DEVICE_BATCH_SIZE=16`), identical tokenizer/corpus/init, single seed. Tags `d24_stp_lam0p02_971d280` / `d24_baseline_971d280` (wandb `veryfansome/nanochat`). ~$135 (+~$2 controls). **Verdict: not a pretraining capability win at λ=0.02.**
+
+- **Base CORE** (base_eval): STP **0.2745** vs baseline **0.2544** (+0.0201). Per-task: boolq +0.2117 and commonsense_qa +0.1300 = +0.0155 = **77% of the aggregate**; the other 20 tasks net +0.0046 (piqa +0.029, lambada +0.015 vs winograd −0.029, jeopardy −0.022, squad −0.013).
+- **val/bpb**: STP **0.2741** vs baseline **0.2723** (+0.0018, worse).
+- **Post-SFT ChatCORE**: STP **0.2389** vs baseline **0.2220**; MMLU wash (36.79 vs 36.78); gap is HumanEval (12.5% vs 4.2%, ~1 problem) + GSM8K (~2% both).
+- **Counterfactual controls** (`base_eval --controls 1`, 500-example subsample, on the saved checkpoints), clean→corrupted centered:
+  - commonsense_qa (stem_swap): STP 0.155→0.140, baseline 0.065→0.033. STP's advantage is content-insensitive (persists under stem corruption) = letter-prior artifact.
+  - boolq (passage_swap): STP −0.095→−0.253, baseline −0.184→−0.305. STP relies on the passage more than baseline (0.158 vs 0.121 drop); both arms below the boolq majority baseline; STP's edge shrinks ~40% under swap.
+- **STP geometry** (STP_DIAG during training; eff_rank/hidden_var recomputed on both *final* checkpoints, 8 val batches, matched): eff_rank STP **1.56** vs baseline **26.0** (STP-specific ~17× effective-rank reduction). hidden_var STP 0.65 vs baseline 0.035 (variance concentrated on few axes, not destroyed — anisotropy, not variance-collapse). tube_cos STP −0.49→+0.20 (the optimized quantity moves; mechanically coupled to the eff_rank concentration).
+
+Artifacts: `results/{d24_stp_lam0p02_971d280,d24_baseline_971d280}/eval.csv`, `results/controls_{stp,baseline}/base_model_005568.csv`. Checkpoints on RunPod volume `cvpyt64b6z` (EUR-IS-3). eff_rank recompute uses `overlay.stp.compute_stp_diagnostics` on the checkpoint's post-final-norm hidden.
 
 ## Diagnostics (`STP_DIAG=1`)
 
