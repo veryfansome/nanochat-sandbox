@@ -9,6 +9,8 @@ wandb/
 # lambda_ab.sh orchestrator: local instance state + any host logs tee'd locally
 runs/.lambda_ab.state
 runs/.runpod_ab.state
+runs/.runpod_stp_ab.state
+runs/.stp_ctrl.state
 runs/*.log
 
 # rustbpe build artifacts (cargo target dirs; per-crate uv.lock from maturin builds)
